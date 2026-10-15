@@ -9,6 +9,7 @@ import type {
   ContactFilters,
   ContactPageResponse,
   ContactSortField,
+  DatasetSourcesResponse,
   DatasetStatusResponse,
   DatasetValidationResponse,
   ExportJob,
@@ -84,6 +85,8 @@ export interface ApiClient {
 
   health(): Promise<HealthResponse>;
   datasetStatus(): Promise<DatasetStatusResponse>;
+  /** Bounded listing of the original files under `raw/` (Dataset page only). */
+  datasetSources(): Promise<DatasetSourcesResponse>;
   /** Pre-computed dataset statistics, or null when none have been generated. */
   datasetStats(): Promise<DatasetStats | null>;
   validateDataset(version: string): Promise<DatasetValidationResponse>;

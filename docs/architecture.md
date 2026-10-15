@@ -114,6 +114,10 @@ Shard counts (512 exact / 256 prefix / 256 token / 512 trigram / 256 ids) are re
 thousands for ~10M companies — no million-object buckets, no single giant object, no listing
 per query.
 
+The only LIST operation in the whole application is the bounded `raw/` listing on the Dataset
+Management page (`GET /api/dataset/sources`, at most 25 objects, requested only when that page
+is opened). Search, contact retrieval, exports and the app shell never list the bucket.
+
 ## Frontend
 
 - Routes (`src/main.tsx`): `/` landing, `/dashboard`, `/companies`, `/companies/:companyId`,
@@ -128,8 +132,15 @@ per query.
 1. **TanStack Query** — in-memory cache with request deduplication and per-query stale times.
 2. **IndexedDB** (`src/lib/cache/persistent-cache.ts`) — bounded LRU with TTL, version-scoped
    keys, and contact redaction so sensitive contact pages are not retained indefinitely.
-3. **Cloudflare Cache API** — only for immutable, version-addressed index objects; never for
-   leads, settings or anything user-mutable. Access is enforced before any cache lookup.
+3. **Edge caching — deliberately narrow.** The Worker uses Cloudflare's edge cache in exactly two
+   places: the Access JWKS fetch (`cf: { cacheTtl, cacheEverything }`) and immutable hashed static
+   assets (`cache-control: public, max-age=31536000, immutable`; the HTML shell and export
+   downloads are `no-store`). Dataset, contact, lead and settings responses are **not** put in a
+   shared cache: they are private authenticated data behind Access, and the specification is
+   explicit that shared edge caching should be skipped unless privacy can be demonstrated. Their
+   R2 reads are already bounded (≤ 30 small objects per fuzzy query) and mostly absorbed by
+   layers 1–2. Nothing mutable is ever cached anywhere shared, and Access verification happens
+   before any cache or dataset work.
 4. **R2 versioned indexes** — immutable objects as the durable layer.
 
 Cache keys include the dataset version, normalized query, fuzzy flag, filters, sort, page and
@@ -151,6 +162,37 @@ share an entry, and a new dataset version invalidates everything automatically.
 - Before each lead-shard mutation the previous content is copied to
   `backups/app-data/<YYYY-MM-DD>/<label>.json` — at most one snapshot per object per day, so
   growth is bounded by partitions × days. See `docs/recovery.md` for restore steps.
+
+## API contract (implemented in `worker/src/app.ts`, schemas in `src/shared/api-contract.ts`)
+
+Every `/api/*` route requires a verified Cloudflare Access identity, is same-origin only, is
+rate limited per identity, and validates input with Zod. Errors are
+`{ error: { code, message, requestId } }` with `400` (invalid), `401`/`403` (unauthenticated /
+not allowed), `404`, `429` (rate limited), `500`, or `503` when no dataset version is active.
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| GET | `/api/health` | liveness + environment + identity email |
+| GET | `/api/dataset/status` | active/previous version, manifests, source ids, progress |
+| GET | `/api/dataset/sources` | bounded LIST of `raw/` (≤ 25 objects) — Dataset page only |
+| GET | `/api/dataset/stats` | pre-computed aggregate stats (dashboard charts) |
+| POST | `/api/dataset/validate` | re-verify the active version's manifest, directory and a sample of objects |
+| POST | `/api/dataset/activate` | atomically re-point the active version (rollback), with confirmation |
+| GET | `/api/companies/search` | typo-tolerant company search (`q`, page, sort, filters, fuzzy, resultBudget) |
+| GET | `/api/companies/:id` | company profile + facets + coverage |
+| GET | `/api/companies/:id/contacts` | paginated, filtered contacts for one company |
+| GET | `/api/contacts` | contacts across ≤ 50 selected company ids |
+| GET | `/api/contacts/:id` | one contact |
+| GET/POST/DELETE | `/api/leads`, `/api/leads/:id` | saved leads (R2, ETag-conditional writes) |
+| GET/POST/DELETE | `/api/saved-searches`, `/api/saved-searches/:id` | saved search definitions |
+| POST | `/api/saved-searches/:id/run` | re-run a saved search and stamp `lastRunAt` |
+| GET/PUT | `/api/settings` | user preferences (cache, privacy, default page size) |
+| GET/POST | `/api/activity` | recent-activity feed (batched writes, never per keystroke) |
+| GET/POST | `/api/exports`, `/api/exports/:id`, `/api/exports/:id/download` | CSV export jobs (staged, injection-safe, row-capped) |
+
+Paginated routes return `page: { page, pageSize, total, totalIsLowerBound, hasMore }`, so a
+bounded search can report a lower bound honestly instead of a fabricated total. Search responses
+include `datasetVersion`, `retrieval` (candidate counts per stage) and `tookMs`.
 
 ## Access control
 

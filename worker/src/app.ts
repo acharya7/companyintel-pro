@@ -28,6 +28,7 @@ import type {
   Company,
   CompanySearchHit,
   Contact,
+  DatasetSourcesResponse,
   DatasetStatusResponse,
   DatasetValidationResponse,
   ExportJob,
@@ -48,8 +49,12 @@ type Variables = { identity: AccessIdentity; requestId: string; store: R2Store }
 export const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 
 const APP_VERSION = "0.1.0";
+/** The only bucket this Worker is bound to; there is no second data store. */
+const BUCKET_NAME = "company-intel-data";
 /** Contact listing is bounded: this many company partitions per request. */
 const MAX_CONTACT_COMPANIES = 50;
+/** Bounded `raw/` listing for the Dataset page — never a full bucket walk. */
+const MAX_RAW_OBJECTS = 25;
 
 /* ------------------------------- middleware ------------------------------ */
 
@@ -251,11 +256,12 @@ app.get("/api/dataset/status", async (c) => {
     const directory = await store.getDirectory(pointer.version);
     sources = (directory?.sources ?? []).map((id) => ({
       id,
-      key: id === "csv1" ? "raw/" : "raw/",
+      key: "raw/",
       sizeBytes: null,
       lastModified: null,
       verified: false,
-      error: "Object metadata is recorded in the dataset manifest; run a validation to re-verify checksums.",
+      error:
+        "The manifest records that this source contributed rows, but not the uploaded file name. Open the Dataset page to list the actual raw/ objects with their sizes.",
     }));
   } else {
     try {
@@ -278,7 +284,7 @@ app.get("/api/dataset/status", async (c) => {
     message: pointer?.version
       ? `Active dataset version ${pointer.version}.`
       : "Dataset not indexed. Run the local indexer and publish a validated version.",
-    bucket: "company-intel-data",
+    bucket: BUCKET_NAME,
     bucketOk,
     bucketError,
     sources,
@@ -288,6 +294,41 @@ app.get("/api/dataset/status", async (c) => {
     dataOrigin: "r2",
   };
   return c.json(response);
+});
+
+/**
+ * Bounded listing of the original files under `raw/`.
+ *
+ * Deliberately a separate endpoint from `/api/dataset/status`: status is called
+ * on every page by the shell, and a LIST is a Class A operation. This one is
+ * requested only when the Dataset Management page is opened, returns at most 25
+ * objects (never the index or contact prefixes), and reports failure honestly
+ * instead of inventing sizes.
+ */
+app.get("/api/dataset/sources", async (c) => {
+  const store = c.get("store");
+  const checkedAt = new Date().toISOString();
+  try {
+    const objects = await store.list("raw/", MAX_RAW_OBJECTS + 1);
+    return c.json<DatasetSourcesResponse>({
+      bucket: BUCKET_NAME,
+      objects: objects.slice(0, MAX_RAW_OBJECTS).map((object) => ({
+        key: object.key,
+        sizeBytes: typeof object.size === "number" ? object.size : null,
+        lastModified: object.uploaded ? new Date(object.uploaded).toISOString() : null,
+      })),
+      truncated: objects.length > MAX_RAW_OBJECTS,
+      checkedAt,
+    });
+  } catch (error) {
+    return c.json<DatasetSourcesResponse>({
+      bucket: BUCKET_NAME,
+      objects: [],
+      truncated: false,
+      checkedAt,
+      error: error instanceof Error ? error.message : "The raw/ prefix could not be listed",
+    });
+  }
 });
 
 app.get("/api/dataset/stats", async (c) => {

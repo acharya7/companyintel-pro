@@ -20,6 +20,7 @@ import type {
   ContactPageResponse,
   CompanySortField,
   ContactSortField,
+  DatasetSourcesResponse,
   DatasetStatusResponse,
   DatasetValidationResponse,
   ExportJob,
@@ -131,6 +132,20 @@ export class LocalApiClient implements ApiClient {
       lastIndexedAt: null,
       indexing: null,
       dataOrigin: "sample",
+    };
+  }
+
+  /**
+   * The preview has no bucket to list, so it reports no objects and says why.
+   * It never invents filenames or sizes that were not read from R2.
+   */
+  async datasetSources(): Promise<DatasetSourcesResponse> {
+    return {
+      bucket: "company-intel-data",
+      objects: [],
+      truncated: false,
+      checkedAt: new Date().toISOString(),
+      error: "Preview mode: the browser cannot list the private R2 bucket. Open the Dataset page on the deployed Worker to see the real raw/ objects.",
     };
   }
 

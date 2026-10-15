@@ -231,6 +231,29 @@ export interface SourceFileStatus {
   error?: string;
 }
 
+/**
+ * One object under `raw/`, read with a bounded LIST.
+ *
+ * Only the Dataset Management page requests this: the search path never lists
+ * the bucket, and the exact CSV object names are chosen by whoever uploaded
+ * them, so they cannot be derived from a configuration file.
+ */
+export interface RawObjectInfo {
+  key: string;
+  sizeBytes: number | null;
+  lastModified: string | null;
+}
+
+export interface DatasetSourcesResponse {
+  bucket: string;
+  objects: RawObjectInfo[];
+  /** True when more objects exist under `raw/` than were returned. */
+  truncated: boolean;
+  checkedAt: string;
+  /** Set when the listing itself failed (bucket unreachable, no binding). */
+  error?: string;
+}
+
 export interface IndexingCounters {
   rowsRead: number;
   rowsRejected: number;

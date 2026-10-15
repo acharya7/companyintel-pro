@@ -168,6 +168,21 @@ describe("saved leads in R2", () => {
     expect(await store.deleteLead("lead-1")).toBe(false);
   });
 
+  test("raw/ can be listed with bounded metadata for the dataset page", async () => {
+    const { bucket, store } = makeStore();
+    bucket.objects.set("raw/companies_part1.csv", { etag: '"a"', text: "id,name\n1,Acme\n" });
+    bucket.objects.set("raw/companies_part2.csv", { etag: '"b"', text: "id,name\n2,Globex\n" });
+    bucket.objects.set("indexes/v1/exact/0000.json.gz", { etag: '"c"', text: "{}" });
+
+    const listed = await store.list("raw/");
+    expect(listed.map((object) => object.key).sort()).toEqual([
+      "raw/companies_part1.csv",
+      "raw/companies_part2.csv",
+    ]);
+    // Sizes come from object metadata, and nothing outside the prefix leaks in.
+    expect(listed.every((object) => typeof object.size === "number")).toBe(true);
+  });
+
   test("distinct leads land in distinct partitions when ids differ", async () => {
     const { bucket, store } = makeStore();
     await store.upsertLead(makeLead({ id: "lead-a" }));

@@ -18,6 +18,7 @@ import {
   companySearchResponseSchema,
   contactDetailResponseSchema,
   contactPageResponseSchema,
+  datasetSourcesResponseSchema,
   datasetStatusResponseSchema,
   datasetValidationResponseSchema,
   exportJobSchema,
@@ -142,6 +143,10 @@ export class WorkerApiClient implements ApiClient {
 
   datasetStatus() {
     return this.request("/api/dataset/status", datasetStatusResponseSchema);
+  }
+
+  datasetSources() {
+    return this.request("/api/dataset/sources", datasetSourcesResponseSchema);
   }
 
   /**

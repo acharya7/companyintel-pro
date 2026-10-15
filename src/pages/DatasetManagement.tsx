@@ -14,7 +14,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { EmptyState, ErrorBlock, LoadingBlock, PageHeader, Section, StatCard, StatusPill } from "@/components/common";
-import { useActivateDataset, useDatasetStatus, useValidateDataset } from "@/hooks/use-api";
+import { useActivateDataset, useDatasetSources, useDatasetStatus, useValidateDataset } from "@/hooks/use-api";
 import { formatBytes, formatDate, formatNumber, relativeTime } from "@/lib/format";
 
 const INDEX_COMMANDS = [
@@ -44,6 +44,7 @@ const INDEX_COMMANDS = [
 
 export default function DatasetManagement() {
   const status = useDatasetStatus();
+  const sources = useDatasetSources();
   const validate = useValidateDataset();
   const activate = useActivateDataset();
   const [activateTarget, setActivateTarget] = useState<string | null>(null);
@@ -69,6 +70,8 @@ export default function DatasetManagement() {
 
   const data = status.data;
   const activeVersion = data.versions.find((version) => version.version === data.activeVersion);
+  const rawObjects = sources.data?.objects ?? [];
+  const perSource = activeVersion?.counters?.perSource ?? {};
 
   return (
     <>
@@ -127,45 +130,75 @@ export default function DatasetManagement() {
 
       <Section
         title="Source files in R2"
-        description="The two original CSV files under raw/. Sizes are read from object metadata; validation confirms existence."
+        description="Objects under raw/, listed directly from the bucket (bounded to 25 entries, and only when this page is opened). Sizes and timestamps are R2 object metadata — never estimates."
+        actions={
+          <Button variant="outline" size="sm" className="gap-2" disabled={sources.isFetching} onClick={() => sources.refetch()}>
+            <RefreshCw className={sources.isFetching ? "size-4 animate-spin" : "size-4"} />
+            List raw/
+          </Button>
+        }
       >
-        {data.sources.length === 0 ? (
+        {sources.data?.error ? (
+          <p className="mb-3 max-w-3xl text-[11px] leading-4 text-muted-foreground">{sources.data.error}</p>
+        ) : null}
+        {sources.isLoading ? (
+          <LoadingBlock label="Listing raw/" rows={2} />
+        ) : rawObjects.length === 0 ? (
           <EmptyState
             icon={<HardDrive className="size-5" />}
-            title="No source objects reported"
-            description="The dataset manifest lists the sources used to build a version. Until a version is published (or the Worker can reach R2), file names and sizes are unknown rather than assumed."
+            title="No raw objects reported"
+            description="Nothing was returned for the raw/ prefix. Until your CSV files are uploaded there — and the Worker can list the bucket — file names and sizes stay unknown rather than assumed."
           />
         ) : (
           <div className="overflow-hidden rounded-lg border border-border/70">
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>Source id</TableHead>
                   <TableHead>Object key</TableHead>
                   <TableHead>Size</TableHead>
                   <TableHead>Last modified</TableHead>
-                  <TableHead>Verified</TableHead>
+                  <TableHead>Present</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {data.sources.map((source) => (
-                  <TableRow key={source.id}>
-                    <TableCell className="font-mono text-xs">{source.id}</TableCell>
-                    <TableCell className="font-mono text-xs">{source.key}</TableCell>
-                    <TableCell className="tabular">{source.sizeBytes === null ? "—" : formatBytes(source.sizeBytes)}</TableCell>
-                    <TableCell>{source.lastModified ? formatDate(source.lastModified) : "—"}</TableCell>
+                {rawObjects.map((object) => (
+                  <TableRow key={object.key}>
+                    <TableCell className="font-mono text-xs">{object.key}</TableCell>
+                    <TableCell className="tabular">{object.sizeBytes === null ? "—" : formatBytes(object.sizeBytes)}</TableCell>
+                    <TableCell>{object.lastModified ? formatDate(object.lastModified) : "—"}</TableCell>
                     <TableCell>
-                      <StatusPill ok={source.verified} label={source.verified ? "verified" : "not verified"} />
-                      {source.error ? (
-                        <p className="mt-1 max-w-md text-[11px] leading-4 text-muted-foreground">{source.error}</p>
-                      ) : null}
+                      <StatusPill ok label="verified in R2" />
                     </TableCell>
                   </TableRow>
                 ))}
               </TableBody>
             </Table>
+            {sources.data?.truncated ? (
+              <p className="border-t border-border/70 px-3 py-2 text-[11px] text-muted-foreground">
+                More than 25 objects exist under raw/; only the first 25 are shown.
+              </p>
+            ) : null}
           </div>
         )}
+        {data.sources.length > 0 ? (
+          <div className="mt-4 rounded-lg border border-border/70 p-3">
+            <p className="text-[11px] font-medium uppercase tracking-[0.1em] text-muted-foreground">Sources that fed the active version</p>
+            <ul className="mt-2 space-y-1">
+              {data.sources.map((source) => {
+                const counts = perSource[source.id];
+                return (
+                  <li key={source.id} className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+                    <span className="font-mono">{source.id}</span>
+                    <span className="text-muted-foreground">
+                      {counts ? `${formatNumber(counts.rowsRead)} rows read` : "row counts are not recorded in this manifest"}
+                      {counts && typeof counts.contacts === "number" ? ` · ${formatNumber(counts.contacts)} contacts` : ""}
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        ) : null}
       </Section>
 
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">

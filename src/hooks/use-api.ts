@@ -19,6 +19,7 @@ export { apiMode, apiBaseUrl, persistentCache, invalidateCacheForVersion };
 export const queryKeys = {
   health: ["health"] as const,
   datasetStatus: ["dataset", "status"] as const,
+  datasetSources: ["dataset", "sources"] as const,
   datasetStats: ["dataset", "stats"] as const,
   search: (params: unknown) => ["company-search", params] as const,
   company: (id: string) => ["company", id] as const,
@@ -44,6 +45,19 @@ export function useDatasetStatus() {
     queryFn: () => api.datasetStatus(),
     staleTime: 30_000,
     retry: 1,
+  });
+}
+
+/**
+ * Bounded `raw/` listing, fetched only by the Dataset Management page (a LIST is
+ * a Class A operation, so it must not run from the app shell on every page).
+ */
+export function useDatasetSources() {
+  return useQuery({
+    queryKey: queryKeys.datasetSources,
+    queryFn: () => api.datasetSources(),
+    staleTime: 60_000,
+    retry: 0,
   });
 }
 

@@ -61,20 +61,27 @@ the initial index upload (a few thousand PUTs, once per version) and occasional 
 1,000 searches/day is ~30,000 API requests/month, plus asset requests. That is ~0.03% of the
 Free plan's 100,000 requests/day. Requests are not the constraint; **CPU time** per request is.
 
-Measured on the sandbox this repository was developed in (Bun, in-process engine, 50,000-company
-corpus — rerun on your own machine with `bun scripts/benchmark-search.mjs`):
+Measured on the sandbox this repository was developed in (`bun scripts/benchmark-search.mjs
+--companies 50000 --repeat 5`, in-process engine, index build 1.25 s / 102 MB heap — rerun on
+your own machine, preferably with `--companies 200000`):
 
 | Query class | median | p95 | candidates scored |
 | --- | --- | --- | --- |
-| exact ("Microsoft Corporation") | 3.6 ms | 3.9 ms | 400 |
-| legal-suffix variant ("Infosys Ltd") | 6.3 ms | 12.5 ms | 400 |
-| abbreviation ("ibm") | 0.04 ms | 0.07 ms | 2 |
-| short prefix ("tat") | 0.7 ms | 6.2 ms | 213 |
-| single typo ("Microsft") | 0.04 ms | 0.14 ms | 2 |
-| transposition ("Mircosoft") | 3.4 ms | 7.4 ms | 400 |
-| multi-token ("international business machines") | 0.05 ms | 0.12 ms | 4 |
-| word split ("Total Energies") | 12.6 ms | 13.0 ms | 400 |
-| no result | 0.03 ms | 0.08 ms | 0 |
+| exact ("Microsoft Corporation") | 2.8 ms | 3.3 ms | 400 |
+| legal-suffix variant ("Infosys Ltd") | 6.3 ms | 12.4 ms | 400 |
+| abbreviation ("ibm") | 0.02 ms | 0.06 ms | 2 |
+| short prefix ("tat") | 0.5 ms | 2.9 ms | 213 |
+| single typo ("Microsft") | 0.02 ms | 0.05 ms | 2 |
+| transposition ("Mircosoft") | 5.4 ms | 9.4 ms | 400 |
+| multi-token ("international business machines") | 0.06 ms | 0.11 ms | 4 |
+| word split ("Total Energies") | 5.9 ms | 10.1 ms | 400 |
+| no result | 0.02 ms | 0.06 ms | 0 |
+
+Repeat runs on this shared sandbox vary by roughly 2× (identical query, 2.5–5.4 ms median), so
+treat these as an order of magnitude, not a specification. Two optimizations made after the
+first measurement are already included: exact normalized matches return early without running
+the token/whole-string fuzzy passes, and query trigrams plus per-document trigram sets are
+cached instead of rebuilt per candidate.
 
 Labelled relevance on the same corpus: **recall@1 0.939, recall@5 0.97, 0 false positives** on
 the "must not match" queries (`tests/fixtures/companies.ts`).
@@ -85,7 +92,7 @@ these figures hold at 10M companies — that is the whole point of the bounded t
 Interpretation:
 
 - The **median** query is comfortably inside the Free plan's 10 ms CPU budget.
-- The **worst-case fuzzy** query (word-split / heavy typo) measured ~13 ms, which can exceed
+- The **worst-case fuzzy** query (word-split / heavy typo) measured ~10 ms p95, which can exceed
   10 ms CPU on the Free plan. Two honest options: keep the Free plan and accept occasional
   `1102 Worker exceeded CPU time` errors on the heaviest fuzzy queries, or move to Workers Paid
   ($5/month) which removes the 10 ms ceiling. **This is an approval decision — no paid plan has

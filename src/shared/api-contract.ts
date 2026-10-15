@@ -478,6 +478,21 @@ export const datasetStatusResponseSchema = z.object({
   dataOrigin: z.enum(["r2", "sample"]),
 });
 
+/** Bounded listing of `raw/`, requested only by the Dataset Management page. */
+export const datasetSourcesResponseSchema = z.object({
+  bucket: z.string(),
+  objects: z.array(
+    z.object({
+      key: z.string(),
+      sizeBytes: z.number().nullable(),
+      lastModified: z.string().nullable(),
+    }),
+  ),
+  truncated: z.boolean(),
+  checkedAt: z.string(),
+  error: z.string().optional(),
+});
+
 export const datasetValidationResponseSchema = z.object({
   version: z.string(),
   passed: z.boolean(),
