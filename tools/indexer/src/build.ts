@@ -855,7 +855,15 @@ export async function uploadOutput(config: IndexerConfig, result: RunResult, onP
       continue;
     }
     const body = await readFile(join(config.outputDir, object.key));
-    await client.put(object.key, body, object.gzip ? "application/json" : "application/json");
+    // `content-encoding: gzip` is required metadata, not decoration: the Worker
+    // uses it (plus a magic-byte sniff) to decide whether to gunzip a shard.
+    await client.put(
+      object.key,
+      body,
+      object.gzip ? "application/json" : "application/json",
+      4,
+      object.gzip ? { contentEncoding: "gzip" } : undefined,
+    );
     output.uploaded += 1;
     output.bytes += object.bytes;
     if (output.uploaded % 200 === 0) onProgress?.(`uploaded ${output.uploaded} objects (${(output.bytes / 1e6).toFixed(1)} MB)`);
@@ -882,23 +890,41 @@ export async function uploadOutput(config: IndexerConfig, result: RunResult, onP
   return output;
 }
 
-/** Publish a validated version by flipping the active pointer. */
-export async function publishVersion(version: string, bucket?: string): Promise<void> {
+/**
+ * Publish a validated version by flipping the active pointer.
+ *
+ * The current pointer is read first so the version that was serving becomes
+ * `previousVersion`: without that, the Dataset page would have no rollback
+ * target and a bad publish could not be reverted in one click.
+ */
+export async function publishVersion(version: string, bucket?: string): Promise<{ previousVersion: string | null }> {
   const credentials = credentialsFromEnv(bucket);
   if (!credentials) throw new Error("R2 credentials are not set, so the active version cannot be published.");
   const client = new R2Client(credentials);
-  const previous = await client.head("manifests/active.json");
-  void previous;
+
+  let previousVersion: string | null = null;
+  try {
+    const current = await client.get("manifests/active.json");
+    if (current.ok) {
+      const parsed = (await current.json()) as { version?: string; previousVersion?: string | null };
+      if (parsed?.version && parsed.version !== version) previousVersion = parsed.version;
+      else if (parsed?.previousVersion && parsed.previousVersion !== version) previousVersion = parsed.previousVersion;
+    }
+  } catch {
+    // A missing or unreadable pointer simply means there is nothing to roll back to.
+  }
+
   await client.putJson(
     "manifests/active.json",
     {
       version,
-      previousVersion: null,
+      previousVersion,
       activatedAt: new Date().toISOString(),
       activatedBy: "local-indexer",
     },
     false,
   );
+  return { previousVersion };
 }
 
 /* -------------------------------------------------------------------------- */

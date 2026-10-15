@@ -13,7 +13,7 @@
  */
 
 import type { Company, Contact, DatasetStats, DatasetVersionSummary, SavedLead, SavedSearch, UserSettings, ActivityEntry } from "../../src/shared/models";
-import { leadShardKey, statsKey, activeManifestKey, companyPartitionKey, contactPartitionKey, exportMetaKey, exportObjectKey, indexDirectoryKey, indexShardKey, manifestKey, partitionOfRef, contactPartitionOfRef, savedSearchesKey, settingsKey, activityKey, validationKey, progressKey, type IndexDirectory, type ShardPayload, type IndexKind, type CompanyPartitionPayload, type ContactPartitionPayload } from "../../src/shared/search/index-format";
+import { R2_PREFIX, leadShardKey, statsKey, activeManifestKey, companyPartitionKey, contactPartitionKey, exportMetaKey, exportObjectKey, indexDirectoryKey, indexShardKey, manifestKey, partitionOfRef, contactPartitionOfRef, savedSearchesKey, settingsKey, activityKey, validationKey, progressKey, type IndexDirectory, type ShardPayload, type IndexKind, type CompanyPartitionPayload, type ContactPartitionPayload } from "../../src/shared/search/index-format";
 import { SHARDING, snapshotKey } from "../../src/shared/search/index-format";
 import { shardOf } from "../../src/shared/hash";
 
@@ -60,19 +60,33 @@ export class R2Store {
     return object ? object.text() : null;
   }
 
-  /** JSON object (optionally gzip-compressed by the indexer). */
+  /**
+   * JSON object (optionally gzip-compressed by the indexer).
+   *
+   * Gzip is detected from the object's metadata **and** from the 1f 8b magic
+   * bytes. The magic-byte check matters because the indexer is not the only way
+   * objects reach this bucket: anything copied in with rclone/S3 without a
+   * `Content-Encoding` header would otherwise be read as raw gzip bytes, JSON
+   * parsing would fail, and every shard would silently look empty.
+   */
   async getJson<T>(key: string): Promise<T | null> {
     const object = await this.readObject(key);
     if (!object) return null;
     try {
-      const encoding = object.httpMetadata?.contentEncoding;
-      if (encoding === "gzip") {
-        // The R2 binding returns the stored bytes; decompress with the runtime's
-        // streaming decompressor rather than buffering everything first.
-        const decompressed = object.body.pipeThrough(new DecompressionStream("gzip"));
-        return (await new Response(decompressed).json()) as T;
+      // Real R2 bodies always expose `arrayBuffer()`, but reading through the
+      // stream keeps this working with any binding shim as well.
+      const buffer =
+        typeof object.arrayBuffer === "function"
+          ? await object.arrayBuffer()
+          : await new Response(object.body as ReadableStream).arrayBuffer();
+      const view = new Uint8Array(buffer);
+      const gzip =
+        object.httpMetadata?.contentEncoding === "gzip" || (view.length > 1 && view[0] === 0x1f && view[1] === 0x8b);
+      if (gzip) {
+        const stream = new Blob([view]).stream().pipeThrough(new DecompressionStream("gzip"));
+        return (await new Response(stream).json()) as T;
       }
-      return (await object.json()) as T;
+      return JSON.parse(new TextDecoder().decode(view)) as T;
     } catch {
       return null;
     }
@@ -264,11 +278,74 @@ export class R2Store {
     return shardOf(leadId, LEAD_SHARDS);
   }
 
+  /**
+   * List saved leads.
+   *
+   * The lead **shards** are authoritative; the index is only a directory of them
+   * (it exists so reading leads never lists the bucket). If the index is missing,
+   * empty or references a shard that is no longer there, it is rebuilt from the
+   * shards once instead of reporting "no leads". That is the difference between a
+   * self-healing read and silent data loss.
+   */
   async listLeads(): Promise<SavedLead[]> {
-    const index = await this.getJson<LeadIndex>(leadShardKeyIndex());
-    if (!index || !index.partitions.length) return [];
+    let index = await this.getJson<LeadIndex>(leadShardKeyIndex());
+    if (!index?.partitions?.length) {
+      index = await this.rebuildLeadIndex();
+      if (!index.partitions.length) return [];
+    }
+
     const shards = await Promise.all(index.partitions.map((part) => this.getJson<SavedLead[]>(leadShardKey(part.partition))));
-    return shards.flatMap((shard) => shard ?? []).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+    const leads = shards.flatMap((shard) => shard ?? []);
+
+    const missing = index.partitions.filter((_, position) => !Array.isArray(shards[position]));
+    if (missing.length) {
+      // A referenced object is gone (deleted out-of-band, failed write, or a
+      // manual restore). Drop those entries and rewrite the directory so the
+      // next read is clean, but never drop the leads that do exist.
+      const kept = index.partitions.filter((part) => !missing.some((gone) => gone.partition === part.partition));
+      await this.putJson(leadShardKeyIndex(), {
+        total: leads.length,
+        partitions: kept,
+        updatedAt: new Date().toISOString(),
+      }).catch(() => null);
+    }
+
+    return leads.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  /**
+   * Rebuild the lead directory from the authoritative shard objects.
+   *
+   * Bounded: one LIST of `app-data/leads/` (at most 500 objects, and the design
+   * uses 64 shards) plus one read per non-empty shard. Used automatically when
+   * the index is missing, and exposed through `POST /api/leads/repair` so an
+   * interrupted write can be repaired on demand without touching a database.
+   */
+  async rebuildLeadIndex(): Promise<LeadIndex> {
+    const objects = await this.list(`${R2_PREFIX.appData}leads/`, 500);
+    const shardObjects = objects.filter((object) => object.key.endsWith(".json") && !object.key.endsWith("index.json"));
+    const partitions: LeadIndex["partitions"] = [];
+
+    for (const object of shardObjects) {
+      const match = /\/(\d+)\.json$/.exec(object.key);
+      if (!match) continue;
+      const shard = await this.getJson<SavedLead[]>(object.key);
+      if (!Array.isArray(shard) || shard.length === 0) continue;
+      partitions.push({
+        partition: Number(match[1]),
+        count: shard.length,
+        updatedAt: object.uploaded ? new Date(object.uploaded).toISOString() : new Date().toISOString(),
+      });
+    }
+
+    partitions.sort((a, b) => a.partition - b.partition);
+    const index: LeadIndex = {
+      total: partitions.reduce((sum, part) => sum + part.count, 0),
+      partitions,
+      updatedAt: new Date().toISOString(),
+    };
+    await this.putJson(leadShardKeyIndex(), index);
+    return index;
   }
 
   async getLead(id: string): Promise<SavedLead | null> {

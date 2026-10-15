@@ -44,6 +44,20 @@ function hmac(key: Buffer | string, data: string): Buffer {
   return createHmac("sha256", key).update(data).digest();
 }
 
+/** RFC 3986 encoding, as SigV4 requires for canonical query parameters. */
+function rfc3986(value: string): string {
+  return encodeURIComponent(value).replace(/[!'()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function decodeXml(value: string): string {
+  return value
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, "&");
+}
+
 function encodeKeyPath(key: string): string {
   return key
     .split("/")
@@ -67,11 +81,33 @@ export class R2Client {
     this.endpoint = `https://${credentials.accountId}.r2.cloudflarestorage.com`;
   }
 
-  /** Sign and send one S3 request. */
-  private async sign(method: "PUT" | "HEAD" | "GET", key: string, body?: Buffer, contentType?: string): Promise<Response> {
+  /**
+   * Sign and send one S3 request.
+   *
+   * Every header here is part of the SigV4 canonical request, which is why
+   * `content-encoding` must be passed through this function rather than added
+   * afterwards: the Worker decides whether to gunzip a shard from that metadata,
+   * so an unsigned/omitted encoding would make every index object unreadable in
+   * production even though the upload itself succeeded.
+   */
+  private async sign(
+    method: "PUT" | "HEAD" | "GET",
+    key: string,
+    body?: Buffer,
+    contentType?: string,
+    extra?: {
+      contentEncoding?: string;
+      contentDisposition?: string;
+      range?: string;
+      /** Extra query parameters, e.g. a ListObjectsV2 request. */
+      query?: Record<string, string>;
+      /** Signs the bucket root instead of an object key. */
+      bucketRoot?: boolean;
+    },
+  ): Promise<Response> {
     const { accessKeyId, secretAccessKey, bucket } = this.credentials;
     const host = new URL(this.endpoint).host;
-    const canonicalUri = `/${bucket}/${encodeKeyPath(key)}`;
+    const canonicalUri = extra?.bucketRoot ? `/${bucket}` : `/${bucket}/${encodeKeyPath(key)}`;
     const now = new Date();
     const amzDate = now.toISOString().replace(/[:-]|\.\d{3}/g, "");
     const dateStamp = amzDate.slice(0, 8);
@@ -83,13 +119,21 @@ export class R2Client {
       "x-amz-date": amzDate,
     };
     if (contentType) headers["content-type"] = contentType;
+    if (extra?.contentEncoding) headers["content-encoding"] = extra.contentEncoding;
+    if (extra?.contentDisposition) headers["content-disposition"] = extra.contentDisposition;
+    if (extra?.range) headers.range = extra.range;
 
     const signedHeaders = Object.keys(headers).sort().join(";");
     const canonicalHeaders = Object.keys(headers)
       .sort()
       .map((name) => `${name}:${headers[name]}\n`)
       .join("");
-    const canonicalRequest = [method, canonicalUri, "", canonicalHeaders, signedHeaders, payloadHash].join("\n");
+    const canonicalQuery = Object.entries(extra?.query ?? {})
+      .map(([name, value]) => [rfc3986(name), rfc3986(value)] as const)
+      .sort((a, b) => (a[0] === b[0] ? a[1].localeCompare(b[1]) : a[0].localeCompare(b[0])))
+      .map(([name, value]) => `${name}=${value}`)
+      .join("&");
+    const canonicalRequest = [method, canonicalUri, canonicalQuery, canonicalHeaders, signedHeaders, payloadHash].join("\n");
 
     const scope = `${dateStamp}/auto/s3/aws4_request`;
     const stringToSign = ["AWS4-HMAC-SHA256", amzDate, scope, sha256Hex(canonicalRequest)].join("\n");
@@ -97,20 +141,64 @@ export class R2Client {
     const signature = createHmac("sha256", signingKey).update(stringToSign).digest("hex");
 
     const authorization = `AWS4-HMAC-SHA256 Credential=${accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;
+    const queryString = canonicalQuery ? `?${canonicalQuery}` : "";
 
-    return fetch(`${this.endpoint}/${bucket}/${encodeKeyPath(key)}`, {
+    return fetch(`${this.endpoint}${canonicalUri}${queryString}`, {
       method,
       headers: { ...headers, authorization },
       body: body ? new Uint8Array(body) : undefined,
     });
   }
 
+  /**
+   * List objects under a prefix (ListObjectsV2).
+   *
+   * Used by the verification/profile scripts, which run on your machine — the
+   * Worker never lists the bucket except for the bounded `raw/` page listing.
+   */
+  async list(prefix: string, maxKeys = 50): Promise<{ key: string; size: number; lastModified: string | null }[]> {
+    const response = await this.sign("GET", "", undefined, undefined, {
+      bucketRoot: true,
+      query: { "list-type": "2", prefix, "max-keys": String(maxKeys) },
+    });
+    if (!response.ok) {
+      throw new Error(`ListObjectsV2 failed: HTTP ${response.status} ${(await response.text().catch(() => "")).slice(0, 300)}`);
+    }
+    const xml = await response.text();
+    const objects: { key: string; size: number; lastModified: string | null }[] = [];
+    for (const match of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) {
+      const block = match[1];
+      const key = /<Key>([\s\S]*?)<\/Key>/.exec(block)?.[1] ?? "";
+      const size = Number(/<Size>(\d+)<\/Size>/.exec(block)?.[1] ?? "0");
+      const lastModified = /<LastModified>([\s\S]*?)<\/LastModified>/.exec(block)?.[1] ?? null;
+      if (key) objects.push({ key: decodeXml(key), size, lastModified });
+    }
+    return objects;
+  }
+
+  /** Read a byte range of one object (used to sample a 10/50 GB CSV cheaply). */
+  async getRange(key: string, bytes: number, offset = 0): Promise<Buffer> {
+    const response = await this.sign("GET", key, undefined, undefined, {
+      range: `bytes=${offset}-${offset + bytes - 1}`,
+    });
+    if (!response.ok) {
+      throw new Error(`Range read failed for ${key}: HTTP ${response.status}`);
+    }
+    return Buffer.from(await response.arrayBuffer());
+  }
+
   /** PUT with retries and exponential backoff. */
-  async put(key: string, body: Buffer, contentType: string, attempts = 4): Promise<PutResult> {
+  async put(
+    key: string,
+    body: Buffer,
+    contentType: string,
+    attempts = 4,
+    extra?: { contentEncoding?: string; contentDisposition?: string },
+  ): Promise<PutResult> {
     let lastError = "unknown error";
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       try {
-        const response = await this.sign("PUT", key, body, contentType);
+        const response = await this.sign("PUT", key, body, contentType, extra);
         if (response.ok) {
           return { key, bytes: body.length, etag: response.headers.get("etag"), attempts: attempt };
         }
@@ -128,13 +216,13 @@ export class R2Client {
   async putJson(key: string, value: unknown, gzip = false): Promise<PutResult> {
     const raw = Buffer.from(JSON.stringify(value), "utf8");
     const body = gzip ? gzipSync(raw) : raw;
-    return this.put(key, body, gzip ? "application/json" : "application/json");
+    return this.put(key, body, "application/json", 4, gzip ? { contentEncoding: "gzip" } : undefined);
   }
 
   async putFile(key: string, path: string, contentType: string, gzip = false): Promise<PutResult> {
     const raw = await readFile(path);
     const body = gzip && !path.endsWith(".gz") ? gzipSync(raw) : raw;
-    return this.put(key, body, contentType);
+    return this.put(key, body, contentType, 4, gzip ? { contentEncoding: "gzip" } : undefined);
   }
 
   /** GET one object (used by the verification script; never writes). */

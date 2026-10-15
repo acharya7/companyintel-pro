@@ -1,5 +1,5 @@
 /**
- * R2Store behaviour tests with an in-memory fake R2 bucket.
+ * R2Store behaviour tests.
  *
  * These cover the parts of the saved-leads design that are easy to get wrong and
  * impossible to see from the UI:
@@ -7,7 +7,16 @@
  *   - writes are compare-and-set, so a concurrent writer cannot be silently
  *     overwritten (the second writer retries against fresh state),
  *   - a recovery snapshot of the pre-mutation state is written to backups/,
- *   - deletes update both the shard and the index.
+ *   - deletes update both the shard and the index,
+ *   - `raw/` can be listed with bounded metadata for the Dataset page.
+ *
+ * They use the same `FakeR2Bucket` as the end-to-end tests. A second, divergent
+ * double used to live in this file and drifted from the real binding (it lacked
+ * `arrayBuffer()`), which made passing tests meaningless — one realistic double
+ * is now shared by every test that needs R2.
+ *
+ * Deeper failure-mode coverage (missing/corrupt/stale directory, repair) lives in
+ * `leads-recovery.test.ts`.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -15,69 +24,7 @@ import { describe, expect, test } from "bun:test";
 import { R2Store } from "../worker/src/store";
 import type { SavedLead } from "../src/shared/models";
 import { leadShardKey, snapshotKey } from "../src/shared/search/index-format";
-
-/* ------------------------------- fake bucket ------------------------------ */
-
-interface StoredObject {
-  etag: string;
-  text: string;
-}
-
-class FakeBucket {
-  readonly objects = new Map<string, StoredObject>();
-  /** Runs before every put, to simulate another writer winning the race. */
-  beforePut: (() => void) | null = null;
-  putCount = 0;
-  private counter = 0;
-
-  private etag(text: string): string {
-    this.counter += 1;
-    return `"etag-${this.counter}-${text.length}"`;
-  }
-
-  async get(key: string): Promise<unknown> {
-    const object = this.objects.get(key);
-    if (!object) return null;
-    return {
-      key,
-      etag: object.etag,
-      size: object.text.length,
-      text: async () => object.text,
-      json: async () => JSON.parse(object.text),
-    };
-  }
-
-  async put(key: string, value: string, options?: { onlyIf?: { etagMatches?: string } }): Promise<unknown> {
-    this.putCount += 1;
-    const hook = this.beforePut;
-    this.beforePut = null;
-    if (hook) hook();
-    const current = this.objects.get(key);
-    if (options?.onlyIf?.etagMatches && current && current.etag !== options.onlyIf.etagMatches) {
-      // R2 returns null when the precondition fails: a lost update, not an error.
-      return null;
-    }
-    const etag = this.etag(value);
-    this.objects.set(key, { etag, text: value });
-    return { key, etag };
-  }
-
-  async head(key: string): Promise<unknown> {
-    return this.objects.get(key) ?? null;
-  }
-
-  async delete(key: string): Promise<void> {
-    this.objects.delete(key);
-  }
-
-  async list(options: { prefix: string; limit?: number; cursor?: string }): Promise<unknown> {
-    const objects = [...this.objects.entries()]
-      .filter(([key]) => key.startsWith(options.prefix))
-      .slice(0, options.limit ?? 1000)
-      .map(([key, value]) => ({ key, etag: value.etag, size: value.text.length }));
-    return { objects, truncated: false };
-  }
-}
+import { FakeR2Bucket } from "./helpers/fake-r2";
 
 function makeLead(overrides: Partial<SavedLead> = {}): SavedLead {
   return {
@@ -86,18 +33,22 @@ function makeLead(overrides: Partial<SavedLead> = {}): SavedLead {
     companyId: "company_1",
     status: "new",
     tags: [],
-    notes: "",
+    notes: [],
     savedAt: "2026-10-15T10:00:00.000Z",
     updatedAt: "2026-10-15T10:00:00.000Z",
+    datasetVersion: "v1",
     ...overrides,
   } as SavedLead;
 }
 
-function makeStore(): { bucket: FakeBucket; store: R2Store } {
-  const bucket = new FakeBucket();
+function makeStore(): { bucket: FakeR2Bucket; store: R2Store } {
+  const bucket = new FakeR2Bucket();
   const store = new R2Store(bucket as unknown as R2Bucket);
   return { bucket, store };
 }
+
+const readJson = <T>(bucket: FakeR2Bucket, key: string): T =>
+  JSON.parse(bucket.getObject(key)!.bytes.toString("utf8")) as T;
 
 /* ---------------------------------- tests --------------------------------- */
 
@@ -106,9 +57,10 @@ describe("saved leads in R2", () => {
     const { bucket, store } = makeStore();
     await store.upsertLead(makeLead({ id: "lead-a" }));
 
-    const shard = bucket.objects.get(leadShardKey(store["leadPartition"]("lead-a")));
+    const partition = (store as unknown as { leadPartition(id: string): number })["leadPartition"]("lead-a");
+    const shard = bucket.getObject(leadShardKey(partition));
     expect(shard).toBeDefined();
-    expect(JSON.parse(shard!.text)).toHaveLength(1);
+    expect(readJson<SavedLead[]>(bucket, leadShardKey(partition))).toHaveLength(1);
 
     const leads = await store.listLeads();
     expect(leads.map((lead) => lead.id)).toEqual(["lead-a"]);
@@ -118,7 +70,7 @@ describe("saved leads in R2", () => {
     const { bucket, store } = makeStore();
     await store.upsertLead(makeLead({ id: "lead-1" }));
 
-    const partition = store["leadPartition"]("lead-1");
+    const partition = (store as unknown as { leadPartition(id: string): number })["leadPartition"]("lead-1");
     const key = leadShardKey(partition);
 
     let injected = false;
@@ -127,37 +79,30 @@ describe("saved leads in R2", () => {
       // changes, so the first conditional put must fail.
       if (injected) return;
       injected = true;
-      bucket.objects.set(key, {
-        etag: '"someone-else"',
-        text: JSON.stringify([makeLead({ id: "lead-from-other-tab", notes: "written concurrently" })]),
-      });
+      bucket.putBytes(key, Buffer.from(JSON.stringify([makeLead({ id: "lead-from-other-tab" })]), "utf8"));
     };
 
-    await store.upsertLead(makeLead({ id: "lead-1", notes: "second edit" }));
+    await store.upsertLead(makeLead({ id: "lead-1", tags: ["edited"] }));
 
     const leads = await store.listLeads();
-    const ids = leads.map((lead) => lead.id).sort();
-    // Both the concurrent lead and our own edit survive: the retry re-ran the
-    // mutation against fresh state instead of clobbering it.
-    expect(ids).toEqual(["lead-1", "lead-from-other-tab"]);
-    const mine = leads.find((lead) => lead.id === "lead-1");
-    expect(mine?.notes).toBe("second edit");
-    expect(bucket.objects.get(key)).toBeDefined();
+    expect(leads.map((lead) => lead.id).sort()).toEqual(["lead-1", "lead-from-other-tab"]);
+    expect(leads.find((lead) => lead.id === "lead-1")?.tags).toEqual(["edited"]);
+    expect(bucket.getObject(key)).toBeDefined();
   });
 
   test("a recovery snapshot of the pre-mutation state is kept under backups/", async () => {
     const { bucket, store } = makeStore();
-    await store.upsertLead(makeLead({ id: "lead-1", notes: "first" }));
-    await store.upsertLead(makeLead({ id: "lead-1", notes: "second" }));
+    await store.upsertLead(makeLead({ id: "lead-1", tags: ["first"] }));
+    await store.upsertLead(makeLead({ id: "lead-1", tags: ["second"] }));
 
     const stamp = new Date().toISOString().slice(0, 10);
-    const key = snapshotKey(stamp, leadShardKey(store["leadPartition"]("lead-1")));
-    const snapshot = bucket.objects.get(key);
+    const partition = (store as unknown as { leadPartition(id: string): number })["leadPartition"]("lead-1");
+    const snapshot = bucket.getObject(snapshotKey(stamp, leadShardKey(partition)));
     expect(snapshot).toBeDefined();
 
-    const restored = JSON.parse(snapshot!.text) as SavedLead[];
+    const restored = JSON.parse(snapshot!.bytes.toString("utf8")) as SavedLead[];
     expect(restored).toHaveLength(1);
-    expect(restored[0].notes).toBe("first");
+    expect(restored[0].tags).toEqual(["first"]);
   });
 
   test("deleting a lead clears the shard and the index entry", async () => {
@@ -170,9 +115,9 @@ describe("saved leads in R2", () => {
 
   test("raw/ can be listed with bounded metadata for the dataset page", async () => {
     const { bucket, store } = makeStore();
-    bucket.objects.set("raw/companies_part1.csv", { etag: '"a"', text: "id,name\n1,Acme\n" });
-    bucket.objects.set("raw/companies_part2.csv", { etag: '"b"', text: "id,name\n2,Globex\n" });
-    bucket.objects.set("indexes/v1/exact/0000.json.gz", { etag: '"c"', text: "{}" });
+    bucket.putBytes("raw/companies_part1.csv", Buffer.from("id,name\n1,Acme\n"));
+    bucket.putBytes("raw/companies_part2.csv", Buffer.from("id,name\n2,Globex\n"));
+    bucket.putBytes("indexes/v1/exact/0000.json.gz", Buffer.from("{}"));
 
     const listed = await store.list("raw/");
     expect(listed.map((object) => object.key).sort()).toEqual([
@@ -188,8 +133,8 @@ describe("saved leads in R2", () => {
     await store.upsertLead(makeLead({ id: "lead-a" }));
     await store.upsertLead(makeLead({ id: "lead-b" }));
 
-    const keys = [...bucket.objects.keys()].filter((key) => key.startsWith("app-data/leads/") && !key.endsWith("index.json"));
-    expect(keys.length).toBeGreaterThanOrEqual(1);
+    const keys = bucket.keys("app-data/leads/").filter((key) => !key.endsWith("index.json"));
+    expect(keys.length).toBe(2);
     expect((await store.listLeads()).length).toBe(2);
   });
 });

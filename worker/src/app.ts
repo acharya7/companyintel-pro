@@ -121,6 +121,15 @@ app.onError((error, c) => {
   if (error instanceof AccessError) {
     return c.json({ error: { code: error.code, message: error.message, requestId } }, error.status as 401);
   }
+  // `HttpError` carries the status the client must see (404 not found, 503 no
+  // dataset, 400 invalid). Without this branch every one of those would surface
+  // as a generic 500 and the UI could not tell "missing" from "broken".
+  if (error instanceof HttpError) {
+    return c.json(
+      { error: { code: error.code, message: error.message, requestId } },
+      error.status as 400 | 401 | 403 | 404 | 429 | 500 | 503,
+    );
+  }
   if (error instanceof z.ZodError) {
     return c.json(
       {
@@ -529,6 +538,18 @@ app.get("/api/contacts/:id", async (c) => {
 app.get("/api/leads", async (c) => {
   const leads = await c.get("store").listLeads();
   return c.json({ leads, total: leads.length });
+});
+
+/**
+ * Repair the saved-lead directory from the authoritative shard objects.
+ *
+ * Needed if a write was interrupted between the shard and the directory object
+ * (the shard is written first, so the leads themselves survive). Reads already
+ * self-heal, so this is for an explicit operator action; it never deletes a lead.
+ */
+app.post("/api/leads/repair", async (c) => {
+  const index = await c.get("store").rebuildLeadIndex();
+  return c.json({ repaired: true, total: index.total, partitions: index.partitions.length });
 });
 
 app.post("/api/leads", async (c) => {
