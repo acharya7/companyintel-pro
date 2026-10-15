@@ -1,0 +1,62 @@
+# CompanyIntel — Cloudflare Workers + R2 deployment configuration.
+#
+# Deploy:   bunx wrangler deploy
+# Preview:  bunx wrangler dev            (local, synthetic data allowed)
+#
+# Secrets are NEVER stored in this file. Set them once with:
+#   bunx wrangler secret put CF_ACCESS_TEAM_DOMAIN
+#   bunx wrangler secret put CF_ACCESS_AUD
+#   bunx wrangler secret put ALLOWED_EMAILS
+#
+# Step-by-step instructions: docs/deployment.md
+
+name = "companyintel"
+main = "worker/src/index.ts"
+compatibility_date = "2025-09-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+# ---------------------------------------------------------------------------
+# Static frontend (built by `bun run build`, output in ./dist)
+# ---------------------------------------------------------------------------
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+# ---------------------------------------------------------------------------
+# R2 — the ONLY persistent cloud data store. Private bucket; no r2.dev URL, no
+# public bucket access, no S3 credentials inside the Worker.
+# ---------------------------------------------------------------------------
+[[r2_buckets]]
+binding = "COMPANY_DATA"
+bucket_name = "company-intel-data"
+
+[vars]
+ENVIRONMENT = "production"
+APP_VERSION = "0.1.0"
+# Per-identity API rate limit (requests per minute per route group).
+MAX_SEARCHES_PER_MINUTE = "180"
+
+# ---------------------------------------------------------------------------
+# Observability: keep logs; no payload logging of private contact data.
+# ---------------------------------------------------------------------------
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+# ---------------------------------------------------------------------------
+# Local development (`wrangler dev`).
+#
+# DEV_ALLOW_UNAUTHENTICATED must stay false/absent for production, and the
+# Worker refuses the bypass whenever ENVIRONMENT === "production".
+# ---------------------------------------------------------------------------
+[env.development]
+name = "companyintel-dev"
+workers_dev = true
+
+[env.development.vars]
+ENVIRONMENT = "development"
+APP_VERSION = "0.1.0-dev"
+DEV_ALLOW_UNAUTHENTICATED = "false"
+MAX_SEARCHES_PER_MINUTE = "600"

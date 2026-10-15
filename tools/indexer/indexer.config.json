@@ -1,0 +1,46 @@
+{
+  "$comment": [
+    "CompanyIntel indexer configuration.",
+    "",
+    "1. Replace the two `path` values with the real locations of your CSV files on this machine.",
+    "   Use forward slashes on Windows, e.g. \"D:/data/companies_part1.csv\".",
+    "2. Run `profile` first and adjust `columns` if the profiler maps something incorrectly.",
+    "3. Run a `--sample 100000` pass before the full job.",
+    "4. Never paste R2 keys in here: they are read from the environment only."
+  ],
+  "datasetVersion": "v1",
+  "sources": [
+    {
+      "id": "csv1",
+      "path": "D:/company-intel/raw/companies_part1.csv",
+      "encoding": "utf8",
+      "delimiter": ","
+    },
+    {
+      "id": "csv2",
+      "path": "D:/company-intel/raw/companies_part2.csv",
+      "encoding": "utf8",
+      "delimiter": ","
+    }
+  ],
+  "workDir": ".indexer-work",
+  "outputDir": ".indexer-output",
+  "partitions": 256,
+  "shards": {
+    "exact": 512,
+    "prefix": 256,
+    "token": 256,
+    "trigram": 512,
+    "ids": 256
+  },
+  "$commentObjectSizes": [
+    "Companies per object and contacts per object are fixed in code (SHARDING in",
+    "src/shared/search/index-format.ts) because the Worker derives the object key for",
+    "a document reference from those same constants. Changing them requires a new",
+    "index format version and a rebuild."
+  ],
+  "upload": {
+    "enabled": false,
+    "bucket": "company-intel-data"
+  }
+}

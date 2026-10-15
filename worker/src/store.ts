@@ -1,0 +1,401 @@
+/**
+ * R2 data access for the Worker.
+ *
+ * Only two kinds of objects exist here:
+ *   - immutable, versioned index/profile objects (never written in place),
+ *   - a handful of small, mutable `app-data/` objects (leads, saved searches,
+ *     settings, activity, exports) written with conditional (compare-and-set)
+ *     requests so two browser tabs cannot lose each other's writes.
+ *
+ * R2 is eventually consistent for writes, so the optimistic-concurrency loop
+ * below re-reads and retries a bounded number of times and then surfaces a
+ * conflict to the caller instead of silently overwriting.
+ */
+
+import type { Company, Contact, DatasetStats, DatasetVersionSummary, SavedLead, SavedSearch, UserSettings, ActivityEntry } from "../../src/shared/models";
+import { leadShardKey, statsKey, activeManifestKey, companyPartitionKey, contactPartitionKey, exportMetaKey, exportObjectKey, indexDirectoryKey, indexShardKey, manifestKey, partitionOfRef, contactPartitionOfRef, savedSearchesKey, settingsKey, activityKey, validationKey, progressKey, type IndexDirectory, type ShardPayload, type IndexKind, type CompanyPartitionPayload, type ContactPartitionPayload } from "../../src/shared/search/index-format";
+import { SHARDING, snapshotKey } from "../../src/shared/search/index-format";
+import { shardOf } from "../../src/shared/hash";
+
+export const LEAD_SHARDS = 64;
+export const MAX_WRITE_RETRIES = 4;
+
+export interface ActivePointer {
+  version: string;
+  previousVersion: string | null;
+  activatedAt: string;
+  activatedBy: string;
+}
+
+export interface LeadIndex {
+  total: number;
+  partitions: { partition: number; count: number; updatedAt: string }[];
+  updatedAt: string;
+}
+
+export interface ExportIndexEntry {
+  id: string;
+  filename: string;
+  createdAt: string;
+  rowCount: number;
+  bytes: number;
+  truncated: boolean;
+}
+
+export class R2Store {
+  constructor(private readonly bucket: R2Bucket) {}
+
+  /* ------------------------------ primitives ----------------------------- */
+
+  private async readObject(key: string): Promise<R2ObjectBody | null> {
+    try {
+      return await this.bucket.get(key);
+    } catch {
+      return null;
+    }
+  }
+
+  async getText(key: string): Promise<string | null> {
+    const object = await this.readObject(key);
+    return object ? object.text() : null;
+  }
+
+  /** JSON object (optionally gzip-compressed by the indexer). */
+  async getJson<T>(key: string): Promise<T | null> {
+    const object = await this.readObject(key);
+    if (!object) return null;
+    try {
+      const encoding = object.httpMetadata?.contentEncoding;
+      if (encoding === "gzip") {
+        // The R2 binding returns the stored bytes; decompress with the runtime's
+        // streaming decompressor rather than buffering everything first.
+        const decompressed = object.body.pipeThrough(new DecompressionStream("gzip"));
+        return (await new Response(decompressed).json()) as T;
+      }
+      return (await object.json()) as T;
+    } catch {
+      return null;
+    }
+  }
+
+  async putJson(key: string, value: unknown, options: { gzip?: boolean; onlyIf?: R2Conditional } = {}): Promise<R2Object | null> {
+    const body = JSON.stringify(value);
+    return this.bucket.put(key, body, {
+      httpMetadata: {
+        contentType: "application/json",
+        ...(options.gzip ? { contentEncoding: "gzip" } : {}),
+      },
+      onlyIf: options.onlyIf,
+    });
+  }
+
+  async putCsv(key: string, body: string): Promise<void> {
+    await this.bucket.put(key, body, {
+      httpMetadata: { contentType: "text/csv; charset=utf-8", contentDisposition: `attachment` },
+    });
+  }
+
+  async deleteObject(key: string): Promise<void> {
+    await this.bucket.delete(key);
+  }
+
+  async head(key: string): Promise<R2Object | null> {
+    try {
+      return await this.bucket.head(key);
+    } catch {
+      return null;
+    }
+  }
+
+  /** Bounded listing — used only by the dataset management page. */
+  async list(prefix: string, limit = 1000): Promise<R2Object[]> {
+    const objects: R2Object[] = [];
+    let cursor: string | undefined;
+    while (objects.length < limit) {
+      const page = await this.bucket.list({ prefix, limit: Math.min(1000, limit - objects.length), cursor });
+      objects.push(...page.objects);
+      if (!page.truncated) break;
+      cursor = page.cursor;
+    }
+    return objects;
+  }
+
+  /* ------------------------------ dataset --------------------------------- */
+
+  async getActivePointer(): Promise<ActivePointer | null> {
+    return this.getJson<ActivePointer>(activeManifestKey());
+  }
+
+  async getDirectory(version: string): Promise<IndexDirectory | null> {
+    return this.getJson<IndexDirectory>(indexDirectoryKey(version));
+  }
+
+  async getManifest(version: string): Promise<DatasetVersionSummary | null> {
+    return this.getJson<DatasetVersionSummary>(manifestKey(version));
+  }
+
+  async getValidation(version: string): Promise<unknown | null> {
+    return this.getJson(validationKey(version));
+  }
+
+  async getProgress(version: string): Promise<unknown | null> {
+    return this.getJson(progressKey(version));
+  }
+
+  async getStats(version: string): Promise<DatasetStats | null> {
+    return this.getJson<DatasetStats>(statsKey(version));
+  }
+
+  async putProgress(version: string, progress: unknown): Promise<void> {
+    await this.putJson(progressKey(version), progress);
+  }
+
+  async listManifests(limit = 20): Promise<DatasetVersionSummary[]> {
+    const objects = await this.list("manifests/", limit * 3);
+    const versions: DatasetVersionSummary[] = [];
+    for (const object of objects) {
+      if (!object.key.endsWith("/manifest.json")) continue;
+      const manifest = await this.getJson<DatasetVersionSummary>(object.key);
+      if (manifest) versions.push(manifest);
+    }
+    return versions.sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, limit);
+  }
+
+  /** Atomic publish: one tiny pointer object flips the whole dataset version. */
+  async activateVersion(pointer: ActivePointer): Promise<void> {
+    await this.putJson(activeManifestKey(), pointer);
+  }
+
+  /* ------------------------------- index ---------------------------------- */
+
+  async getShard(version: string, kind: IndexKind, shard: number): Promise<ShardPayload | null> {
+    return this.getJson<ShardPayload>(indexShardKey(version, kind, shard));
+  }
+
+  async getShardByTerm(version: string, kind: Exclude<IndexKind, "stats">, term: string, shardCount: number): Promise<ShardPayload | null> {
+    return this.getShard(version, kind, shardOf(term, shardCount));
+  }
+
+  /**
+   * Hydrate companies for a set of global refs.
+   *
+   * Profile objects are grouped by `companiesPerPartition`, so refs that fall in
+   * the same partition cost one read. `maxParts` bounds the worst case for a
+   * dispersed fuzzy result set.
+   */
+  async getCompaniesByRefs(version: string, refs: number[], maxParts = SHARDING.maxHydrate): Promise<Map<number, Company>> {
+    const grouped = new Map<number, number[]>();
+    for (const ref of refs) {
+      const partition = partitionOfRef(ref);
+      const list = grouped.get(partition);
+      if (list) list.push(ref);
+      else grouped.set(partition, [ref]);
+    }
+    const ordered = [...grouped.entries()].sort((a, b) => b[1].length - a[1].length).slice(0, maxParts);
+    const out = new Map<number, Company>();
+    await mapLimit(ordered, 8, async ([partition, partitionRefs]) => {
+      const payload = await this.getJson<CompanyPartitionPayload>(companyPartitionKey(version, partition));
+      if (!payload) return;
+      for (const ref of partitionRefs) {
+        const company = payload.companies[ref - payload.firstRef] as Company | undefined;
+        if (company) out.set(ref, company);
+      }
+    });
+    return out;
+  }
+
+  async getCompanyByRef(version: string, ref: number): Promise<Company | null> {
+    const partition = partitionOfRef(ref);
+    const payload = await this.getJson<CompanyPartitionPayload>(companyPartitionKey(version, partition));
+    if (!payload) return null;
+    return (payload.companies[ref - payload.firstRef] as Company | undefined) ?? null;
+  }
+
+  async getContactsByCompanyRef(version: string, ref: number): Promise<Contact[]> {
+    const partition = contactPartitionOfRef(ref);
+    const payload = await this.getJson<ContactPartitionPayload>(contactPartitionKey(version, partition));
+    if (!payload) return [];
+    return (payload.byCompany[String(ref)] as Contact[] | undefined) ?? [];
+  }
+
+  /* ----------------------------- app data --------------------------------- */
+
+  /**
+   * Read-modify-write one small app-data object with compare-and-set retries.
+   * `mutate` must be pure; it is re-run against fresh state after a conflict.
+   */
+  async updateJson<T>(
+    key: string,
+    mutate: (current: T | null) => T,
+    retries = MAX_WRITE_RETRIES,
+    options: { snapshot?: boolean } = {},
+  ): Promise<T> {
+    for (let attempt = 0; attempt <= retries; attempt += 1) {
+      const object = await this.readObject(key);
+      let current: T | null = null;
+      if (object) {
+        try {
+          const text = await object.text();
+          current = JSON.parse(text) as T;
+          // Recovery snapshot: the pre-mutation state, at most once per object
+          // per day. A snapshot failure must never block the write itself.
+          if (options.snapshot && attempt === 0) {
+            const stamp = new Date().toISOString().slice(0, 10);
+            await this.bucket
+              .put(snapshotKey(stamp, key), text, { httpMetadata: { contentType: "application/json" } })
+              .catch(() => undefined);
+          }
+        } catch {
+          current = null;
+        }
+      }
+      const next = mutate(current);
+      const result = await this.bucket.put(key, JSON.stringify(next), {
+        httpMetadata: { contentType: "application/json" },
+        onlyIf: object ? { etagMatches: object.etag } : undefined,
+      });
+      // `put` returns null when `onlyIf` fails — that is a lost update, not an error.
+      if (result) return next;
+    }
+    throw new Error(`Concurrent write conflict on ${key} — nothing was overwritten. Retry the operation.`);
+  }
+
+  private leadPartition(leadId: string): number {
+    return shardOf(leadId, LEAD_SHARDS);
+  }
+
+  async listLeads(): Promise<SavedLead[]> {
+    const index = await this.getJson<LeadIndex>(leadShardKeyIndex());
+    if (!index || !index.partitions.length) return [];
+    const shards = await Promise.all(index.partitions.map((part) => this.getJson<SavedLead[]>(leadShardKey(part.partition))));
+    return shards.flatMap((shard) => shard ?? []).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }
+
+  async getLead(id: string): Promise<SavedLead | null> {
+    const shard = await this.getJson<SavedLead[]>(leadShardKey(this.leadPartition(id)));
+    return shard?.find((lead) => lead.id === id) ?? null;
+  }
+
+  async upsertLead(lead: SavedLead): Promise<SavedLead> {
+    const partition = this.leadPartition(lead.id);
+    const key = leadShardKey(partition);
+    let stored: SavedLead = lead;
+    await this.updateJson<SavedLead[]>(
+      key,
+      (current) => {
+        const list = current ?? [];
+        const index = list.findIndex((item) => item.id === lead.id);
+        if (index === -1) {
+          list.push(lead);
+        } else {
+          stored = { ...lead, savedAt: list[index].savedAt };
+          list[index] = stored;
+        }
+        return list;
+      },
+      MAX_WRITE_RETRIES,
+      { snapshot: true },
+    );
+    await this.updateJson<LeadIndex>(leadShardKeyIndex(), (current) => {
+      const partitions = current?.partitions ? [...current.partitions] : [];
+      const existing = partitions.findIndex((p) => p.partition === partition);
+      const count = existing === -1 ? 1 : partitions[existing].count;
+      const entry = { partition, count, updatedAt: new Date().toISOString() };
+      if (existing === -1) partitions.push(entry);
+      else partitions[existing] = entry;
+      return { total: partitions.reduce((sum, p) => sum + p.count, 0), partitions, updatedAt: entry.updatedAt };
+    });
+    return stored;
+  }
+
+  async deleteLead(id: string): Promise<boolean> {
+    const partition = this.leadPartition(id);
+    let removed = false;
+    await this.updateJson<SavedLead[]>(
+      leadShardKey(partition),
+      (current) => {
+        const list = current ?? [];
+        const next = list.filter((lead) => lead.id !== id);
+        removed = next.length !== list.length;
+        return next;
+      },
+      MAX_WRITE_RETRIES,
+      { snapshot: true },
+    );
+    if (removed) {
+      await this.updateJson<LeadIndex>(leadShardKeyIndex(), (current) => {
+        const partitions = current?.partitions ?? [];
+        return {
+          total: Math.max(0, (current?.total ?? 1) - 1),
+          partitions,
+          updatedAt: new Date().toISOString(),
+        };
+      });
+    }
+    return removed;
+  }
+
+  async getSavedSearches(): Promise<SavedSearch[]> {
+    return (await this.getJson<SavedSearch[]>(savedSearchesKey())) ?? [];
+  }
+
+  async mutateSavedSearches(mutate: (current: SavedSearch[]) => SavedSearch[]): Promise<SavedSearch[]> {
+    return this.updateJson<SavedSearch[]>(savedSearchesKey(), (current) => mutate(current ?? []));
+  }
+
+  async getSettings(): Promise<UserSettings | null> {
+    return this.getJson<UserSettings>(settingsKey());
+  }
+
+  async putSettings(settings: UserSettings): Promise<UserSettings> {
+    await this.putJson(settingsKey(), settings);
+    return settings;
+  }
+
+  async getActivity(): Promise<ActivityEntry[]> {
+    return (await this.getJson<ActivityEntry[]>(activityKey())) ?? [];
+  }
+
+  async appendActivity(entry: ActivityEntry): Promise<void> {
+    await this.updateJson<ActivityEntry[]>(activityKey(), (current) => [entry, ...(current ?? [])].slice(0, 80));
+  }
+
+  async putExport(meta: ExportIndexEntry, csv: string): Promise<void> {
+    await this.putJson(exportMetaKey(meta.id), meta);
+    await this.putCsv(exportObjectKey(meta.id), csv);
+    await this.updateJson<ExportIndexEntry[]>(`app-data/exports/index.json`, (current) =>
+      [meta, ...(current ?? [])].slice(0, 50),
+    );
+  }
+
+  async listExports(): Promise<ExportIndexEntry[]> {
+    return (await this.getJson<ExportIndexEntry[]>("app-data/exports/index.json")) ?? [];
+  }
+
+  async getExport(id: string): Promise<ExportIndexEntry | null> {
+    return this.getJson<ExportIndexEntry>(exportMetaKey(id));
+  }
+
+  async getExportCsv(id: string): Promise<string | null> {
+    return this.getText(exportObjectKey(id));
+  }
+}
+
+function leadShardKeyIndex(): string {
+  return "app-data/leads/index.json";
+}
+
+/** Bounded-concurrency map — keeps R2 read fan-out predictable. */
+export async function mapLimit<T, R>(items: T[], limit: number, worker: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let cursor = 0;
+  const runners = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      results[index] = await worker(items[index]);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
