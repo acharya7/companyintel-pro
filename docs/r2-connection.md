@@ -1,10 +1,13 @@
 # Connecting R2 — what is real, what is not
 
 Short version: **the production Worker reaches your bucket through the native R2
-binding `COMPANY_DATA` and needs no keys at all**; the only thing that ever needs
-S3 credentials is the one-time local indexing upload, and those credentials belong
-in a terminal on your own machine — not in the Freebuff environment panel. Nothing
-in this workspace has read your bucket yet.
+binding `COMPANY_DATA` and needs no keys at all.** The one-command connection test
+(`bun run verify:r2:remote`, §2) uses that same binding through a local, read-only
+probe Worker, so verifying the real bucket needs **no R2 access key and no secret**.
+The only thing that ever needs S3 credentials is the local indexer's *upload*, and
+the indexer reading Mode B sources — those credentials belong in a terminal on your
+own machine, never in the Freebuff environment panel. Nothing in this workspace has
+read your bucket yet.
 
 ## 1. What was actually checked in this workspace (evidence, not assumption)
 
@@ -13,14 +16,95 @@ in this workspace has read your bucket yet.
 | Does the app depend on Convex? | `convex` is absent from `package.json`; no `src/convex/`; no `convex` import in `src/`, `worker/`, `tools/`, `tests/` | **No Convex dependency at all** |
 | Where does the Worker get its configuration? | `worker/src/env.d.ts` + `wrangler.toml` | Bindings/vars/secrets only: `COMPANY_DATA`, `ASSETS`, `ENVIRONMENT`, `APP_VERSION`, `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD`, `ALLOWED_EMAILS`, `DEV_ALLOW_UNAUTHENTICATED`, `MAX_SEARCHES_PER_MINUTE` |
 | Are R2 credentials visible to this workspace's processes? | `bun scripts/verify-raw.mjs` | **Exit 2**: "R2 credentials are not set for this terminal session" — so `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` are **not** present here |
-| Can this workspace make server-side R2 S3 requests? | The verification scripts run on Node/Bun and sign SigV4 themselves; exercised end to end over a stub transport (`tests/verify-raw-script.test.ts`, `tests/profile-raw-script.test.ts`) | **Yes, technically** — but see §3: it still needs credentials supplied to that process |
+| Can this workspace make server-side R2 S3 requests? | The verification scripts run on Node/Bun and sign SigV4 themselves; exercised end to end over a stub transport (`tests/verify-raw-script.test.ts`, `tests/profile-raw-script.test.ts`) | **Yes, technically** — but see §4: it still needs credentials supplied to that process |
 | Does the preview depend on Convex? | `src/lib/api/client.ts` | **No.** With no `VITE_API_MODE` set it serves the bundled synthetic sample dataset (`local` mode) and labels every screen as sample data |
 | Does the Worker ever read an S3 secret? | `tests/worker-r2-binding.test.ts` scans every `worker/**/*.ts` | **No** — no `R2_*` secret, no `cloudflarestorage.com`, no `process.env` |
 
 The Frontend tab still lists `VITE_CONVEX_URL` / `CONVEX_DEPLOYMENT` because the
 project template ships those lines. Nothing in this codebase reads them.
 
-## 2. The Freebuff panel: what each tab can and cannot do
+## 2. The fastest path: the read-only probe (no S3 keys)
+
+`bun run verify:r2:remote` starts an **isolated, read-only probe Worker** on your Mac
+(`probe/wrangler.toml`) bound to `127.0.0.1:8788`, with the native `COMPANY_DATA` binding pointed at
+the real `company-intel-data` bucket through `remote = true`. Your existing Wrangler login is the
+only credential involved; the probe is never deployed and cannot write (see §6 for the guards that
+prove it).
+
+```bash
+cd /path/to/companyintel-pro-main          # the folder you extracted
+bun run verify:r2:remote                   # human-readable report
+bun run verify:r2:remote --json > raw-verification.json     # one share-safe JSON report
+bun run verify:r2:remote --keys raw/<file1>.csv,raw/<file2>.csv   # name the sources explicitly
+```
+
+Requirements: Wrangler 4.x (`bunx wrangler --version`), a completed `bunx wrangler login`, Bun
+installed, and port 8788 free. Nothing else — no API token, no key, no secret.
+
+What one run does, and nothing more:
+
+1. starts the probe locally (`wrangler dev --config probe/wrangler.toml --ip 127.0.0.1 --port 8788`)
+   and waits for `/health`;
+2. **one bounded `raw/` listing** (≤ 25 objects per page, ≤ 2 pages, largest first) with real keys,
+   byte sizes and timestamps;
+3. names the two source objects (or the `--keys` you gave), then does a `HEAD` and a **1 KB ranged
+   body read** per source to prove it is readable — never a whole-file download;
+4. a **6 MB bounded sample** per source for a schema report: encoding, delimiter, header line,
+   column names, fill rates, type guesses and per-column canonical-field suggestions with a
+   confidence and the evidence, plus a ready-to-paste `columns` override for the indexer;
+5. the published-dataset state (`manifests/active.json` → manifest / validation / directory), or
+   "none" if nothing is published;
+6. stops the probe and exits **0** verified, **1** problem (missing/unreadable/not published),
+   **2** the probe could not be started.
+
+The report contains object keys, sizes, ETags, timestamps, headers, fill rates and mappings — and
+**no cell values, names, emails or phone numbers**.
+
+Expected output, in outline:
+
+```
+CompanyIntel R2 probe — companyintel-r2-probe
+checked at 2026-…   read-only: no writes, no uploads, no deletes
+
+Bucket company-intel-data — READABLE with the native COMPANY_DATA binding (no S3 keys used)
+Objects under raw/: 2 read over 1 page(s), showing up to 25
+   50.00 GB  raw/<file2>.csv   2026-09-12T10:00:00.000Z
+   10.00 GB  raw/<file1>.csv   2026-09-12T09:00:00.000Z
+
+Source selection: two-largest-csv
+Source objects
+  ok       raw/<file2>.csv  50.00 GB  etag=…  read 1.00 KB of the body
+  ok       raw/<file1>.csv  10.00 GB  etag=…  read 1.00 KB of the body
+
+Published dataset
+  none — the app will report "Dataset not indexed" until a version is published
+
+Schema — raw/<file2>.csv
+  encoding          UTF-8 (no BOM) (encoding utf-8, confidence high)
+  delimiter         "," (confidence high)
+  header line       1   columns 14
+  columns (no cell values are included): …
+  mapping suggestions: …
+  suggested indexer columns override: {…}
+
+VERIFIED: every expected object is present and readable, and the published dataset is intact.
+```
+
+If it fails:
+
+| Symptom | What it means / what to do |
+| --- | --- |
+| `The probe did not become ready within …s` | Read the wrangler lines it prints. Usually `bunx wrangler login` has not been run in this terminal. |
+| `Port 8788 is already in use` | Re-run with `--port 8789` (free the port, or keep the other process). |
+| `The probe exited before it answered` | Wrangler older than 4.x, or the account cannot see the bucket. Check `bunx wrangler --version` and `bunx wrangler r2 bucket list`. |
+| `remote = true` rejected by your Wrangler | Your Wrangler predates remote bindings; update Wrangler, or use §5 (S3 keys) for this one check. |
+| The report says `MISSING` for a source | The object key is not in the bounded listing. Copy the exact keys from the listing and pass `--keys`. Nothing was modified. |
+| You want to watch it while it runs | `bun run verify:r2:remote --keep-open` leaves the probe on `127.0.0.1:8788`; press Ctrl-C to stop it. |
+
+This is the check to run first. `bun run verify:r2` (§5) is the S3-key equivalent and remains useful
+as a fallback, and because the indexer needs those same keys for its upload stage.
+
+## 3. The Freebuff panel: what each tab can and cannot do
 
 - **Backend tab** — its variables belong to the project's Convex deployment (the UI
   reports that deployment is paused). This app has no Convex runtime, so a value
@@ -35,16 +119,19 @@ project template ships those lines. Nothing in this codebase reads them.
   Treat that as the boundary: secrets go into your own terminal, never into a
   message.
 
-## 3. The correct, supported credential path (unchanged by any of the above)
+## 4. The correct, supported credential path (unchanged by any of the above)
 
 | Stage | How R2 is reached | Credentials |
 | --- | --- | --- |
 | Production Worker (every search, every shard read) | Native binding `COMPANY_DATA` → `company-intel-data` (`wrangler.toml`) | **None. No keys exist in the Worker.** |
-| Phase A verification + schema profiling | `scripts/verify-raw.mjs`, `scripts/profile-raw.mjs` on your machine | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` in that shell session only |
-| Full indexing upload | `tools/indexer` on your machine (`run --upload`, `publish`) | same three variables, or rclone instead |
+| Phase A verification + schema profiling (**recommended**) | `bun run verify:r2:remote` → the local read-only probe Worker with the same binding (`remote = true`) | **None.** Your Wrangler login only |
+| Phase A alternative | `scripts/verify-raw.mjs`, `scripts/profile-raw.mjs` on your machine | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` in that shell session only |
+| Indexing Mode B (reading the two CSVs straight from R2) | `tools/indexer` with `r2://company-intel-data/raw/…` sources | the same three variables (Object Read is enough) |
+| Full indexing upload | `tools/indexer` on your machine (`run --upload`, `publish`) | same three variables (Object Read & Write), or rclone instead |
 | Worker secrets (Access) | `wrangler secret put …` on your machine | never in this repo |
 
-macOS (your machine, terminal session only — closes when the window does):
+macOS, only if you prefer the S3-key path over the probe (§2) — session only, closes with the
+window:
 
 ```bash
 cd /path/to/company-intel          # the repository this preview builds from
@@ -71,7 +158,7 @@ rclone lsl r2:company-intel-data/raw/        # rclone already configured on your
 
 The schema reports do need the scripts, because they need a profiled sample.
 
-## 4. What the connection test actually does
+## 5. What the S3-key connection test does
 
 `bun scripts/verify-raw.mjs` (read-only; `bun run verify:r2` is the same thing):
 
@@ -96,7 +183,7 @@ quoted multiline row), and prints both schema reports plus a suggested indexer
 `columns` mapping. `--json` gives one share-safe report: headers, fill rates and
 mappings, **no cell values**.
 
-## 5. Answers to the ten questions
+## 6. Answers to the ten questions
 
 1. **Can I use Backend → Add Variable for R2 credentials?** No.
 2. **Is that section tied to the paused Convex deployment?** Yes — it is Convex's
@@ -113,33 +200,39 @@ mappings, **no cell values**.
    real secret; the access key id and account id are still not for the Frontend tab.
 6. **What code consumes them?** Only local, non-deployed code:
    `tools/indexer/src/r2.ts` → `credentialsFromEnv()`, used by
-   `scripts/verify-raw.mjs`, `scripts/profile-raw.mjs` and the indexer's
-   `--upload`/`publish`. The Worker consumes **no** credentials — it uses the
-   `COMPANY_DATA` binding.
-7. **How do I test the connection securely?** In your own terminal, session-scoped
-   exports (or rclone), then `bun scripts/verify-raw.mjs --json`. Send back the JSON:
-   it contains names, sizes, ETags and counts — no secrets, no cell values.
-8. **If no — simplest safe alternative on macOS?** Your own terminal session (above).
-   Zero-config fallback: `rclone lsl r2:company-intel-data/raw/`, which needs no S3
-   keys at all and already works for you.
-9. **What can be done automatically here?** Everything except supplying the
-   credential: scripts, bounds, sample trimming, schema reports, mapping suggestions,
-   the R2 binding config, and the tests that prove the Worker never touches a key.
-   Proof so far: `tests/verify-raw-script.test.ts` and
-   `tests/profile-raw-script.test.ts` run the real scripts end to end over a stub
-   transport (bounded LIST, 25-object bound, 1 KB / 6 MB ranged reads, missing-object
-   handling, exit codes, no secrets in output) and `tests/worker-r2-binding.test.ts`
-   asserts the binding-only rule. **None of that is evidence about your bucket.**
-10. **Single next manual action:** in your own terminal, export the three variables
-    and run `bun scripts/verify-raw.mjs --json > raw-verification.json`, then send me
-    that file's contents. That is the one step that turns Phase A from "ready" into
-    "verified", and it is read-only.
+   `scripts/verify-raw.mjs`, `scripts/profile-raw.mjs`, the indexer's `r2://` (Mode B)
+   sources and its `--upload`/`publish`. The Worker consumes **no** credentials — it
+   uses the `COMPANY_DATA` binding, and so does the read-only probe.
+7. **How do I test the connection securely?** Run `bun run verify:r2:remote --json`
+   in your own terminal (§2). It needs no keys at all: it uses your Wrangler login and
+   the same native binding the deployed app uses. Send back the JSON — it contains
+   names, sizes, ETags, headers, fill rates and mappings, and no secrets or cell values.
+8. **If no — simplest safe alternative on macOS?** The probe is the simplest path;
+   its zero-config fallbacks are `rclone lsl r2:company-intel-data/raw/` and
+   Cloudflare dashboard → R2 → `company-intel-data` → Objects → prefix `raw/`, which
+   need no keys either. The S3-key scripts (§5) stay available if you prefer them.
+9. **What can be done automatically here?** Everything except running the probe against
+   your account: the probe Worker, its bounds, the bounded sample/schema reports, the
+   mapping suggestions, the binding config, the single-command runner, and the tests
+   that prove the Worker and the probe never touch a key and never write.
+   Proof so far: `tests/r2-probe.test.ts` (routes, bounds, no writes, no cell values),
+   `tests/r2-probe-schema.test.ts` (encoding/delimiter/multiline/mapping), and
+   `tests/verify-r2-remote-script.test.ts` (the runner's exit codes 0/1/2 over a stub
+   probe), plus `tests/worker-r2-binding.test.ts` for the binding-only rule.
+   **None of that is evidence about your bucket.**
+10. **Single next manual action:** in your own terminal,
+    `bun run verify:r2:remote --json > raw-verification.json`, then paste that file's
+    contents. That is the one step that turns Phase A from "ready" into "verified".
 
-## 6. Still pending, and one config item to confirm
+## 7. Still pending, and one config item to confirm
 
 - **Nothing about your bucket is verified yet.** Phase A stays `NOT VERIFIED` until
-  the run in §5.10 happens, and I will not fill in filenames, sizes or mappings
-  before then.
+  the run in §6.10 happens, and I will not fill in filenames, sizes or mappings before
+  then.
+- The probe itself is implemented and tested (locally, against an in-memory bucket and
+  a stub HTTP probe) but has **not** been run against your account: it needs your
+  authenticated Wrangler session, which exists only on your Mac. No Cloudflare call was
+  made from here.
 - `wrangler.toml` sets `workers_dev = true`, so the app is also reachable at its
   `*.workers.dev` hostname. The Worker itself fails closed (it requires a valid
   Cloudflare Access JWT for every `/api/*` route, even there), but when you configure

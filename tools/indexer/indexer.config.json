@@ -2,29 +2,53 @@
   "$comment": [
     "CompanyIntel indexer configuration.",
     "",
-    "1. Replace the two `path` values with the real locations of your CSV files on this machine.",
-    "   Use forward slashes on Windows, e.g. \"D:/data/companies_part1.csv\".",
-    "2. Run `profile` first and adjust `columns` if the profiler maps something incorrectly.",
-    "3. Run a `--sample 100000` pass before the full job.",
-    "4. Never paste R2 keys in here: they are read from the environment only."
+    "Sources support two modes — the indexer does not care which you use:",
+    "  MODE A (local file):  \"path\": \"D:/data/companies_part1.csv\"",
+    "  MODE B (R2 object):   \"path\": \"r2://company-intel-data/raw/companies_part1.csv\"",
+    "",
+    "The example below uses MODE B because the two source CSVs already live in R2,",
+    "while their original local copies may only exist on your previous laptop.",
+    "",
+    "Before a real run:",
+    "  1. Run `bun run verify:r2:remote` and copy the EXACT object keys from its",
+    "     report into `path` values. Do not guess the key names.",
+    "  2. Run `profile` and confirm the canonical mapping (fix `columns` if needed).",
+    "  3. Run a `--sample 100000` pass before the full job.",
+    "  4. Never paste R2 keys in here: they are read from the environment only.",
+    "",
+    "MODE B needs R2_ACCOUNT_ID / R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY exported",
+    "in your own terminal session (Object Read on company-intel-data is enough),",
+    "because Wrangler's login cannot be handed to a local Bun/Node process.",
+    "See docs/indexing.md.",
+    "",
+    "Switching to MODE A instead: copy the objects down with",
+    "  rclone copy r2:company-intel-data/raw/ ./raw-copy --progress",
+    "and point `path` at the local files."
   ],
   "datasetVersion": "v1",
   "sources": [
     {
       "id": "csv1",
-      "path": "D:/company-intel/raw/companies_part1.csv",
+      "path": "r2://company-intel-data/raw/companies_part1.csv",
       "encoding": "utf8",
       "delimiter": ","
     },
     {
       "id": "csv2",
-      "path": "D:/company-intel/raw/companies_part2.csv",
+      "path": "r2://company-intel-data/raw/companies_part2.csv",
       "encoding": "utf8",
       "delimiter": ","
     }
   ],
   "workDir": ".indexer-work",
   "outputDir": ".indexer-output",
+  "$commentRawCacheDir": [
+    "MODE B only: each R2 object is streamed to this directory once (via a .part",
+    "file that is renamed only after the byte count matches R2), so a re-run resumes",
+    "from disk instead of downloading 60 GB again. Budget ~1.0x the input size here",
+    "in addition to workDir, or set it to null to stream without caching."
+  ],
+  "rawCacheDir": ".indexer-raw-cache",
   "partitions": 256,
   "shards": {
     "exact": 512,

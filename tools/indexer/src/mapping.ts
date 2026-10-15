@@ -28,89 +28,18 @@ import {
   normalizePhone,
   nameVariants,
 } from "../../../src/shared/normalize";
-import { normalizeHeader } from "./csv";
-
-/** Canonical fields the indexer understands. */
-export const CANONICAL_COMPANY_FIELDS = [
-  "companyname",
-  "companydomain",
-  "companywebsite",
-  "companylinkedin",
-  "companyid",
-  "industry",
-  "subindustry",
-  "companycountry",
-  "companystate",
-  "companycity",
-  "companysize",
-  "companyrevenue",
-] as const;
-
-export const CANONICAL_CONTACT_FIELDS = [
-  "contactname",
-  "firstname",
-  "lastname",
-  "jobtitle",
-  "designation",
-  "seniority",
-  "department",
-  "email",
-  "phone",
-  "linkedin",
-  "contactcountry",
-  "contactstate",
-  "contactcity",
-] as const;
-
-export const ALL_CANONICAL_FIELDS = [...CANONICAL_COMPANY_FIELDS, ...CANONICAL_CONTACT_FIELDS];
-
-/**
- * Header aliases, normalized. Extend these after running the profiler — that is
- * exactly what `unmappedHeaders` in the profile report is for.
- */
-export const HEADER_ALIASES: Record<string, string[]> = {
-  companyname: ["companyname", "company", "organization", "organisation", "employer", "accountname", "companylegalname", "businessname"],
-  companydomain: ["companydomain", "domain", "website", "companywebsite", "webdomain", "domainname", "companyurl"],
-  companywebsite: ["companywebsite", "websiteurl", "url", "companyurl"],
-  companylinkedin: ["companylinkedin", "companylinkedinurl", "companylinkedinprofile", "organizationlinkedin"],
-  companyid: ["companyid", "companyidentifier", "organizationid", "accountid", "companycode", "domainid"],
-  industry: ["industry", "sector", "primaryindustry", "industryname"],
-  subindustry: ["subindustry", "industrysector", "secondaryindustry", "niche"],
-  companycountry: ["companycountry", "country", "countryname", "hqcountry", "headquarterscountry"],
-  companystate: ["companystate", "state", "province", "region", "companystateprovince"],
-  companycity: ["companycity", "city", "locality", "hqcity", "headquarterscity", "town"],
-  companysize: ["companysize", "employees", "employeecount", "employeeRange", "companysizeemployees", "size", "headcount"],
-  companyrevenue: ["companyrevenue", "revenue", "annualrevenue", "estimatedrevenue", "turnover"],
-  contactname: ["contactname", "fullname", "name", "personname", "contactfullname"],
-  firstname: ["firstname", "givenname", "first"],
-  lastname: ["lastname", "surname", "familyname", "last"],
-  jobtitle: ["jobtitle", "title", "position", "jobposition", "role"],
-  designation: ["designation", "joblevel", "level", "jobfunctionlevel"],
-  seniority: ["seniority", "senioritylevel", "managementlevel", "jobseniority"],
-  department: ["department", "function", "jobfunction", "team"],
-  email: ["email", "emailaddress", "workemail", "businessemail", "emailid", "contactemail"],
-  phone: ["phone", "phonenumber", "telephone", "mobile", "contactnumber", "directphone", "contactphone"],
-  linkedin: ["linkedin", "linkedinurl", "linkedinprofile", "personlinkedin", "contactlinkedin"],
-  contactcountry: ["contactcountry", "personcountry", "contactlocationcountry"],
-  contactstate: ["contactstate", "personstate", "contactlocationstate"],
-  contactcity: ["contactcity", "personcity", "contactlocationcity"],
-};
-
-/** Build a column-index map for one file from its real headers. */
-export function buildColumnMap(headers: string[]): Record<string, number> {
-  const map: Record<string, number> = {};
-  const normalized = headers.map(normalizeHeader);
-  for (const [field, aliases] of Object.entries(HEADER_ALIASES)) {
-    for (const alias of aliases) {
-      const index = normalized.indexOf(normalizeHeader(alias));
-      if (index !== -1) {
-        map[field] = index;
-        break;
-      }
-    }
-  }
-  return map;
-}
+// The canonical field list, the header aliases and the header→field mapping are
+// shared with the read-only R2 probe and the browser bundle, so they live in
+// `src/shared/headers.ts` and are re-exported here to keep every existing
+// `from "./mapping"` import (cli.ts, build.ts, tests) working.
+export {
+  CANONICAL_COMPANY_FIELDS,
+  CANONICAL_CONTACT_FIELDS,
+  ALL_CANONICAL_FIELDS,
+  HEADER_ALIASES,
+  normalizeHeader,
+  buildColumnMap,
+} from "../../../src/shared/headers";
 
 export interface RawCompanyInput {
   name: string;

@@ -15,13 +15,25 @@ Bucket: `company-intel-data` · prefix `raw/` · target version `v1`.
 | `csv1` | _awaiting Phase A listing_ | ≈ 10 GB (your statement) | Not verified — no R2 access from here |
 | `csv2` | _awaiting Phase A listing_ | ≈ 50 GB (your statement) | Not verified — no R2 access from here |
 
-`bun scripts/verify-raw.mjs --json` lists `raw/` (≤ 25 objects, largest first) with the exact names
-and byte sizes, confirms presence + size + ETag for each original and proves the body is readable
-with a 1 KB ranged GET (it exits non-zero when an expected object is missing, so it can gate the
-run), and `bun scripts/profile-raw.mjs --json` adds both schema reports. I will put the
-real names and sizes here verbatim once you send that output. The indexer config
-`sources[].path` must point at the real local paths (it reads local files; `raw/` objects can be
-downloaded once with `bunx wrangler r2 object get` if you prefer to keep them in R2 only).
+`bun run verify:r2:remote --json` (read-only; **no S3 keys needed** — it uses your Wrangler login
+and the same native `COMPANY_DATA` binding the app uses) lists `raw/` under a bound (≤ 25 objects
+per page, largest first) with the exact keys and byte sizes, confirms presence + size + ETag for
+each source, proves the body is readable with a 1 KB ranged GET, and adds both schema reports from
+bounded 6 MB samples (encoding, delimiter, headers, fill rates, mapping suggestions with
+confidence). It exits 1 when an expected object is missing, so it can gate the run. The S3-key
+equivalents (`bun scripts/verify-raw.mjs --json`, `bun scripts/profile-raw.mjs --json`) remain
+available. I will put the real names and sizes here verbatim once you send that output.
+
+The indexer config now takes either mode:
+
+- **Mode B (recommended here):** `"path": "r2://company-intel-data/raw/<key>.csv"` — the object is
+  streamed in bounded 8 MiB ranged reads and cached once under `rawCacheDir`, so the run resumes
+  from disk. Needs the three `R2_*` variables (Object Read is enough); Wrangler's login cannot be
+  used by a local script, which is exactly why the probe and the deployed Worker need no keys while
+  this mode does. Estimated network: ~60 GB once; local cache ~60 GB (set `"rawCacheDir": null` to
+  skip it); ~7,500 ranged GETs.
+- **Mode A:** copy the objects down with `rclone copy r2:company-intel-data/raw/ ./raw-copy` and
+  point `path` at the local files. Identical pipeline, same output.
 
 ## 2. Confirmed schema mappings
 
@@ -48,13 +60,19 @@ Mapping corrections are expected in exactly these areas (all handled by the exis
 listed so you know what to look for in the report): missing company identifier for a row style,
 contact-only rows, country name vs ISO code, and a legal-suffix-only difference in company names.
 
-## 3. Commands (PowerShell, from the repository root)
+## 3. Commands (macOS zsh or PowerShell, from the repository root)
 
-```powershell
+```bash
 bun install
 
-# Credentials for upload/publish only — session-scoped, never committed
-$env:R2_ACCOUNT_ID="..."; $env:R2_ACCESS_KEY_ID="..."; $env:R2_SECRET_ACCESS_KEY="..."
+# Step 0 — read-only verification of the real bucket. Needs NO credentials:
+# your Wrangler login plus the native COMPANY_DATA binding (remote = true).
+bun run verify:r2:remote --json > raw-verification.json
+
+# Credentials below are needed only for Mode B reads and for upload/publish —
+# session-scoped, never committed, never pasted in chat (macOS shown; PowerShell
+# equivalent: $env:R2_ACCOUNT_ID="..."):
+export R2_ACCOUNT_ID="..."; export R2_ACCESS_KEY_ID="..."; export R2_SECRET_ACCESS_KEY="..."
 
 # A. Write the real file paths / column overrides into the config, then:
 bun tools/indexer/src/cli.ts profile --config tools/indexer/indexer.config.json
@@ -77,7 +95,7 @@ bun tools/indexer/src/cli.ts publish   --config tools/indexer/indexer.config.jso
 | Resource | Requirement | Basis |
 | --- | --- | --- |
 | RAM | 16 GB comfortable, 8 GB workable | Bounded one-partition-at-a-time design; measured 1.25 s / 102 MB heap to build a 50,000-company index in-process. Less RAM costs speed, not correctness |
-| Free disk | **≥ 120 GB** recommended | Spool ≈ 1.5 × input (≈ 88 GB at 60 GB input) + output ≈ 12 GB (estimate). `workDir` must be on the fastest disk; keep the two on the same volume only if it has the room |
+| Free disk | **≥ 120 GB** recommended (≈ 180 GB if you also keep the Mode B cache) | Spool ≈ 1.1× input plus 256 MB (≈ 66 GB at 60 GB input) + output ≈ 12 GB (estimate) + Mode B `rawCacheDir` ≈ 60 GB. `workDir` must be on the fastest disk; set `"rawCacheDir": null` to drop the cache (a re-run then re-downloads) |
 | Cores | 4+ | One run saturates ~1 core for CSV parsing plus I/O; never run two full jobs at once |
 | Network | Steady upload | Upload is per-object with retry and skips objects already in R2, so a dropped connection costs time, not a restart |
 
@@ -141,17 +159,19 @@ Full detail and the pricing sources: `docs/cost.md`.
 
 ## 9. Exact actions I need from you
 
-1. Set the three R2 environment variables in your own terminal session (never in chat) — macOS and
-   PowerShell commands are in `docs/r2-connection.md`.
-2. Run `bun scripts/verify-raw.mjs --json > raw-verification.json` and send that file (names,
-   sizes, ETags, timestamps, dataset state — no secrets, no cell values).
-3. Run `bun scripts/profile-raw.mjs --json > raw-schema-reports.json` and send it (**both** schema
-   reports). Use `--keys raw/<file1>.csv,raw/<file2>.csv` if the auto-selected two are not your
-   source files.
-5. Paste the two recommended `columns` blocks (or confirm "no override needed").
-6. Run the 10 k and 100 k sample runs; send the counters.
-7. Run the 1 M sample; send wall-clock time, peak RAM, disk used, output size, object count.
-8. Send those numbers and ask for approval.
+1. In your own terminal: `cd <the repository folder>` then
+   `bun run verify:r2:remote --json > raw-verification.json`, and send that file (object keys,
+   sizes, ETags, timestamps, headers, fill rates, mappings, dataset state — no secrets and no cell
+   values). No R2 credentials are required for this step. If auto-selection picks the wrong two
+   objects, re-run with `--keys raw/<file1>.csv,raw/<file2>.csv`.
+2. Put the two exact keys into `tools/indexer/indexer.config.json` (`r2://…`, Mode B) and export the
+   three `R2_*` variables in that shell only.
+3. Paste the two recommended `columns` blocks (or confirm "no override needed").
+4. Run the 10 k and 100 k sample runs (`run --sample …`); send the counters, including the per-source
+   breakdown and rejected-row counts.
+5. Run the 1 M sample; send wall-clock time, peak RAM, disk used, output size, object count — and
+   the cache directory size for Mode B.
+6. Send those numbers and ask for approval.
 
 I will then fill in sections 1, 2, 5 and 6 with real values and hand back the final command list.
 **No full 60 GB run, no production deployment and no paid plan will be started by me without that

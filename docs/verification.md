@@ -4,14 +4,16 @@ What was **executed** in this environment, what it proved, what is **BLOCKED**, 
 must run on your own machine. Nothing here is inferred from type-checking alone: every claim
 names the command or test that produced it.
 
-Run everything below yourself with:
+Run everything below yourself with (all commands are read-only unless marked otherwise):
 
 ```bash
-bun run check                          # 4 typechecks + 193 tests
+bun run check                          # 5 typechecks + 249 tests
+bun run verify:r2:remote               # read-only probe of the REAL bucket (no keys at all)
+bun run verify:r2:remote --json > raw-verification.json
 bun scripts/benchmark-r2-path.mjs      # R2-backed search path
 bun scripts/benchmark-search.mjs       # engine + labelled relevance
-bun scripts/verify-raw.mjs --json      # (needs R2 credentials) real object inventory
-bun scripts/profile-raw.mjs --list     # (needs R2 credentials) real object listing + schemas
+bun scripts/verify-raw.mjs --json      # (S3-key alternative) real object inventory
+bun scripts/profile-raw.mjs --list     # (S3-key alternative) real object listing + schemas
 ```
 
 ## Fixes made in this phase (all found by executing, not reviewing)
@@ -26,9 +28,38 @@ bun scripts/profile-raw.mjs --list     # (needs R2 credentials) real object list
 
 ## Phase A — Real R2 data
 
-**STATUS: BLOCKED in this environment.** I have no R2 credentials and I will not ask you to
-paste them into chat. No object was listed, no byte was read, no schema was reported, and no
-claim of verification is made.
+**STATUS: BLOCKED in this environment** (no Cloudflare session, no credentials, and I will not ask
+you to paste secrets into chat). No object was listed, no byte was read, no schema was reported, and
+no claim of verification is made.
+
+### Primary path — the isolated read-only probe (no credentials)
+
+`bun run verify:r2:remote` starts `probe/` (a separate Worker, `127.0.0.1:8788`, `remote = true` on
+the `COMPANY_DATA` binding, never deployed) with your existing Wrangler login, fetches one report,
+stops it, and returns exit 0 (verified) / 1 (problem) / 2 (probe unavailable). It lists `raw/` under
+a bound (≤ 25 objects per page, ≤ 2 pages, largest first), verifies both sources by name with real
+sizes/ETags/timestamps and a **1 KB** ranged body read, samples **6 MB** per source for a schema
+report (encoding, delimiter, header line, columns, fill rates, mapping suggestions with confidence
++ ambiguity, ready-to-paste `columns` override), and reports the published-dataset state.
+Verification that it behaves that way, all executed here:
+
+| Claim | Test |
+| --- | --- |
+| Routing, `/health`, `/verify`, `/schema`, `/report`, 404, 405 on write methods | `tests/r2-probe.test.ts` (17) |
+| The probe refuses to answer when `ENVIRONMENT=production` | `tests/r2-probe.test.ts` |
+| Query parameters can only ask for *less* than the config caps; a mistyped `?max=100000` clamps to 100 | `tests/r2-probe.test.ts` |
+| Both sources confirmed by name/size/ETag with a bounded body read; missing object = problem | `tests/r2-probe.test.ts` |
+| A 4 MB object is sampled, never downloaded (bytes read asserted < 120 KB) | `tests/r2-probe.test.ts` |
+| Listing is pagination-aware, and a truncated listing is reported as a partial view, never a total | `tests/r2-probe.test.ts` |
+| **Zero** `put`/`delete` calls and an unchanged bucket after every route is exercised | `tests/r2-probe.test.ts` |
+| No cell value, name, email or phone appears in any response | `tests/r2-probe.test.ts`, `tests/r2-probe-schema.test.ts` |
+| Encoding (BOM, UTF-16, invalid-UTF-8 → uncertain), delimiter, quoted multiline records, sample trimming at record boundaries | `tests/r2-probe-schema.test.ts` (13) |
+| Mapping suggestions: confidence + evidence, ambiguity flagged, no invented fields | `tests/r2-probe-schema.test.ts` |
+| The runner's exit codes 0/1/2, `--json` purity, and an unavailable probe failing with guidance | `tests/verify-r2-remote-script.test.ts` (7, over a stub probe on loopback) |
+| The probe config cannot be deployed as a site (`workers_dev=false`, no `[assets]`, no routes), the production config is untouched, and no probe/shared-R2 source can write | `tests/worker-r2-binding.test.ts` |
+
+What none of that proves: anything about your bucket. The probe has not been run against your
+account — see the manual step below.
 
 Measured, not assumed: `bun scripts/verify-raw.mjs` exits **2** here with "R2 credentials are not
 set for this terminal session", i.e. `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` /
@@ -111,11 +142,12 @@ bucket. **None of this is evidence about your bucket.**
 
 ### Non-secret outputs I need from you (paste these; they contain no credentials)
 
-1. `raw-verification.json` — object **names**, **sizes**, ETags, timestamps, dataset state.
-2. `raw-schema-reports.json` — both schema reports: header line, delimiter, encoding, sampled
-   record count, per-column fill rates, and the canonical mapping for each file.
-3. For each file, the canonical mapping lines and any "unmapped headers" / "canonical fields
-   absent" lines.
+1. `bun run verify:r2:remote --json > raw-verification.json` — object **keys**, **sizes**, ETags,
+   timestamps, dataset state, and both schema reports (encodings, delimiters, headers, fill rates,
+   mapping suggestions). One command, no credentials.
+2. Alternatively (or in addition) `raw-schema-reports.json` from `bun scripts/profile-raw.mjs --json`.
+3. For each file, any "unmapped columns" / "canonical fields absent" lines, so I can confirm the
+   `columns` overrides.
 4. Whether a 10,000-record sample run completed and its counters (`rows read`, `rejected`,
    `unique companies`, `unique contacts`, per-source breakdown).
 
@@ -300,7 +332,9 @@ authoritative objects in R2, and the directory is explicitly derived data.
 | Requirement | Implemented | Test evidence | Remaining risk | Manual action required |
 | --- | --- | --- | --- | --- |
 | A. List real `raw/` objects, verify sizes/readability, sample + report both schemas, map to canonical model | Tooling implemented and tested over a stub transport; real run not executed (no R2 creds reach this environment) | `tests/verify-raw-script.test.ts` (7), `tests/profile-raw-script.test.ts` (3), `tests/raw-report.test.ts` (9); `scripts/verify-raw.mjs`, `scripts/profile-raw.mjs` | Real headers may differ from the fixture | Run both scripts locally, send both `--json` reports |
-| Production Worker reaches R2 only through the `COMPANY_DATA` binding | Yes | `tests/worker-r2-binding.test.ts` (7): binding + bucket name, no published bucket, no `R2_*`/`cloudflarestorage.com`/`process.env` in `worker/**`, S3 client confined to `tools/` + `scripts/` | Custom domain/`workers.dev` routing is account config | Create the Access app (Phase D) |
+| Production Worker reaches R2 only through the `COMPANY_DATA` binding | Yes | `tests/worker-r2-binding.test.ts` (11): binding + bucket name, no published bucket, no `R2_*`/`cloudflarestorage.com`/`process.env` in `worker/**`, S3 client confined to `tools/` + `scripts/`, plus the probe guards (remote binding, `workers_dev=false`, no write call in `probe/**` or `src/shared/r2/**`, no env/secret access) | Custom domain/`workers.dev` routing is account config | Create the Access app (Phase D) |
+| Read-only probe: no-credential connection test, bounded reads, schema report, no writes | Yes (locally, against an in-memory bucket and a stub probe) | `tests/r2-probe.test.ts` (17), `tests/r2-probe-schema.test.ts` (13), `tests/verify-r2-remote-script.test.ts` (7) | Not run against the real account | `bun run verify:r2:remote --json` on your Mac |
+| Indexer Mode B: read the source objects straight from R2 | Yes (over a stubbed S3 transport) | `tests/indexer-r2-source.test.ts` (13): bounded 8 MiB ranged reads, chunk-boundary parsing, Mode A/Mode B parity, cache/resume, 404/403/credential errors | The real 60 GB stream needs your credentials | Set the `R2_*` variables in one shell when you start Mode B |
 | A. Mapping corrections identified | Mechanism tested, real overrides pending | `tests/e2e-index.test.ts` (two schemas → one model) | A column may need a `columns` override | Approve the `columns` blocks I return |
 | B. Streaming, multiline, dual-schema parsing | Yes | `tests/e2e-index.test.ts`, `tests/csv.test.ts` | None known | — |
 | B. Disk-backed grouping, identity resolution, dedupe, cross-file association | Yes | `tests/e2e-index.test.ts` (multiline record = 1, dup contact once, Microsoft merged from both files, same-name/different-domain kept apart) | Real data may expose new ambiguity | Review ambiguous-count in the manifest after the sample runs |

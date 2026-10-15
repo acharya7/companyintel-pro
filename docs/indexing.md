@@ -1,12 +1,71 @@
-# Indexing (Windows, local, streaming)
+# Indexing (local, streaming, two input modes)
 
 The indexer turns the two raw CSV files into the versioned R2 objects the Worker reads. It
 runs **on your machine**, never inside a Worker: 60 GB cannot be streamed in a Cloudflare
 Worker, and the spec forbids a hosted database substitute.
 
-- Files: `tools/indexer/src/{cli,csv,mapping,build,r2}.ts`
+- Files: `tools/indexer/src/{cli,csv,mapping,build,r2,source}.ts`
 - Config: `tools/indexer/indexer.config.json`
 - Runtime: Node 20+ or Bun. Only Node built-ins are used for CSV/disk work.
+
+## Two input modes (the pipeline is identical)
+
+| Mode | `sources[].path` | Where the bytes come from | Credentials |
+| --- | --- | --- | --- |
+| **A — local file** | `D:/data/companies_part1.csv` (or any local path) | your disk | none |
+| **B — R2 object** | `r2://company-intel-data/raw/companies_part1.csv` | the real bucket, streamed | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` |
+
+Both modes feed the same parser, the same column mapping and the same pipeline, and a parity test
+asserts they produce identical records and identical profiles for the same bytes
+(`tests/indexer-r2-source.test.ts`).
+
+For your situation — the CSVs are in R2 and the local copies may only exist on a previous laptop —
+**Mode B is the practical option**, and it does not mean downloading 60 GB into memory or into a
+single local file:
+
+- objects are read in **bounded ranged requests** (8 MiB per request by default);
+- each object is **cached once** under `rawCacheDir` (default `.indexer-raw-cache`) through a
+  `.part` file that is renamed only after the byte count matches R2, so an interrupted run resumes
+  from disk instead of re-downloading;
+- set `"rawCacheDir": null` to stream straight through without keeping a local copy (a re-run then
+  re-downloads).
+
+### Why Mode B still needs R2 keys (and why the app does not)
+
+Wrangler's OAuth login is usable only by processes Wrangler manages — the Worker runtime and its
+bindings. This indexer is a plain Bun/Node process, so the only way for it to read an object is the
+S3-compatible API, signed with its own credentials. There is no API that hands a Worker binding to
+a local script, and `wrangler` has no "read a bounded range for me" command. That is why the
+production Worker and the read-only probe need **no** keys, while Mode B does.
+
+Least privilege, once you decide to run Mode B (do not create the token before then):
+
+1. Cloudflare dashboard → **R2 → API → Manage API tokens → Create API token**.
+2. Permissions: **Object Read** is enough to read/index. Add **Object Read & Write** in a separate
+   token only when you upload the built index from the same shell.
+3. Scope it to the single bucket `company-intel-data`. Never "all buckets".
+4. In your own terminal, for that session only:
+   `export R2_ACCOUNT_ID=… ; export R2_ACCESS_KEY_ID=… ; export R2_SECRET_ACCESS_KEY=…`
+5. `unset` them (or close the window) when the run finishes. Never commit them, never paste them in
+   chat, never put them in a hosting environment panel.
+
+If you would rather avoid tokens entirely, copy the objects down with rclone and use Mode A:
+
+```bash
+rclone copy r2:company-intel-data/raw/ ./raw-copy --progress   # needs ~60 GB of local disk
+```
+
+### Honest cost estimate for a 60 GB Mode B run
+
+All figures are estimates to be replaced by your measured sample run:
+
+| Resource | Estimate | Why |
+| --- | --- | --- |
+| Network | ~60 GB down (once per object) | the bytes must be read; ~7,500 ranged GETs at 8 MiB |
+| Local disk | ~60 GB cache + ~1.1× input spool + ~0.12× output if `rawCacheDir` is on the same volume; `null` drops the 60 GB | spool rows dominate |
+| RAM | well under 2 GB | one hash-bucket batch and one partition at a time |
+| Duration | hours, bounded by disk and network (measure with `--sample 1000000`) | parsing is ~1 core |
+| R2 operations | ~7.5K Class B reads + uploads of the index | far inside the free allowance |
 
 ## How a run works
 
@@ -31,11 +90,14 @@ skips finished passes (`--no-resume` to start over).
 
 All commands are run from the repository root, on Windows use PowerShell with forward slashes.
 
-```powershell
+```bash
+# 0. Confirm the real object keys first — never guess them (read-only, no keys needed)
+bun run verify:r2:remote
+
 # 1. Install dependencies once
 bun install
 
-# 2. Inspect both files: headers, fill rates, encoding, delimiter, mapping suggestions
+# 2. Inspect both sources: headers, fill rates, encoding, delimiter, mapping suggestions
 bun tools/indexer/src/cli.ts profile --config tools/indexer/indexer.config.json
 
 # 3. Sample runs (mandatory before the full job)
@@ -53,9 +115,10 @@ bun tools/indexer/src/cli.ts validate --config tools/indexer/indexer.config.json
 bun tools/indexer/src/cli.ts publish --config tools/indexer/indexer.config.json --version v1 --yes
 ```
 
-`--sample <n>` applies per source, so both schemas are always represented in a sample run.
-Sample versions are safe to upload to a `staging`/sample version id; the app ignores any
-version that is not the active one.
+`--sample <n>` applies per source, so both schemas are always represented in a sample run — and in
+Mode B it also bounds the download: the reader stops fetching once the sample limit is reached and
+discards the partial cache. Sample versions are safe to upload to a `staging`/sample version id;
+the app ignores any version that is not the active one.
 
 ## Coverage validation
 
@@ -116,6 +179,10 @@ validation.
 | Symptom | Cause / fix |
 | --- | --- |
 | `source csv1 was not found at …` | Fix `sources[].path` in the config; the profiler prints the exact resolved path. |
+| `R2 credentials are missing for: company-intel-data` | Mode B needs the three `R2_*` variables in the shell running the indexer (Object Read is enough). The message prints the least-privilege recipe; see the Mode B section above. |
+| `… does not exist (HTTP 404)` | The object key is wrong. Copy the exact key from `bun run verify:r2:remote` output into `sources[].path`. |
+| `… could not be read (HTTP 403)` | The credentials in that shell cannot read the bucket: check the token's bucket scope and permission. |
+| A Mode B run downloads again after a restart | The cache directory was changed or removed, the object changed on R2 (size differs), or `rawCacheDir` is `null`. Set `"rawCacheDir": ".indexer-raw-cache"` to keep resume behaviour. |
 | Columns mapped to the wrong canonical field | Add a `columns` override for that source (`{"companyname": "Org Name"}`). |
 | High rejected-row count | Check the encoding/delimiter for that file; inspect `workDir/rejected.jsonl` reasons. |
 | `Refusing to start: temporary space is insufficient` | Free space on the `workDir` volume, or lower `partitions`. |

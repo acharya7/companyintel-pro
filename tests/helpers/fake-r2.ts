@@ -127,23 +127,49 @@ export class FakeR2Bucket {
 
   /* --------------------------- R2Bucket surface --------------------------- */
 
-  async get(key: string): Promise<unknown> {
+  /**
+   * `get`, including R2's bounded range reads.
+   *
+   * A range read serves only the requested slice — and `bytesRead` counts only
+   * what was served — which is what lets a test prove that verifying a 50 GB
+   * object pulls kilobytes, not gigabytes. `size` stays the *object* size, exactly
+   * as the real binding reports it.
+   */
+  async get(
+    key: string,
+    options?: { range?: { offset?: number; length?: number; suffix?: number } },
+  ): Promise<unknown> {
     this.counters.gets += 1;
     const object = this.objects.get(key);
     if (!object) return null;
-    this.counters.bytesRead += object.bytes.length;
+
+    const total = object.bytes.length;
+    let start = 0;
+    let end = total;
+    const range = options?.range;
+    if (range) {
+      if (typeof range.suffix === "number") {
+        start = Math.max(0, total - range.suffix);
+      } else {
+        start = Math.max(0, Math.min(range.offset ?? 0, total));
+        const length = range.length === undefined ? total - start : Math.max(0, range.length);
+        end = Math.min(total, start + length);
+      }
+    }
+    const bytes = object.bytes.subarray(start, end);
+    this.counters.bytesRead += bytes.length;
     this.counters.readKeys.push(key);
-    const bytes = object.bytes;
     return {
       key,
       etag: object.etag,
-      size: bytes.length,
+      size: total,
       uploaded: object.uploaded,
+      range: range ? { offset: start, length: bytes.length } : undefined,
       httpMetadata: { contentType: object.contentType, contentEncoding: object.contentEncoding },
       body: new Blob([new Uint8Array(bytes)]).stream(),
-      arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
-      text: async () => bytes.toString("utf8"),
-      json: async () => JSON.parse(bytes.toString("utf8")),
+      arrayBuffer: async () => new Uint8Array(bytes).buffer,
+      text: async () => Buffer.from(bytes).toString("utf8"),
+      json: async () => JSON.parse(Buffer.from(bytes).toString("utf8")),
     };
   }
 

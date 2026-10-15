@@ -1,0 +1,45 @@
+# CompanyIntel — ISOLATED READ-ONLY R2 PROBE (development only, never deployed).
+#
+# This is NOT the production Worker. `wrangler.toml` in the repository root stays
+# the only deployment config; this file exists so `bun run verify:r2:remote` can
+# run a separate, tiny Worker locally against the REAL bucket.
+#
+# Deliberate constraints, each one checkable in the config below:
+#   - no `[assets]`, no `[routes]`, no custom domain, `workers_dev = false`, so
+#     there is nothing to serve publicly even if someone ran `wrangler deploy`;
+#   - the R2 binding is the only capability — no Access secrets, no vars that
+#     enable writes, no business endpoints;
+#   - `remote = true` keeps the Worker on your Mac while the binding talks to the
+#     real `company-intel-data` bucket. Do NOT pass `--local` when starting it:
+#     that flag swaps the real bucket for a local simulation and would "verify"
+#     an empty fake.
+#   - the bound values are UPPER limits. The verification script may ask for less
+#     and can never ask for more, so a 50 GB object can never be downloaded.
+#
+# Start it with (the script does this for you):
+#   bunx wrangler dev --config probe/wrangler.toml --ip 127.0.0.1 --port 8788
+
+name = "companyintel-r2-probe"
+main = "src/index.ts"
+compatibility_date = "2025-09-01"
+workers_dev = false
+
+[[r2_buckets]]
+binding = "COMPANY_DATA"
+bucket_name = "company-intel-data"
+# The native binding, pointed at the real bucket, with no S3 keys anywhere.
+remote = true
+
+[vars]
+# The probe refuses to answer at all if this is "production": it exists for a
+# local, authenticated session on your Mac, not for the public internet.
+ENVIRONMENT = "development"
+PROBE_READ_ONLY = "true"
+RAW_PREFIX = "raw/"
+# Objects per page and the number of objects reported.
+MAX_RAW_OBJECTS = "25"
+MAX_LIST_LIMIT = "100"
+# Hard caps for the bounded reads (bytes).
+MAX_READ_BYTES = "65536"
+MAX_SAMPLE_BYTES = "8388608"
+MAX_SCHEMA_ROWS = "2000"

@@ -11,3 +11,10 @@ src/convex/_generated
 .raw-samples/
 .indexer-work/
 .indexer-output/
+
+# Local indexer cache of raw/ objects read straight from R2 (Mode B).
+# It holds real rows of the original CSVs, so it must never be committed.
+.indexer-raw-cache/
+
+# Wrangler dev state written while the read-only probe runs locally.
+.wrangler/

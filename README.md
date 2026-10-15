@@ -13,10 +13,13 @@ No Convex, no SQL database, no KV/D1/Durable Objects, no Redis, no search server
 - Backend: Cloudflare Worker (Hono), Zod-validated REST API, Workers Static Assets, R2 binding
   `COMPANY_DATA` → `company-intel-data`
 - Access: Cloudflare Access JWT verification on every `/api/*` route (single approved identity)
-- Indexing: Windows-compatible streaming indexer in `tools/indexer` (Node/Bun, disk-backed)
-- Tests: `bun test` (193 tests, 816 assertions) — normalization, relevance, CSV/indexer, R2 store,
-  end-to-end index + Worker API over a generated index, lead recovery, security, plus the R2
-  verification scripts run end to end over a stub transport
+- Indexing: streaming indexer in `tools/indexer` (Node/Bun, disk-backed) with two input modes:
+  local CSV files, or `r2://company-intel-data/raw/…` objects streamed in bounded ranged reads
+- R2 verification: an isolated read-only probe Worker (`probe/`) started locally by
+  `bun run verify:r2:remote` — native binding, remote R2, no S3 keys, never deployed
+- Tests: `bun test` (249 tests, 1099 assertions) — normalization, relevance, CSV/indexer, R2 store,
+  end-to-end index + Worker API over a generated index, lead recovery, security, the R2 probe and
+  its runner, and the S3 verification scripts over a stub transport
 
 ## Documentation
 
@@ -24,8 +27,8 @@ No Convex, no SQL database, no KV/D1/Durable Objects, no Redis, no search server
 | --- | --- |
 | `docs/architecture.md` | components, data flow, canonical model, entity resolution, search, R2 layout, caching |
 | `docs/configuration.md` | frontend API mode, `wrangler.toml`, Worker secrets, indexer config, R2 credentials |
-| `docs/r2-connection.md` | how R2 access really works (binding vs. S3 keys), what the Freebuff env panel can and cannot do, macOS commands, the read-only connection test |
-| `docs/indexing.md` | the profiling → sample → full → validate → publish workflow, preflight, resume, troubleshooting |
+| `docs/r2-connection.md` | how R2 access really works (binding vs. S3 keys), the one-command read-only probe, what the Freebuff env panel can and cannot do, macOS commands, the S3-key fallback |
+| `docs/indexing.md` | input Mode A/B, profiling → sample → full → validate → publish, preflight, cache/resume, credentials, estimated costs, troubleshooting |
 | `docs/deployment.md` | beginner step-by-step Cloudflare setup: wrangler, secrets, Access application, deploy, verify, rollback |
 | `docs/security.md` | threat model, Access verification, headers, validation, rate limits, deployment checklist, residual risks |
 | `docs/cost.md` | documented Cloudflare pricing, storage/operation/CPU estimates, measured benchmarks |
@@ -35,10 +38,11 @@ No Convex, no SQL database, no KV/D1/Durable Objects, no Redis, no search server
 
 ## Quick start
 
-```powershell
+```bash
 bun install
-bun run check        # typechecks (frontend, worker, indexer) + full test suite
-bun run dev          # frontend preview (sample dataset mode unless VITE_API_MODE=worker)
+bun run check             # typechecks (frontend, worker, indexer, probe) + full test suite
+bun run verify:r2:remote  # read-only check of the REAL R2 bucket (no keys, never deploys)
+bun run dev               # frontend preview (sample dataset mode unless VITE_API_MODE=worker)
 ```
 
 The preview ships a clearly-labelled **synthetic sample dataset** so the interface can be
@@ -47,8 +51,9 @@ explored without R2. Production behaviour requires `VITE_API_MODE=worker` plus a
 
 ## Indexing your data
 
-```powershell
-# 1. Point tools/indexer/indexer.config.json at your two CSV files
+```bash
+# 1. Put the two real object keys in tools/indexer/indexer.config.json
+#    (Mode B: "r2://company-intel-data/raw/<key>.csv", or Mode A: a local path)
 bun run index:profile                 # headers, fill rates, mapping suggestions, preflight
 # 2. Sample runs first (both source schemas are always represented)
 bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json --sample 10000  --version v1-sample-10k
@@ -64,23 +69,32 @@ Iterating on search quality or the theme does not require data:
 positives) on a synthetic corpus.
 
 Before any of that, Phase A verifies what is really in R2 — read-only, bounded, both source files
-untouched (`docs/r2-connection.md`):
+untouched (`docs/r2-connection.md`). The recommended path needs **no credentials at all**: it uses
+your Wrangler login and the same native `COMPANY_DATA` binding the deployed app uses.
 
 ```bash
-bun scripts/verify-raw.mjs          # access + ≤25-object raw/ listing + sizes/ETags + bounded body read
-bun scripts/verify-raw.mjs --json   # same, as one share-safe machine-readable report
-bun scripts/profile-raw.mjs --list  # inventory only
-bun scripts/profile-raw.mjs         # ranged 6 MB sample → both schema reports + suggested mapping
+bun run verify:r2:remote            # starts a local read-only probe, prints the report, stops it
+bun run verify:r2:remote --json > raw-verification.json
+bun run verify:r2:remote --keys raw/<file1>.csv,raw/<file2>.csv
 ```
+
+It lists `raw/` under a bound, confirms both source objects by name with real sizes/ETags and a
+**1 KB** body read, samples **6 MB** per source for a schema report (encoding, delimiter, headers,
+fill rates, mapping suggestions with confidence), reports the published-dataset state, and never
+includes a cell value. Exit codes: 0 verified, 1 a problem, 2 the probe would not start.
+The equivalent S3-key path remains available: `bun scripts/verify-raw.mjs[--json]` and
+`bun scripts/profile-raw.mjs[--list|--json]`.
 
 ## Verification status
 
 | Area | Status |
 | --- | --- |
-| Frontend, Worker, indexer typechecks | **IMPLEMENTED AND TESTED** — `bun run check` → 4/4 PASS |
-| Test suite (193 tests, 816 assertions) | **IMPLEMENTED AND TESTED** — normalization, relevance, CSV parsing, indexer pipeline, R2 store, Access security, end-to-end index build + Worker route handlers |
+| Frontend, Worker, indexer, probe typechecks | **IMPLEMENTED AND TESTED** — `bun run check` → 5/5 PASS |
+| Test suite (249 tests, 1099 assertions) | **IMPLEMENTED AND TESTED** — normalization, relevance, CSV parsing, indexer pipeline + R2 streaming sources, R2 store, Access security, end-to-end index build + Worker route handlers, the read-only probe |
 | Worker → R2 access path | **IMPLEMENTED AND TESTED** — `tests/worker-r2-binding.test.ts` proves the Worker reaches R2 only through the `COMPANY_DATA` binding, never with S3 secrets, and that the bucket is not published |
-| Read-only R2 verification tooling | **IMPLEMENTED AND TESTED over a stub transport** — bounded 25-object `raw/` listing, size/ETag + 1 KB ranged body read, missing-object and denied-credential exit codes, `--json` reports with no cell values. Real bucket still unread |
+| Read-only R2 probe (native binding, no keys) | **IMPLEMENTED AND TESTED locally** — `tests/r2-probe.test.ts`, `tests/r2-probe-schema.test.ts`, `tests/verify-r2-remote-script.test.ts` cover routing, bound clamping, the production refusal, 405 on writes, no write/delete call existing anywhere in the probe, 1 KB/6 MB read budgets, missing-object handling, the schema report and the runner's 0/1/2 exit codes. **Not run against your account** |
+| Read-only R2 verification scripts (S3 keys) | **IMPLEMENTED AND TESTED over a stub transport** — bounded 25-object `raw/` listing, size/ETag + 1 KB ranged body read, missing-object and denied-credential exit codes, `--json` reports with no cell values. Real bucket still unread |
+| Indexer Mode B (read the CSVs straight from R2) | **IMPLEMENTED AND TESTED over a stubbed S3 transport** — bounded 8 MiB ranged reads, chunk-boundary-safe parsing, Mode A/Mode B parity, disk cache + resume, 404/403/credential failures. Real 60 GB run not started |
 | Search engine + ranking | **IMPLEMENTED AND TESTED** — recall@1 0.939 / recall@5 0.97 on the labelled fixture set |
 | R2 object layout, manifests, rollback | **IMPLEMENTED, PARTIALLY TESTED** — layout and pointer logic tested; the real R2 path needs a deployed bucket |
 | Worker API + R2 reads | **IMPLEMENTED, PARTIALLY TESTED** — routing, validation and Access verified by tests; end-to-end reads require a published dataset |
@@ -93,13 +107,15 @@ bun scripts/profile-raw.mjs         # ranged 6 MB sample → both schema reports
 
 ## Manual actions required from you
 
-1. In **your own** terminal, export your R2 credentials for that session only, then run:
-   `bun scripts/verify-raw.mjs --json > raw-verification.json` and
-   `bun scripts/profile-raw.mjs --json > raw-schema-reports.json`. Send back those two files —
-   they hold names, sizes, ETags, headers, fill rates and mappings, and no secrets or cell values.
-   Do **not** enter R2 credentials in the provider's Frontend/Backend environment panel
-   (see `docs/r2-connection.md`).
-2. Point `tools/indexer/indexer.config.json` at your local CSV paths and run `bun run index:profile`.
+1. In **your own** terminal, run `bun run verify:r2:remote --json > raw-verification.json` and send
+   that file back. It needs **no** R2 credentials — just your Wrangler login — and it holds object
+   keys, sizes, ETags, timestamps, headers, fill rates and mapping suggestions, with no secrets and
+   no cell values. (The S3-key variant, `bun scripts/verify-raw.mjs` + `bun scripts/profile-raw.mjs`,
+   is still available.) Do **not** enter R2 credentials in the provider's Frontend/Backend
+   environment panel (see `docs/r2-connection.md`).
+2. Copy the two exact object keys from that report into `tools/indexer/indexer.config.json`
+   (`r2://company-intel-data/raw/…`, Mode B) and run `bun run index:profile`. Mode B needs the three
+   `R2_*` variables in that shell; the least-privilege recipe is in `docs/indexing.md`.
 3. Run the sample runs, then approve the full indexing job (approval gate 1) — see `docs/execution-plan.md`.
 4. Create the Cloudflare Access application and set `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD`,
    `ALLOWED_EMAILS` as Worker secrets (never in chat, never in a file).

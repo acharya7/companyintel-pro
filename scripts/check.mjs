@@ -8,7 +8,8 @@
  *   1. frontend + shared   tsc -b --noEmit
  *   2. Cloudflare Worker   tsc -p worker/tsconfig.json --noEmit
  *   3. local indexer       tsc -p tools/indexer/tsconfig.json --noEmit
- *   4. test suite          bun test
+ *   4. read-only R2 probe  tsc -p probe/tsconfig.json --noEmit
+ *   5. test suite          bun test
  *
  * Exits non-zero if anything fails. It deliberately does NOT run a production
  * build (that is a separate, explicit step: `bun run build`).
@@ -26,6 +27,7 @@ const steps = [
   { name: "typecheck frontend + shared", cmd: tsc, args: ["-b", "--noEmit"] },
   { name: "typecheck worker", cmd: tsc, args: ["-p", "worker/tsconfig.json", "--noEmit"] },
   { name: "typecheck indexer", cmd: tsc, args: ["-p", "tools/indexer/tsconfig.json", "--noEmit"] },
+  { name: "typecheck probe", cmd: tsc, args: ["-p", "probe/tsconfig.json", "--noEmit"] },
   { name: "tests", cmd: bunBin, args: ["test"] },
 ];
 

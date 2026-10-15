@@ -63,9 +63,15 @@ import {
   type RawCompanyInput,
 } from "./mapping";
 import { credentialsFromEnv, fileSize, R2Client } from "./r2";
+import { createSourceContext, sourceBytes, sourceProfile, sourceRecords, type SourceContext } from "./source";
 
 export interface SourceConfig {
   id: string;
+  /**
+   * MODE A: path to a local CSV file.
+   * MODE B: `r2://company-intel-data/raw/<key>.csv` — streamed from R2 in bounded
+   * ranged reads (see `source.ts` for why Mode B needs S3 credentials).
+   */
   path: string;
   encoding?: string;
   delimiter?: string;
@@ -81,6 +87,12 @@ export interface IndexerConfig {
   /** Number of spool partitions. Keep a power of two; 256 handles 10M+ rows. */
   partitions: number;
   shards: { exact: number; prefix: number; token: number; trigram: number; ids: number };
+  /**
+   * Where Mode B (r2://) sources are cached locally, so a re-run resumes from
+   * disk instead of downloading the objects again. Set to `null` to stream
+   * without caching (nothing is written to disk; a re-run re-downloads).
+   */
+  rawCacheDir?: string | null;
   /**
    * Companies per company/contact object is NOT configurable on purpose: the
    * readers derive the object for a given document ref from the shared
@@ -117,17 +129,24 @@ export interface PreflightReport {
 const BYTES_PER_SPOOL_ROW = 900;
 const ROWS_PER_SECOND_BASELINE = 120_000;
 
+/** Source context (Mode A local files / Mode B R2 objects) for one config. */
+function sourceContextFor(config: IndexerConfig): SourceContext {
+  return createSourceContext({ cacheDir: config.rawCacheDir === undefined ? undefined : config.rawCacheDir });
+}
+
 /* -------------------------------------------------------------------------- */
 /* Preflight                                                                  */
 /* -------------------------------------------------------------------------- */
 
-export async function preflight(config: IndexerConfig): Promise<PreflightReport> {
+export async function preflight(config: IndexerConfig, context: SourceContext = sourceContextFor(config)): Promise<PreflightReport> {
   const sources: PreflightReport["sources"] = [];
   let totalInputBytes = 0;
   const warnings: string[] = [];
 
   for (const source of config.sources) {
-    const bytes = await fileSize(source.path);
+    // Mode A reads the local file size; Mode B asks R2 for the object size with a
+    // bounded HEAD. An unknown size stays unknown (`null`) rather than 0.
+    const bytes = await sourceBytes(source, context);
     const exists = bytes !== null;
     if (!exists) warnings.push(`Source ${source.id} was not found at ${source.path}`);
     sources.push({ id: source.id, path: source.path, bytes, exists });
@@ -312,7 +331,12 @@ interface SpoolRow {
 
 export async function runIndex(config: IndexerConfig, options: RunOptions = {}): Promise<RunResult> {
   const startedAt = Date.now();
-  const report = await preflight(config);
+  // One context for the whole run: it owns the Mode B cache and credentials.
+  const sourceContext = createSourceContext({
+    cacheDir: config.rawCacheDir === undefined ? undefined : config.rawCacheDir,
+    onNotice: (message) => options.onProgress?.({ stage: "preflight", message, rowsRead: 0, rowsRejected: 0, companies: 0, contacts: 0, progress: null, rowsPerSecond: null, etaSeconds: null }),
+  });
+  const report = await preflight(config, sourceContext);
   const emit = (event: Partial<ProgressEvent> & { stage: ProgressEvent["stage"]; message: string }) =>
     options.onProgress?.({
       rowsRead: 0,
@@ -343,12 +367,12 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   const profiles: FileProfile[] = [];
   const columnMaps: Record<string, number>[] = [];
   for (const source of config.sources) {
-    const profile = await profileCsvFile(source.path, {
-      encoding: source.encoding,
-      delimiter: source.delimiter,
-      sampleRows: 500,
-      knownFields: [...ALL_CANONICAL_FIELDS],
-    });
+    // Mode A profiles the file; Mode B profiles a bounded sample of the object.
+    const profile = await sourceProfile(
+      source,
+      { encoding: source.encoding, delimiter: source.delimiter, sampleRows: 500, knownFields: [...ALL_CANONICAL_FIELDS] },
+      sourceContext,
+    );
     profiles.push(profile);
     const map = buildColumnMap(profile.headers);
     if (source.columns) {
@@ -400,11 +424,11 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       // by the profiler and must never be indexed as data.
       let isHeader = true;
 
-      for await (const record of readCsvFile(source.path, {
+      for await (const record of sourceRecords(source, {
         encoding: source.encoding,
         delimiter: source.delimiter,
         maxRecords: options.sampleLimit === undefined ? undefined : options.sampleLimit + 1,
-      })) {
+      }, sourceContext)) {
         if (isHeader) {
           isHeader = false;
           continue;

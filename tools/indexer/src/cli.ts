@@ -20,6 +20,7 @@ import { ALL_CANONICAL_FIELDS, buildColumnMap } from "./mapping";
 import { profileCsvFile } from "./csv";
 import { preflight, publishVersion, runIndex, uploadOutput, type IndexerConfig, type ProgressEvent } from "./build";
 import { credentialsFromEnv } from "./r2";
+import { createSourceContext, credentialsHelp, missingCredentialBuckets, parseR2Source } from "./source";
 
 function parseArgs(argv: string[]): { command: string; flags: Record<string, string | boolean> } {
   const [command = "help", ...rest] = argv;
@@ -42,6 +43,9 @@ async function loadConfig(path: string): Promise<IndexerConfig> {
   const parsed = JSON.parse(raw) as IndexerConfig;
   if (!parsed.sources?.length) throw new Error("Config has no sources. Add the two CSV paths under `sources`.");
   for (const source of parsed.sources) {
+    // MODE B (`r2://bucket/key`) is not a local file: nothing to resolve or check
+    // locally. A malformed r2 URL fails here, before any run starts.
+    if (parseR2Source(source.path)) continue;
     source.path = resolve(source.path);
     if (!existsSync(source.path)) {
       console.warn(`! source ${source.id} was not found at ${source.path} — that file will be skipped by preflight checks.`);
@@ -86,7 +90,24 @@ function progressLogger() {
   };
 }
 
+/**
+ * Mode B sources need R2 credentials in this process; Wrangler's login is not
+ * usable by a local script. Fail early with the least-privilege recipe instead of
+ * failing in the middle of a multi-hour run.
+ */
+function requireSourceAccess(config: IndexerConfig): boolean {
+  const context = createSourceContext({ cacheDir: config.rawCacheDir === undefined ? undefined : config.rawCacheDir });
+  const missing = missingCredentialBuckets(config.sources, context);
+  if (missing.length) {
+    console.error(credentialsHelp(missing));
+    process.exitCode = 1;
+    return false;
+  }
+  return true;
+}
+
 async function cmdProfile(config: IndexerConfig): Promise<void> {
+  if (!requireSourceAccess(config)) return;
   const report = await preflight(config);
   printPreflight(report);
   for (const source of config.sources) {
@@ -97,7 +118,9 @@ async function cmdProfile(config: IndexerConfig): Promise<void> {
       knownFields: [...ALL_CANONICAL_FIELDS],
     });
     const map = buildColumnMap(profile.headers);
+    const mode = parseR2Source(source.path) ? "R2 object (bounded sample read)" : "local file";
     console.log(`\n${source.id} — ${source.path}`);
+    console.log(`  input mode       ${mode}`);
     console.log(`  sampled rows     ${profile.sampledRows.toLocaleString()}`);
     console.log(`  header line      ${profile.headerLine}`);
     console.log(`  detected delim   ${JSON.stringify(profile.delimiter)}   encoding ${profile.encoding}`);
@@ -122,6 +145,7 @@ async function cmdProfile(config: IndexerConfig): Promise<void> {
 }
 
 async function cmdRun(config: IndexerConfig, flags: Record<string, string | boolean>): Promise<void> {
+  if (!requireSourceAccess(config)) return;
   const sample = flags.sample ? Number(flags.sample) : undefined;
   const version = typeof flags.version === "string" ? flags.version : config.datasetVersion;
   const upload = Boolean(flags.upload);
@@ -238,6 +262,12 @@ function usage(): void {
   run        Stream, resolve, index, validate and optionally upload
   validate   Re-check the generated objects against their checksums
   publish    Flip the active-version pointer to a validated version
+
+Sources (sources[].path in the config) accept either mode:
+  local file   D:/data/companies_part1.csv
+  R2 object    r2://company-intel-data/raw/companies_part1.csv
+               (streamed in bounded ranged reads; needs R2_* credentials in this
+                shell because Wrangler's login cannot be used by a local script)
 
 Flags
   --config <path>   indexer configuration (required for every command)

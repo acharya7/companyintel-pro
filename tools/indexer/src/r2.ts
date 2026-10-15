@@ -236,6 +236,21 @@ export class R2Client {
     const size = response.headers.get("content-length");
     return { exists: true, size: size ? Number(size) : null, etag: response.headers.get("etag") };
   }
+
+  /**
+   * HEAD with the HTTP status kept.
+   *
+   * `head()` collapses every failure into "does not exist", which is right for a
+   * presence check but wrong for diagnosis: a 403 (credentials that cannot read
+   * the bucket) must not read as "the file is missing". The Mode B source reader
+   * uses this variant so a run fails with the real reason.
+   */
+  async headDetailed(key: string): Promise<{ exists: boolean; size: number | null; etag: string | null; status: number }> {
+    const response = await this.sign("HEAD", key);
+    if (!response.ok) return { exists: false, size: null, etag: null, status: response.status };
+    const size = response.headers.get("content-length");
+    return { exists: true, size: size ? Number(size) : null, etag: response.headers.get("etag"), status: response.status };
+  }
 }
 
 /** Local file size helper used by the preflight report. */
