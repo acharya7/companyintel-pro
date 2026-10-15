@@ -86,10 +86,11 @@ Optional vars: `ENVIRONMENT`, `APP_VERSION`, `MAX_SEARCHES_PER_MINUTE`.
 - R2 credentials for upload/publish are **environment variables only** (see below); they are
   never written to this file.
 
-## 5. R2 credentials for the indexer (local machine only)
+## 5. R2 credentials for the indexer and verification scripts (local machine only)
 
-Used by `run --upload` and `publish`. You configured these already with rclone; the indexer
-reads the same S3-compatible credentials:
+Used by `run --upload`, `publish`, `scripts/verify-raw.mjs` and `scripts/profile-raw.mjs`.
+You configured these already with rclone; the local code reads the same S3-compatible
+credentials from the environment — never from a file in this repository:
 
 ```powershell
 # Windows PowerShell — set for the current session only
@@ -98,8 +99,24 @@ $env:R2_ACCESS_KEY_ID="<access key id>"
 $env:R2_SECRET_ACCESS_KEY="<secret access key>"
 ```
 
-Never commit these, never paste them into chat. If they are absent, `publish` stops and tells
-you to upload with rclone and then write `manifests/active.json` manually.
+```bash
+# macOS / Linux — same three, scoped to this shell session only
+export R2_ACCOUNT_ID="<account id>"
+export R2_ACCESS_KEY_ID="<access key id>"
+export R2_SECRET_ACCESS_KEY="<secret access key>"
+```
+
+No `R2_ENDPOINT`, `R2_REGION` or `R2_BUCKET_NAME` variable is read: the endpoint is derived
+from the account id, the signature scope is `auto`, and the bucket defaults to
+`company-intel-data` (`tools/indexer/src/r2.ts`).
+
+Never commit these, never paste them into chat, and do not enter them in a hosting
+provider's Frontend/Backend environment panel: the production Worker uses the
+`COMPANY_DATA` binding and needs no keys, and the Backend panel of a Convex-backed project
+is read by Convex, not by this app. See `docs/r2-connection.md`.
+
+If they are absent, `publish` stops and tells you to upload with rclone and then write
+`manifests/active.json` manually, and the verification scripts exit 2 with setup instructions.
 
 ## 6. Node / tooling
 

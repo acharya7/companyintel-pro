@@ -15,9 +15,10 @@ Bucket: `company-intel-data` · prefix `raw/` · target version `v1`.
 | `csv1` | _awaiting Phase A listing_ | ≈ 10 GB (your statement) | Not verified — no R2 access from here |
 | `csv2` | _awaiting Phase A listing_ | ≈ 50 GB (your statement) | Not verified — no R2 access from here |
 
-`bun scripts/profile-raw.mjs --list` prints the exact names and byte sizes, and
-`bun scripts/verify-raw.mjs --keys <real keys>` confirms presence, size and ETag for each original
-(it exits non-zero when an expected object is missing, so it can gate the run). I will put the
+`bun scripts/verify-raw.mjs --json` lists `raw/` (≤ 25 objects, largest first) with the exact names
+and byte sizes, confirms presence + size + ETag for each original and proves the body is readable
+with a 1 KB ranged GET (it exits non-zero when an expected object is missing, so it can gate the
+run), and `bun scripts/profile-raw.mjs --json` adds both schema reports. I will put the
 real names and sizes here verbatim once you send that output. The indexer config
 `sources[].path` must point at the real local paths (it reads local files; `raw/` objects can be
 downloaded once with `bunx wrangler r2 object get` if you prefer to keep them in R2 only).
@@ -140,11 +141,13 @@ Full detail and the pricing sources: `docs/cost.md`.
 
 ## 9. Exact actions I need from you
 
-1. Set the three R2 environment variables in your own PowerShell session (never in chat).
-2. Run `bun scripts/profile-raw.mjs --list` and send the listing (names, sizes, timestamps).
-3. Run `bun scripts/verify-raw.mjs --keys raw/<file1>.csv,raw/<file2>.csv` (alias: `bun run verify:r2`)
-   and send its output.
-4. Run `bun scripts/profile-raw.mjs` and send **both** schema reports.
+1. Set the three R2 environment variables in your own terminal session (never in chat) — macOS and
+   PowerShell commands are in `docs/r2-connection.md`.
+2. Run `bun scripts/verify-raw.mjs --json > raw-verification.json` and send that file (names,
+   sizes, ETags, timestamps, dataset state — no secrets, no cell values).
+3. Run `bun scripts/profile-raw.mjs --json > raw-schema-reports.json` and send it (**both** schema
+   reports). Use `--keys raw/<file1>.csv,raw/<file2>.csv` if the auto-selected two are not your
+   source files.
 5. Paste the two recommended `columns` blocks (or confirm "no override needed").
 6. Run the 10 k and 100 k sample runs; send the counters.
 7. Run the 1 M sample; send wall-clock time, peak RAM, disk used, output size, object count.

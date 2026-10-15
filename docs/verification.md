@@ -6,11 +6,11 @@ names the command or test that produced it.
 
 Run everything below yourself with:
 
-```powershell
-bun run check                          # 4 typechecks + 167 tests
+```bash
+bun run check                          # 4 typechecks + 193 tests
 bun scripts/benchmark-r2-path.mjs      # R2-backed search path
 bun scripts/benchmark-search.mjs       # engine + labelled relevance
-bun scripts/verify-raw.mjs             # (needs R2 credentials) real object inventory
+bun scripts/verify-raw.mjs --json      # (needs R2 credentials) real object inventory
 bun scripts/profile-raw.mjs --list     # (needs R2 credentials) real object listing + schemas
 ```
 
@@ -30,49 +30,90 @@ bun scripts/profile-raw.mjs --list     # (needs R2 credentials) real object list
 paste them into chat. No object was listed, no byte was read, no schema was reported, and no
 claim of verification is made.
 
+Measured, not assumed: `bun scripts/verify-raw.mjs` exits **2** here with "R2 credentials are not
+set for this terminal session", i.e. `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` /
+`R2_SECRET_ACCESS_KEY` are not present in this workspace's process environment — so no variable
+from a provider environment panel is reaching this app's server-side code, and the app itself
+never reads `VITE_CONVEX_URL` / `CONVEX_DEPLOYMENT` (no Convex dependency exists). Details and
+the ten answers: `docs/r2-connection.md`.
+
 What is ready for you — two read-only scripts, neither writes to the bucket. `verify-raw.mjs` is
-the inventory/verification script (presence, exact byte size, ETag, and the currently published
-dataset/manifest/validation state); `profile-raw.mjs` samples the heads and prints the two schema
-reports.
+the connection test + inventory (access, bounded `raw/` listing, presence, exact byte size, ETag,
+bounded body read, and the currently published dataset/manifest/validation state);
+`profile-raw.mjs` samples the heads and prints the two schema reports.
 
-```powershell
-# Session-only credentials (never committed, never pasted into chat)
-$env:R2_ACCOUNT_ID="<account id>"
-$env:R2_ACCESS_KEY_ID="<access key id>"
-$env:R2_SECRET_ACCESS_KEY="<secret access key>"
+Credentials go in **your own terminal session** (macOS shown; PowerShell equivalents and the full
+rationale — including why they must not go in the provider's Frontend/Backend panel — are in
+`docs/r2-connection.md`):
 
-# 1. What actually exists under raw/ — names, sizes, timestamps, readability
+```bash
+export R2_ACCOUNT_ID="<account id>"
+export R2_ACCESS_KEY_ID="<access key id>"
+export R2_SECRET_ACCESS_KEY="<secret access key>"
+
+# 1. Connection test: access, one bounded LIST of raw/ (≤ 25 objects, largest first,
+#    real names/sizes/timestamps), both sources' size + ETag + a 1 KB ranged body read,
+#    and the published dataset state. --json gives one share-safe report.
+bun scripts/verify-raw.mjs --json > raw-verification.json
+
+# 2. Read the head of both files with ranged GETs (never the whole file) and
+#    print two independent schema reports + a ready-to-paste sources block.
+#    --json writes headers/fill-rates/mappings only — no cell values.
+bun scripts/profile-raw.mjs --json > raw-schema-reports.json
+
+# 3. Inventory only (no sampling)
 bun scripts/profile-raw.mjs --list
-
-# 2. Presence + size + ETag of both originals, plus the active dataset state.
-#    Pass the real keys from step 1 — the built-in default names are a placeholder.
-#    (`bun run verify:r2` is the same command without --keys.)
-bun scripts/verify-raw.mjs --keys raw/<file1>.csv,raw/<file2>.csv
-
-# 3. Read the head of both files with ranged GETs (never the whole file) and
-#    print two independent schema reports + a ready-to-paste sources block
-bun scripts/profile-raw.mjs
 ```
 
-`profile-raw.mjs` reads only the first ~6 MB of each object (never the 10/50 GB), cuts the last
-partial record so a truncated line cannot distort the profile, writes the samples to
-`.raw-samples/`, prints per-file delimiter/encoding/fill-rates/sample values, the canonical field
-mapping for **each** file separately, and a ready-to-paste `sources` block.
+What `verify-raw.mjs` guarantees, and what it refuses to do:
 
-Without credentials you can still confirm presence with wrangler (no keys in the shell):
+- **Bounded.** One `LIST` with `max-keys = 26`, at most 25 objects shown, ordered largest-first so
+the source files are always inside the bound. `objectsRead` is what that one call returned — it is
+never presented as a bucket total; `truncated: true` simply says more objects exist than were read.
+- **Honest.** A missing object, a missing manifest, a non-passing validation record or a refused
+credential is a *problem*, with exit code 1 (absent credentials exit 2). Nothing is assumed present.
+- **Bounded bodies.** `HEAD` plus a 1 KB ranged `GET` per source proves readability without ever
+downloading the 10 GB or 50 GB file. No `PUT`, `DELETE` or bucket-policy call exists in the script.
+- **Not guessing which files are the sources.** Auto-selection takes the two largest `.csv` objects
+and records `selection.mode = "two-largest-csv"`; naming them with `--keys` records `"explicit"`.
+When more than two CSV objects exist, the choice is reported as a notice, not as fact.
 
-```powershell
+`profile-raw.mjs` reads only the first ~6 MB of each object, trims the sample back to the last
+**complete** record (a range boundary can land inside a quoted multiline row — `quoteCount` parity
+decides), writes the sampled bytes to `.raw-samples/` (now gitignored, and it holds real records:
+never commit or share it), prints per-file delimiter/encoding/fill-rates/sample values, the
+canonical field mapping for **each** file separately, and a ready-to-paste `sources` block.
+
+Without any S3 credentials you can still confirm presence with rclone or wrangler:
+
+```bash
+rclone lsl r2:company-intel-data/raw/
 bunx wrangler r2 object list company-intel-data --prefix raw/
 ```
 
 The app exposes the same bounded listing as `GET /api/dataset/sources` (≤ 25 objects, `raw/` only)
 and renders it on the **Dataset Management** page — a second, independent confirmation once the
-Worker is deployed and Access is configured.
+Worker is deployed and Access is configured. (The API returns the first 25 keys as R2 lists them;
+the script orders by size, deliberately, so the two large sources cannot fall outside the bound.)
+
+### Tooling verified here (script behaviour, not your bucket)
+
+`tests/verify-raw-script.test.ts`, `tests/profile-raw-script.test.ts` and
+`tests/raw-report.test.ts` run the real scripts as child processes over a stub S3 transport that
+speaks ListObjectsV2 / HEAD / ranged GET and records every request. Verified for real: the
+25-object bound and size ordering, 1 KB and 6 MB read budgets, `bytes=0-1023` / `bytes=0-5999999`
+ranges, exactly one LIST per run, no non-GET/HEAD request ever issued, missing objects and 403s
+producing the documented exit codes, `--json` being pure parseable JSON with no cell values, and no
+credential value appearing in stdout or stderr. `tests/worker-r2-binding.test.ts` asserts the
+Worker uses the `COMPANY_DATA` binding, declares `COMPANY_DATA: R2Bucket`, contains no `R2_*`
+secret, no `cloudflarestorage.com` and no `process.env`, and that the config never publishes the
+bucket. **None of this is evidence about your bucket.**
 
 ### Non-secret outputs I need from you (paste these; they contain no credentials)
 
-1. The `--list` output (object **names**, **sizes**, timestamps).
-2. Both schema reports: header line, delimiter, encoding, sampled record count.
+1. `raw-verification.json` — object **names**, **sizes**, ETags, timestamps, dataset state.
+2. `raw-schema-reports.json` — both schema reports: header line, delimiter, encoding, sampled
+   record count, per-column fill rates, and the canonical mapping for each file.
 3. For each file, the canonical mapping lines and any "unmapped headers" / "canonical fields
    absent" lines.
 4. Whether a 10,000-record sample run completed and its counters (`rows read`, `rejected`,
@@ -258,7 +299,8 @@ authoritative objects in R2, and the directory is explicitly derived data.
 
 | Requirement | Implemented | Test evidence | Remaining risk | Manual action required |
 | --- | --- | --- | --- | --- |
-| A. List real `raw/` objects, verify sizes/readability, sample + report both schemas, map to canonical model | Tooling ready, run not executed (no R2 creds here) | `scripts/verify-raw.mjs`, `scripts/profile-raw.mjs` (ranged GETs only) | Real headers may differ from the fixture | Run both scripts locally, send listings + both schema reports |
+| A. List real `raw/` objects, verify sizes/readability, sample + report both schemas, map to canonical model | Tooling implemented and tested over a stub transport; real run not executed (no R2 creds reach this environment) | `tests/verify-raw-script.test.ts` (7), `tests/profile-raw-script.test.ts` (3), `tests/raw-report.test.ts` (9); `scripts/verify-raw.mjs`, `scripts/profile-raw.mjs` | Real headers may differ from the fixture | Run both scripts locally, send both `--json` reports |
+| Production Worker reaches R2 only through the `COMPANY_DATA` binding | Yes | `tests/worker-r2-binding.test.ts` (7): binding + bucket name, no published bucket, no `R2_*`/`cloudflarestorage.com`/`process.env` in `worker/**`, S3 client confined to `tools/` + `scripts/` | Custom domain/`workers.dev` routing is account config | Create the Access app (Phase D) |
 | A. Mapping corrections identified | Mechanism tested, real overrides pending | `tests/e2e-index.test.ts` (two schemas → one model) | A column may need a `columns` override | Approve the `columns` blocks I return |
 | B. Streaming, multiline, dual-schema parsing | Yes | `tests/e2e-index.test.ts`, `tests/csv.test.ts` | None known | — |
 | B. Disk-backed grouping, identity resolution, dedupe, cross-file association | Yes | `tests/e2e-index.test.ts` (multiline record = 1, dup contact once, Microsoft merged from both files, same-name/different-domain kept apart) | Real data may expose new ambiguity | Review ambiguous-count in the manifest after the sample runs |

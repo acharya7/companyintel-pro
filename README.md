@@ -14,8 +14,9 @@ No Convex, no SQL database, no KV/D1/Durable Objects, no Redis, no search server
   `COMPANY_DATA` → `company-intel-data`
 - Access: Cloudflare Access JWT verification on every `/api/*` route (single approved identity)
 - Indexing: Windows-compatible streaming indexer in `tools/indexer` (Node/Bun, disk-backed)
-- Tests: `bun test` (167 tests, 683 assertions) — normalization, relevance, CSV/indexer, R2 store,
-  end-to-end index + Worker API over a generated index, lead recovery, security
+- Tests: `bun test` (193 tests, 816 assertions) — normalization, relevance, CSV/indexer, R2 store,
+  end-to-end index + Worker API over a generated index, lead recovery, security, plus the R2
+  verification scripts run end to end over a stub transport
 
 ## Documentation
 
@@ -23,6 +24,7 @@ No Convex, no SQL database, no KV/D1/Durable Objects, no Redis, no search server
 | --- | --- |
 | `docs/architecture.md` | components, data flow, canonical model, entity resolution, search, R2 layout, caching |
 | `docs/configuration.md` | frontend API mode, `wrangler.toml`, Worker secrets, indexer config, R2 credentials |
+| `docs/r2-connection.md` | how R2 access really works (binding vs. S3 keys), what the Freebuff env panel can and cannot do, macOS commands, the read-only connection test |
 | `docs/indexing.md` | the profiling → sample → full → validate → publish workflow, preflight, resume, troubleshooting |
 | `docs/deployment.md` | beginner step-by-step Cloudflare setup: wrangler, secrets, Access application, deploy, verify, rollback |
 | `docs/security.md` | threat model, Access verification, headers, validation, rate limits, deployment checklist, residual risks |
@@ -61,17 +63,29 @@ Iterating on search quality or the theme does not require data:
 `bun run bench` measures latency, retrieval cost and labelled relevance (recall@1/@5, false
 positives) on a synthetic corpus.
 
+Before any of that, Phase A verifies what is really in R2 — read-only, bounded, both source files
+untouched (`docs/r2-connection.md`):
+
+```bash
+bun scripts/verify-raw.mjs          # access + ≤25-object raw/ listing + sizes/ETags + bounded body read
+bun scripts/verify-raw.mjs --json   # same, as one share-safe machine-readable report
+bun scripts/profile-raw.mjs --list  # inventory only
+bun scripts/profile-raw.mjs         # ranged 6 MB sample → both schema reports + suggested mapping
+```
+
 ## Verification status
 
 | Area | Status |
 | --- | --- |
 | Frontend, Worker, indexer typechecks | **IMPLEMENTED AND TESTED** — `bun run check` → 4/4 PASS |
-| Test suite (167 tests, 683 assertions) | **IMPLEMENTED AND TESTED** — normalization, relevance, CSV parsing, indexer pipeline, R2 store, Access security, end-to-end index build + Worker route handlers |
+| Test suite (193 tests, 816 assertions) | **IMPLEMENTED AND TESTED** — normalization, relevance, CSV parsing, indexer pipeline, R2 store, Access security, end-to-end index build + Worker route handlers |
+| Worker → R2 access path | **IMPLEMENTED AND TESTED** — `tests/worker-r2-binding.test.ts` proves the Worker reaches R2 only through the `COMPANY_DATA` binding, never with S3 secrets, and that the bucket is not published |
+| Read-only R2 verification tooling | **IMPLEMENTED AND TESTED over a stub transport** — bounded 25-object `raw/` listing, size/ETag + 1 KB ranged body read, missing-object and denied-credential exit codes, `--json` reports with no cell values. Real bucket still unread |
 | Search engine + ranking | **IMPLEMENTED AND TESTED** — recall@1 0.939 / recall@5 0.97 on the labelled fixture set |
 | R2 object layout, manifests, rollback | **IMPLEMENTED, PARTIALLY TESTED** — layout and pointer logic tested; the real R2 path needs a deployed bucket |
 | Worker API + R2 reads | **IMPLEMENTED, PARTIALLY TESTED** — routing, validation and Access verified by tests; end-to-end reads require a published dataset |
 | Streaming indexer | **IMPLEMENTED AND TESTED on synthetic CSVs** — both schemas, multiline records, cross-file association, shard bounds, checkpoint, upload retries, checksums, atomic publish/rollback. Real 10 GB/50 GB run pending your approval gate |
-| Real data in R2 (`raw/`) | **NOT VERIFIED** — this environment has no R2 credentials; run `bun scripts/profile-raw.mjs --list` and `bun scripts/verify-raw.mjs` locally (`docs/verification.md` → Phase A) |
+| Real data in R2 (`raw/`) | **NOT VERIFIED** — measured here: no R2 credentials reach this environment, so nothing has been listed or read. Run `bun scripts/verify-raw.mjs --json` and `bun scripts/profile-raw.mjs --json` on your machine (`docs/r2-connection.md`, `docs/verification.md` → Phase A) |
 | Browser-rendered UI | **BLOCKED here** — no browser in this sandbox; manual checklist in `docs/verification.md` → Phase C |
 | Cloudflare deployment + Access policy | **NOT STARTED** — manual steps are in `docs/deployment.md`, awaiting your go-ahead |
 | Full 60 GB indexing | **BLOCKED (by design)** — requires your explicit approval after the sample benchmarks |
@@ -79,9 +93,12 @@ positives) on a synthetic corpus.
 
 ## Manual actions required from you
 
-1. Export your R2 credentials in this terminal only, then verify the real files:
-   `bun scripts/profile-raw.mjs --list`, `bun scripts/verify-raw.mjs --keys raw/<file1>.csv,raw/<file2>.csv`,
-   `bun scripts/profile-raw.mjs`. Send back the listings and both schema reports (no secrets).
+1. In **your own** terminal, export your R2 credentials for that session only, then run:
+   `bun scripts/verify-raw.mjs --json > raw-verification.json` and
+   `bun scripts/profile-raw.mjs --json > raw-schema-reports.json`. Send back those two files —
+   they hold names, sizes, ETags, headers, fill rates and mappings, and no secrets or cell values.
+   Do **not** enter R2 credentials in the provider's Frontend/Backend environment panel
+   (see `docs/r2-connection.md`).
 2. Point `tools/indexer/indexer.config.json` at your local CSV paths and run `bun run index:profile`.
 3. Run the sample runs, then approve the full indexing job (approval gate 1) — see `docs/execution-plan.md`.
 4. Create the Cloudflare Access application and set `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD`,

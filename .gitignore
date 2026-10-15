@@ -1,4 +1,13 @@
 .env.local
+.env
 node_modules
 dist
 src/convex/_generated
+
+# Real data must never be committed:
+#  - .raw-samples/ holds sampled bytes of the original CSVs (real contact records)
+#  - .indexer-work/ is the indexer spool/checkpoint area (derived from those records)
+#  - .indexer-output/ is the generated index before upload
+.raw-samples/
+.indexer-work/
+.indexer-output/
