@@ -9,7 +9,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
-import { Building2, ChevronDown, Copy, ExternalLink, Filter, Linkedin, Search, Star, X } from "lucide-react";
+import { Building2, ChevronDown, Copy, Database, ExternalLink, Filter, Linkedin, Search, Star, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -20,6 +20,7 @@ import { EmptyState, ErrorBlock, LoadingBlock, MatchBadge, PageHeader, Pager, Se
 import {
   useCompanySearch,
   useCreateSavedSearch,
+  useDatasetMode,
   useDatasetStatus,
   useSaveLead as useInsertLead,
   recordActivity,
@@ -71,6 +72,7 @@ export default function CompanySearch() {
   const inputRef = useRef<HTMLInputElement>(null);
 
   const dataset = useDatasetStatus();
+  const datasetMode = useDatasetMode();
   const saveSearch = useCreateSavedSearch();
   const saveLead = useInsertLead();
 
@@ -313,7 +315,27 @@ export default function CompanySearch() {
             </div>
           ) : null}
 
-          {query.isLoading ? (
+          {datasetMode.mode === "no-dataset" && !datasetMode.isLoading ? (
+            // Nothing is published, so there is nothing honest to search. This is a
+            // state, not an error: explain it instead of showing a failed request.
+            <EmptyState
+              icon={<Database className="size-5" />}
+              title="No dataset indexed"
+              description={
+                datasetMode.error
+                  ? `The dataset status could not be read: ${(datasetMode.error as Error).message}`
+                  : datasetMode.description
+              }
+              action={
+                <Button variant="outline" className="gap-2" asChild>
+                  <Link to="/dataset">
+                    <Database className="size-4" />
+                    Dataset management
+                  </Link>
+                </Button>
+              }
+            />
+          ) : query.isLoading ? (
             <LoadingBlock label="Searching the index" rows={6} />
           ) : query.error ? (
             <ErrorBlock error={query.error as Error} onRetry={() => query.refetch()} />

@@ -14,7 +14,7 @@ import { SEARCH_LIMITS, buildContactCacheKey, buildSearchCacheKey } from "@/shar
 import { persistentCache, type PersistentCacheOptions } from "@/lib/cache/persistent-cache";
 import { LocalApiClient } from "./local";
 import { WorkerApiClient } from "./worker";
-import type { ApiClient, CompanySearchParams, ContactQueryParams } from "./types";
+import { API_CLIENT_METHODS, apiClientMethodNames, type ApiClient, type CompanySearchParams, type ContactQueryParams } from "./types";
 
 interface ViteEnv {
   VITE_API_MODE?: string;
@@ -83,8 +83,37 @@ export function withPersistentCache(base: ApiClient): ApiClient {
     return status.activeVersion ?? (status.dataOrigin === "sample" ? "sample-v1" : "unindexed");
   };
 
+  /*
+   * Forward EVERY method the underlying client really has.
+   *
+   * This used to be an object spread of `base` plus four cached overrides. That
+   * looks like it copies the client and it typechecks — but spread copies only *own
+   * enumerable* properties, and class methods live on the prototype. The result
+   * was a client object with `mode` and four methods and nothing else, which is
+   * exactly the runtime failure the preview showed:
+   *
+   *     Request failed — api.datasetStatus is not a function
+   *
+   * while every typecheck passed. Walking the prototype chain instead means a
+   * method added to `ApiClient` later is forwarded automatically, and the guard
+   * below turns any real gap into a loud error instead of a broken page.
+   */
+  const wrapper: Record<string, unknown> = {};
+  for (const name of apiClientMethodNames(base)) {
+    const fn = (base as unknown as Record<string, (...args: unknown[]) => unknown>)[name];
+    wrapper[name] = (...args: unknown[]) => fn.apply(base, args);
+  }
+  const missing = API_CLIENT_METHODS.filter((name) => typeof wrapper[name] !== "function");
+  if (missing.length) {
+    throw new Error(
+      `The ${base.mode} API client does not implement: ${missing.join(", ")}. ` +
+        "Every method of ApiClient must exist at runtime — see src/lib/api/types.ts.",
+    );
+  }
+  wrapper.mode = base.mode;
+
   return {
-    ...base,
+    ...(wrapper as unknown as ApiClient),
 
     async searchCompanies(params: CompanySearchParams): Promise<CompanySearchResponse> {
       const datasetVersion = await resolveVersion().catch(() => "unknown");

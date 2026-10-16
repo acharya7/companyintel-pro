@@ -13,8 +13,17 @@ import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { EmptyState, ErrorBlock, LoadingBlock, PageHeader, Section, StatCard, StatusPill } from "@/components/common";
-import { useActivateDataset, useDatasetSources, useDatasetStatus, useValidateDataset } from "@/hooks/use-api";
+import {
+  DatasetModeBanner,
+  EmptyState,
+  ErrorBlock,
+  LoadingBlock,
+  PageHeader,
+  Section,
+  StatCard,
+  StatusPill,
+} from "@/components/common";
+import { useActivateDataset, useDatasetMode, useDatasetSources, useDatasetStatus, useValidateDataset } from "@/hooks/use-api";
 import { formatBytes, formatDate, formatNumber, relativeTime } from "@/lib/format";
 
 const INDEX_COMMANDS = [
@@ -44,6 +53,7 @@ const INDEX_COMMANDS = [
 
 export default function DatasetManagement() {
   const status = useDatasetStatus();
+  const mode = useDatasetMode();
   const sources = useDatasetSources();
   const validate = useValidateDataset();
   const activate = useActivateDataset();
@@ -100,7 +110,22 @@ export default function DatasetManagement() {
         }
       />
 
+      <DatasetModeBanner mode={mode.mode} detail={mode.description} />
+
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <StatCard
+          label="Application mode"
+          value={mode.label}
+          hint={
+            mode.mode === "real"
+              ? "Serving a published R2 index version"
+              : mode.mode === "demo"
+                ? "Bundled synthetic dataset — never presented as production data"
+                : "R2 reachable or not, nothing is published: search has no real records to return"
+          }
+          icon={<Layers className="size-4" />}
+          tone={mode.mode === "real" ? "default" : mode.mode === "demo" ? "accent" : "muted"}
+        />
         <StatCard
           label="Bucket"
           value={data.bucket}

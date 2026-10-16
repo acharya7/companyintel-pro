@@ -29,8 +29,8 @@ import { Input } from "@/components/ui/input";
 import { Sheet, SheetContent, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import { SampleDataBanner, StatusPill } from "@/components/common";
-import { useDatasetStatus, useLeads, useSavedSearches } from "@/hooks/use-api";
+import { DatasetModeBanner, StatusPill } from "@/components/common";
+import { useDatasetMode, useLeads, useSavedSearches } from "@/hooks/use-api";
 import { apiMode, relativeTime } from "@/lib/format-bridge";
 
 const NAV = [
@@ -102,28 +102,21 @@ function NavItems({ onNavigate }: { onNavigate?: () => void }) {
 }
 
 function DatasetPill() {
-  const { data, isLoading } = useDatasetStatus();
+  const { mode, label, description, status, isLoading } = useDatasetMode();
   if (isLoading) return <Badge variant="outline" className="animate-pulse text-xs">Checking dataset…</Badge>;
-  const sample = data?.dataOrigin === "sample";
   return (
     <TooltipProvider delayDuration={400}>
       <Tooltip>
         <TooltipTrigger asChild>
           <span className="inline-flex">
-            <StatusPill
-              ok={Boolean(data?.indexed)}
-              label={sample ? "Sample data" : data?.indexed ? `Index ${data.activeVersion}` : "Dataset not indexed"}
-            />
+            <StatusPill ok={mode === "real"} label={label} />
           </span>
         </TooltipTrigger>
         <TooltipContent side="bottom" className="max-w-xs text-xs">
-          <p className="font-medium">{data?.bucket ?? "company-intel-data"}</p>
+          <p className="font-medium">{status?.bucket ?? "company-intel-data"}</p>
           <p className="text-muted-foreground">
-            {sample
-              ? "Preview mode is serving the synthetic sample dataset. It is never presented as production data."
-              : data?.indexed
-                ? `Active version published ${relativeTime(data.lastIndexedAt)}.`
-                : "No validated R2 dataset version is active yet."}
+            {description}
+            {mode === "real" && status?.lastIndexedAt ? ` Published ${relativeTime(status.lastIndexedAt)}.` : ""}
           </p>
         </TooltipContent>
       </Tooltip>
@@ -183,7 +176,7 @@ function GlobalSearch() {
 }
 
 export function AppLayout() {
-  const { data: dataset } = useDatasetStatus();
+  const { mode, status: dataset } = useDatasetMode();
   const [mobileOpen, setMobileOpen] = useState(false);
 
   return (
@@ -241,7 +234,7 @@ export function AppLayout() {
           <div className="lg:hidden">
             <GlobalSearch />
           </div>
-          {dataset?.dataOrigin === "sample" ? <SampleDataBanner message={dataset.message} /> : null}
+          {mode === "demo" || mode === "no-dataset" ? <DatasetModeBanner mode={mode} detail={dataset?.message} /> : null}
           <Outlet />
         </main>
         <footer className="mx-auto w-full max-w-[1500px] px-4 pb-8 text-[11px] text-muted-foreground sm:px-6">
@@ -250,7 +243,13 @@ export function AppLayout() {
             <span aria-hidden>·</span>
             <span>Cloudflare Workers + R2</span>
             <span aria-hidden>·</span>
-            <span>{dataset?.indexed ? `Dataset ${dataset.activeVersion}` : "No dataset indexed"}</span>
+            <span>
+              {mode === "real"
+                ? `Live dataset ${dataset?.activeVersion}`
+                : mode === "demo"
+                  ? "Demo mode (bundled sample data)"
+                  : "No dataset indexed"}
+            </span>
           </div>
         </footer>
       </div>

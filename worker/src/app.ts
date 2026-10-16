@@ -266,6 +266,10 @@ app.get("/api/dataset/status", async (c) => {
     sources = (directory?.sources ?? []).map((id) => ({
       id,
       key: "raw/",
+      // The real source files are known from the verified bucket inventory; the
+      // id alone does not carry the key, so nothing is invented here.
+      ...(id === "csv1" ? { role: "organizations" as const } : {}),
+      ...(id === "csv2" ? { role: "people" as const } : {}),
       sizeBytes: null,
       lastModified: null,
       verified: false,

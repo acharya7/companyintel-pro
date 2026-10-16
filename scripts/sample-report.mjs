@@ -24,7 +24,7 @@ import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { gunzipSync } from "node:zlib";
 
-import { formatSampleReport, summariseAssociation } from "./lib/sample-report.mjs";
+import { formatSampleReport, rejectionSummary, sharedNameRisk, summariseAssociation } from "./lib/sample-report.mjs";
 
 const argv = process.argv.slice(2);
 
@@ -37,6 +37,7 @@ function flag(name, fallback = null) {
 
 const asJson = Boolean(flag("json"));
 const dir = resolve(String(flag("dir", ".indexer-output")));
+const workDir = resolve(String(flag("work-dir", ".indexer-work")));
 
 if (!existsSync(dir)) {
   console.error(
@@ -115,6 +116,26 @@ const association = summariseAssociation({
   duplicateContactRows: manifest.counters?.duplicateRowsResolved ?? 0,
 });
 
+/** How often the name-only cross-file join could have picked the wrong company. */
+const risk = sharedNameRisk({ companies, contactsByRef });
+
+/* Rejected rows: one JSON object per line, written by the run that produced this
+   version. Absent when the run was cleaned up — reported as absent, not as zero. */
+const rejectedPath = join(workDir, "rejected.jsonl");
+let rejections = null;
+if (existsSync(rejectedPath)) {
+  const rows = [];
+  for (const line of readFileSync(rejectedPath, "utf8").split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      rows.push(JSON.parse(line));
+    } catch {
+      // A truncated final line (killed run) is ignored rather than crashing the report.
+    }
+  }
+  rejections = rejectionSummary(rows);
+}
+
 let objects = 0;
 let bytes = { companies: 0, contacts: 0, indexes: 0 };
 for (const bucket of ["companies", "contacts", "indexes"]) {
@@ -143,6 +164,8 @@ const report = {
   counters: manifest.counters ?? {},
   coverage: stats?.contactCoverage ?? null,
   association,
+  risk,
+  rejections,
   shards: directory?.shards ?? null,
   sizes: { objects, ...bytes },
   notes: [],

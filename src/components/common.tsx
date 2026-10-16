@@ -15,6 +15,7 @@ import { cn } from "@/lib/utils";
 import { AlertTriangle, ChevronLeft, ChevronRight, Database, Info, Loader2, RefreshCw } from "lucide-react";
 import { matchCategoryLabel } from "@/lib/format";
 import type { MatchCategory } from "@/shared/models";
+import type { DatasetMode } from "@/lib/api/types";
 
 export function PageHeader({
   title,
@@ -154,16 +155,58 @@ export function ErrorBlock({ error, onRetry }: { error: Error; onRetry?: () => v
 
 /** Shown whenever the active dataset is the synthetic sample, never hidden. */
 export function SampleDataBanner({ message }: { message?: string }) {
+  return <DatasetModeBanner mode="demo" detail={message} />;
+}
+
+/**
+ * States what the application is actually serving.
+ *
+ * One banner for all three modes, so "demo", "live" and "nothing published yet"
+ * can never be confused with each other — and a bucket that happens to be
+ * reachable is never labelled as real data.
+ */
+export function DatasetModeBanner({
+  mode,
+  detail,
+  action,
+}: {
+  mode: DatasetMode;
+  detail?: ReactNode;
+  action?: ReactNode;
+}) {
+  const copy: Record<DatasetMode, { title: string; body: string; tone: string; icon: ReactNode }> = {
+    demo: {
+      title: "Demo mode — bundled sample data",
+      body: "The synthetic dataset is serving this preview. Nothing on screen is read from your Cloudflare R2 bucket.",
+      tone: "border-chart-3/40 bg-chart-3/10 text-chart-3",
+      icon: <Database className="mt-0.5 size-4 shrink-0" />,
+    },
+    real: {
+      title: "Live data — published R2 index",
+      body: "Results come from the active index version published in company-intel-data.",
+      tone: "border-chart-2/40 bg-chart-2/10 text-chart-2",
+      icon: <Database className="mt-0.5 size-4 shrink-0" />,
+    },
+    "no-dataset": {
+      title: "No dataset indexed",
+      body: "No validated index version has been published to R2 yet, so there are no real records to search.",
+      tone: "border-chart-3/50 bg-chart-3/[0.07] text-chart-3",
+      icon: <AlertTriangle className="mt-0.5 size-4 shrink-0" />,
+    },
+  };
+  const item = copy[mode];
   return (
-    <div className="flex items-start gap-3 rounded-lg border border-chart-3/40 bg-chart-3/10 px-4 py-3">
-      <Database className="mt-0.5 size-4 shrink-0 text-chart-3" />
+    <div
+      className={cn("flex items-start gap-3 rounded-lg border px-4 py-3", item.tone)}
+      data-dataset-mode={mode}
+      role="status"
+    >
+      {item.icon}
       <div className="text-xs leading-5">
-        <p className="font-medium text-foreground">Sample data — not your Cloudflare R2 dataset</p>
-        <p className="text-muted-foreground">
-          {message ??
-            "This preview runs on a deterministic synthetic dataset. Connect the Worker to R2 and publish a validated index to search real records."}
-        </p>
+        <p className="font-medium text-foreground">{item.title}</p>
+        <p className="text-muted-foreground">{detail ?? item.body}</p>
       </div>
+      {action ? <div className="ml-auto shrink-0 self-center">{action}</div> : null}
     </div>
   );
 }

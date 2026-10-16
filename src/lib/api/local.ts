@@ -120,13 +120,17 @@ export class LocalApiClient implements ApiClient {
       bucketOk: false,
       bucketError:
         "Preview mode: the browser cannot reach the private R2 bucket. Bind COMPANY_DATA in the Worker to verify the object store.",
-      sources: (["csv1", "csv2"] as const).map((id) => ({
-        id,
-        key: id === "csv1" ? "raw/companies_part1.csv" : "raw/companies_part2.csv",
+      // The keys are the ones verified against the real bucket; the browser still
+      // cannot read them, so nothing here is claimed as verified.
+      sources: ([
+        { id: "csv1", key: "raw/file1.csv", role: "organizations" as const },
+        { id: "csv2", key: "raw/file2.csv", role: "people" as const },
+      ]).map((source) => ({
+        ...source,
         sizeBytes: null,
         lastModified: null,
         verified: false,
-        error: "Not verified — run the Worker against R2 to confirm object existence and size.",
+        error: "Not read here — the browser cannot reach the private bucket. Open the Dataset page on the deployed Worker for real sizes.",
       })),
       versions: [],
       lastIndexedAt: null,

@@ -221,8 +221,10 @@ export interface ContactDetailResponse {
 export interface SourceFileStatus {
   /** Logical id used in manifests, e.g. `csv1`. */
   id: string;
-  /** Object key inside the R2 bucket, e.g. `raw/companies_part1.csv`. */
+  /** Object key inside the R2 bucket, e.g. `raw/file1.csv`. */
   key: string;
+  /** What the object holds, when that is known: `organizations` or `people`. */
+  role?: "organizations" | "people";
   /** Bytes reported by R2, or null when the object could not be read. */
   sizeBytes: number | null;
   lastModified: string | null;

@@ -10,6 +10,7 @@
 import { useMutation, useQuery, useQueryClient, keepPreviousData } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { createApiClient, apiMode, apiBaseUrl, configurePersistentCache, persistentCache, invalidateCacheForVersion } from "@/lib/api/client";
+import { datasetModeInfo } from "@/lib/api/types";
 import type { CompanyFilters, ContactFilters, CompanySortField, ContactSortField, LeadStatus, SortOrder } from "@/shared/models";
 import type { ExportRequestBody, SavedSearchRequest, SettingsRequest } from "@/shared/api-contract";
 
@@ -46,6 +47,26 @@ export function useDatasetStatus() {
     staleTime: 30_000,
     retry: 1,
   });
+}
+
+/**
+ * The application's mode, derived from the dataset status — never from whether a
+ * bucket happens to be reachable.
+ *
+ * Every screen reads the mode through this hook so "demo", "live" and "nothing
+ * published" stay consistent, and a failed status request falls back to
+ * `no-dataset` (the honest default) instead of pretending data exists.
+ */
+export function useDatasetMode() {
+  const status = useDatasetStatus();
+  const info = datasetModeInfo(status.data);
+  return {
+    ...info,
+    status: status.data,
+    isLoading: status.isLoading,
+    error: status.error,
+    refetch: status.refetch,
+  };
 }
 
 /**
