@@ -36,9 +36,16 @@ const SOURCE_TWO = [
 const SECRET_EMAIL = "ada@globex.example";
 const SECRET_PHONE = "+1 555 0100";
 
+/**
+ * The probe answers arbitrary JSON (including error envelopes), so responses are
+ * deliberately dynamic here: `ReturnType<typeof JSON.parse>` is what the parser
+ * hands back, without writing `any` at each assertion.
+ */
+type ParsedJson = ReturnType<typeof JSON.parse>;
+
 interface ProbeResponse {
   status: number;
-  body: any;
+  body: ParsedJson;
   text: string;
   headers: Headers;
 }
@@ -61,7 +68,7 @@ function env(bucket: FakeR2Bucket, overrides: Record<string, string> = {}): neve
 async function call(path: string, bucket: FakeR2Bucket, init: RequestInit = {}, overrides: Record<string, string> = {}): Promise<ProbeResponse> {
   const response = await probe.fetch(new Request(`http://127.0.0.1:8788${path}`, init), env(bucket, overrides));
   const text = await response.text();
-  let body: any = null;
+  let body: ParsedJson = null;
   try {
     body = text ? JSON.parse(text) : null;
   } catch {

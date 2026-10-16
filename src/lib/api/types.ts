@@ -19,7 +19,7 @@ import type {
   SortOrder,
   UserSettings,
 } from "@/shared/models";
-import type { ExportRequestBody, SaveLeadRequest, SavedSearchRequest, SettingsRequest } from "@/shared/api-contract";
+import type { ExportRequestBody, SavedSearchRequest, SettingsRequest } from "@/shared/api-contract";
 
 export interface CompanySearchParams {
   query: string;

@@ -51,10 +51,16 @@ const env = {
 
 const ctx = { waitUntil: () => {}, passThroughOnException: () => {} } as unknown as ExecutionContext;
 
-async function api(path: string, init?: RequestInit): Promise<{ status: number; body: any }> {
+/**
+ * Whatever `JSON.parse` returns: these tests assert on the JSON of *arbitrary*
+ * endpoints, including error envelopes, so the shape is intentionally dynamic.
+ */
+type ParsedJson = ReturnType<typeof JSON.parse>;
+
+async function api(path: string, init?: RequestInit): Promise<{ status: number; body: ParsedJson }> {
   const response = await app.fetch(new Request(`https://companyintel.example${path}`, init), env, ctx);
   const text = await response.text();
-  let body: any = null;
+  let body: ParsedJson = null;
   try {
     body = text ? JSON.parse(text) : null;
   } catch {

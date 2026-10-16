@@ -19,20 +19,30 @@ import type { CompanySortField, SortOrder, UserSettings } from "@/shared/models"
 export default function Settings() {
   const settings = useSettings();
   const update = useUpdateSettings();
-  const [draft, setDraft] = useState<UserSettings | null>(null);
+  /**
+   * Edits made on this screen. `null` means "show what the server returned".
+   *
+   * Deriving the form value this way (`localDraft ?? server`) instead of copying
+   * the server value into state from an effect means: no double render on load,
+   * no effect to keep the two in sync, and a background refetch can never
+   * clobber what the user has typed.
+   */
+  const [localDraft, setLocalDraft] = useState<UserSettings | null>(null);
   const [cacheStats, setCacheStats] = useState<{ entries: number; bytes: number; redactedEntries: number } | null>(null);
 
   useEffect(() => {
-    if (settings.data && !draft) setDraft(settings.data);
-  }, [settings.data, draft]);
-
-  useEffect(() => {
-    void refreshStats();
+    // `cacheStats` is browser state (IndexedDB), not server state: read it once
+    // after mount and after an explicit refresh, never during render.
+    let active = true;
+    void persistentCache.stats().then((stats) => {
+      if (active) setCacheStats(stats);
+    });
+    return () => {
+      active = false;
+    };
   }, []);
 
-  async function refreshStats() {
-    setCacheStats(await persistentCache.stats());
-  }
+  const draft = localDraft ?? settings.data ?? null;
 
   if (!draft) {
     return (
@@ -46,8 +56,19 @@ export default function Settings() {
   const hitRate = totalLookups ? cacheMetrics.hits / totalLookups : 0;
   const dirty = JSON.stringify(draft) !== JSON.stringify(settings.data);
 
+  /**
+   * Apply one field edit. `draft` already resolves to `localDraft ?? server`, so
+   * building the next value from it keeps edits on top of each other; `set` is
+   * only reachable below the `!draft` guard above.
+   */
+  const base = draft;
   function set<K extends keyof UserSettings>(key: K, value: UserSettings[K]) {
-    setDraft((current) => (current ? { ...current, [key]: value } : current));
+    setLocalDraft({ ...base, [key]: value });
+  }
+
+  /** Re-read the browser cache counters (after clearing, or on demand). */
+  async function refreshStats() {
+    setCacheStats(await persistentCache.stats());
   }
 
   return (

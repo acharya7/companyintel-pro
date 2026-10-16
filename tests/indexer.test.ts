@@ -214,7 +214,7 @@ describe("contact deduplication", () => {
 describe("end-to-end indexing pipeline", () => {
   let dir: string;
   let config: IndexerConfig;
-  let shardReads: { kind: string; shard: number }[] = [];
+  const shardReads: { kind: string; shard: number }[] = [];
 
   beforeAll(async () => {
     dir = await mkdtemp(join(tmpdir(), "ci-index-"));

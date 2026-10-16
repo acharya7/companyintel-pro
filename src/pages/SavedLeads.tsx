@@ -40,7 +40,10 @@ export default function SavedLeads() {
   const [noteText, setNoteText] = useState("");
   const [tagDraft, setTagDraft] = useState<Record<string, string>>({});
 
-  const all = leads.data?.leads ?? [];
+  // Memoised so the `?? []` fallback cannot hand `useMemo` a brand-new array on
+  // every render, which would re-run the filters and the status count below for
+  // nothing (react-hooks/exhaustive-deps flags exactly that).
+  const all = useMemo(() => leads.data?.leads ?? [], [leads.data]);
   const filtered = useMemo(() => {
     const term = search.trim().toLowerCase();
     return all.filter((lead) => {

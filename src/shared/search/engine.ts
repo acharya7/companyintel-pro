@@ -66,6 +66,19 @@ export interface CandidateSource {
    */
   tierOf?(ref: DocRef): "strong" | "weak";
   /**
+   * Whether the partition budget — not the candidate list — was what stopped the
+   * most recent `docs()` calls during this search.
+   *
+   * This is the difference between "more budget would find more companies" and
+   * "there are no more companies to find". Only the source can tell them apart:
+   * it is the one that knows a ref was dropped because its partition was past
+   * the cap (true) rather than because the stored object simply has no record
+   * for it (false). The engine uses it to decide whether a second, larger
+   * budget is worth spending; a source that cannot tell leaves it undefined and
+   * gets the single-pass behaviour.
+   */
+  hydrationBudgetHit?(): boolean;
+  /**
    * Optional notification that a new search is starting on this source.
    *
    * A source may be reused for several searches (tests do, and an isolate could);
@@ -100,6 +113,14 @@ export interface SearchOptions {
    * `SEARCH_MAX_HYDRATE` Worker variable; the engine clamps it either way.
    */
   maxHydrate?: number;
+  /**
+   * When the page is still short *and the partition budget was what cut the
+   * candidate list short*, spend a second (doubled) budget to fill it. Default
+   * true; set false to measure or to hold a hard byte ceiling for every query.
+   * See `ADAPTIVE_HYDRATE_FACTOR`. A source that cannot report
+   * `hydrationBudgetHit` never takes the second pass.
+   */
+  adaptiveHydration?: boolean;
 }
 
 /** Relevance values inside the same band are treated as equal for ordering. */
@@ -126,6 +147,22 @@ export const HYDRATE_BATCH = 32;
  * inside the same relevance band and reorder the page.
  */
 export const WEAK_CEILING = 0.95;
+
+/**
+ * How much the hydration budget is raised for a second pass when the requested
+ * page is still short (`maxHydrate` → `2 × maxHydrate`, capped by
+ * `SEARCH_LIMITS.maxHydrate`).
+ *
+ * This is the completeness dial: broad, low-precision queries are exactly the
+ * ones whose matches are spread over more partitions than the first budget
+ * covers, and they are also the ones with a page to fill. It never applies when
+ * the first pass already filled the page, so precise queries keep their latency;
+ * and it never applies when the first pass had budget left over, so a query with
+ * genuinely few matches (an exact name, a prefix with two hits) does not pay for
+ * a second round of reads that could not find anything. Both cases are measured
+ * in `scripts/benchmark-hydration.mjs` against a real-data index.
+ */
+export const ADAPTIVE_HYDRATE_FACTOR = 2;
 
 /** Hard ceilings — also enforced server-side in the Worker. */
 export const SEARCH_LIMITS = {
@@ -324,35 +361,86 @@ export async function searchCompanies(
   // needed to know whether another page exists.
   const rowsToFillPage = (page - 1) * pageSize + pageSize + 1;
   const pageFull = () => scored.length >= rowsToFillPage;
-  let cursor = 0;
-  while (cursor < budgetedRefs.length) {
-    const tier = source.tierOf ? source.tierOf(budgetedRefs[cursor]) : "strong";
-    let end = cursor + 1;
-    if (source.tierOf) {
-      while (end < budgetedRefs.length && source.tierOf(budgetedRefs[end]) === tier) end += 1;
-      // A source without tier knowledge keeps the original single-pass contract.
-    } else {
-      end = budgetedRefs.length;
-    }
 
-    // Early stop: every hit found so far scores strictly above what a
-    // token/trigram-only candidate can reach, and the page is already full — so
-    // the rest of the candidate list can neither reorder this page nor add a
-    // row to it. The result count then becomes a lower bound (`totalIsLowerBound`),
-    // which the API and the UI already report as "N+".
-    if (tier === "weak" && pageFull() && worstRelevance > WEAK_CEILING) {
-      stoppedEarly = true;
-      break;
-    }
+  /** Documents already hydrated, so a second pass can never score one twice. */
+  const hydratedIds = new Set<string>();
 
-    for (let from = cursor; from < end; from += HYDRATE_BATCH) {
-      const batch = budgetedRefs.slice(from, Math.min(end, from + HYDRATE_BATCH));
-      const docs = await source.docs(batch, { maxPartitions: maxHydrate });
-      hydrated += docs.length;
-      for (const doc of docs) accept(doc);
+  /**
+   * Hydrate the candidate list best-first with the given partition budget.
+   *
+   * Candidates arrive grouped by retrieval strength, and one run of candidates
+   * per tier is hydrated at a time so the barrier can be tested on a whole tier
+   * rather than on a mixed batch.
+   */
+  const hydrateCandidates = async (maxPartitions: number): Promise<void> => {
+    let cursor = 0;
+    while (cursor < budgetedRefs.length) {
+      const tier = source.tierOf ? source.tierOf(budgetedRefs[cursor]) : "strong";
+      let end = cursor + 1;
+      if (source.tierOf) {
+        while (end < budgetedRefs.length && source.tierOf(budgetedRefs[end]) === tier) end += 1;
+      } else {
+        // A source without tier knowledge keeps the original single-pass contract.
+        end = budgetedRefs.length;
+      }
+
+      // Early stop: every hit found so far scores strictly above what a
+      // token/trigram-only candidate can reach, and the page is already full — so
+      // the rest of the candidate list can neither reorder this page nor add a
+      // row to it. The result count then becomes a lower bound
+      // (`totalIsLowerBound`), which the API and the UI already report as "N+".
+      if (tier === "weak" && pageFull() && worstRelevance > WEAK_CEILING) {
+        stoppedEarly = true;
+        return;
+      }
+
+      for (let from = cursor; from < end; from += HYDRATE_BATCH) {
+        const batch = budgetedRefs.slice(from, Math.min(end, from + HYDRATE_BATCH));
+        if (!batch.length) continue;
+        /*
+         * The whole run is asked for again on a retry pass, deliberately: the
+         * previous pass may have been cut short by the partition budget, and
+         * only the source knows which of these refs it has already stored. A
+         * ref it has memorised costs a map lookup, not a read, so re-asking is
+         * cheap and is the only way a larger budget can actually reach the
+         * candidates the smaller one could not. `hydratedIds` keeps the result
+         * set — and the total — free of duplicates.
+         */
+        const docs = await source.docs(batch, { maxPartitions });
+        for (const doc of docs) {
+          if (hydratedIds.has(doc.id)) continue;
+          hydratedIds.add(doc.id);
+          hydrated += 1;
+          accept(doc);
+        }
+      }
+      cursor = end;
     }
-    cursor = end;
+  };
+
+  await hydrateCandidates(maxHydrate);
+
+  // Adaptive second pass: a page that is still short is the one case where more
+  // bytes are worth spending, because the user is looking at an incomplete
+  // result list. It re-walks the same candidate order with a doubled partition
+  // budget and costs nothing at all for the common case where the first pass
+  // already filled the page, or where the first pass had budget to spare (then
+  // more reads could not have found anything — `hydrationBudgetHit`).
+  //
+  // Measured on the real-data sample (`scripts/benchmark-hydration.mjs`): this
+  // recovers every row the fixed 16-partition budget lost on broad queries
+  // (20 of 20 here) and pays for it only on short pages — ~2× the reads of that
+  // query, once, never more than `SEARCH_LIMITS.maxHydrate` partitions. A
+  // query whose true match count is below the page size pays it on every
+  // search; the only way to avoid that is to know the count before reading,
+  // which is a v3 format question, not a tuning one.
+  const adaptiveCeiling = Math.min(maxHydrate * ADAPTIVE_HYDRATE_FACTOR, SEARCH_LIMITS.maxHydrate);
+  const adaptive = options.adaptiveHydration ?? true;
+  const budgetWasTheLimit = source.hydrationBudgetHit?.() ?? false;
+  if (adaptive && budgetWasTheLimit && !pageFull() && hydrated < budgetedRefs.length && adaptiveCeiling > maxHydrate) {
+    await hydrateCandidates(adaptiveCeiling);
   }
+
   retrieval.scored = hydrated;
 
   scored.sort((a, b) => {
@@ -411,10 +499,11 @@ export async function searchCompanies(
     page,
     pageSize,
     total,
-    // Two reasons the count is a floor rather than an exact number: retrieval
-    // itself was budget-bounded, or the early-stop barrier skipped candidates
-    // that provably cannot enter this page.
-    totalIsLowerBound: candidates.size >= retrievalBudget || stoppedEarly,
+    // Three reasons the count is a floor rather than an exact number: retrieval
+    // was budget-bounded, the early-stop barrier skipped candidates that provably
+    // cannot enter this page, or the hydration budget ran out before every
+    // candidate it asked for came back.
+    totalIsLowerBound: candidates.size >= retrievalBudget || stoppedEarly || hydrated < budgetedRefs.length,
     hasMore: start + pageSize < total,
   };
 

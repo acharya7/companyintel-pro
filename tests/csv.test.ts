@@ -117,7 +117,11 @@ describe("file reader and profiler", () => {
     await writeFile(path, `id\n${Array.from({ length: 50 }, (_, i) => i).join("\n")}\n`, "utf8");
     try {
       let count = 0;
-      for await (const _record of readCsvFile(path, { maxRecords: 10 })) count += 1;
+      for await (const record of readCsvFile(path, { maxRecords: 10 })) {
+        // Every yielded record is parsed (header first), not just counted.
+        expect(record.fields).toHaveLength(1);
+        count += 1;
+      }
       // `maxRecords` bounds records yielded, and the header is the first record.
       expect(count).toBe(10);
     } finally {

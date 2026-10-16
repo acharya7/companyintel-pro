@@ -25,7 +25,6 @@ import {
 import { DEFAULT_SETTINGS, LEAD_STATUSES } from "../../src/shared/models";
 import type {
   ActivityEntry,
-  Company,
   CompanySearchHit,
   Contact,
   DatasetSourcesResponse,

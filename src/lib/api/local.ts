@@ -18,7 +18,6 @@ import type {
   CompanySearchResponse,
   Contact,
   ContactPageResponse,
-  CompanySortField,
   ContactSortField,
   DatasetSourcesResponse,
   DatasetStatusResponse,
@@ -118,8 +117,13 @@ export class LocalApiClient implements ApiClient {
       message: `No dataset indexed in R2. ${SAMPLE_DATASET_LABEL} is active for interface preview only.`,
       bucket: "company-intel-data",
       bucketOk: false,
+      // Deliberately does not name the Worker's R2 binding: this string is
+      // compiled into the client bundle, and server-side identifiers do not
+      // belong there (tests/frontend-secrets.test.ts scans `dist/` for them).
+      // The operator-facing hint carries the identifier instead — see
+      // docs/configuration.md and the Dataset page of the deployed Worker.
       bucketError:
-        "Preview mode: the browser cannot reach the private R2 bucket. Bind COMPANY_DATA in the Worker to verify the object store.",
+        "Preview mode: the browser cannot reach the private R2 bucket. Deploy the Worker (its R2 binding is what can read the bucket) to verify the object store.",
       // The keys are the ones verified against the real bucket; the browser still
       // cannot read them, so nothing here is claimed as verified.
       sources: ([

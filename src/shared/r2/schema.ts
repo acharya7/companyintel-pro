@@ -16,7 +16,7 @@
  *     are flagged and listed as each other's alternative.
  */
 
-import { truncateAtRecordBoundary, detectDelimiter, detectEncoding, decodeBytes, parseRecords, type DelimiterDetection, type EncodingDetection } from "../csv-parse";
+import { truncateAtRecordBoundary, detectDelimiter, detectEncoding, decodeBytes, parseRecords, type DelimiterDetection } from "../csv-parse";
 import { profileRecords, type FileProfile } from "../csv-profile";
 import { ALL_CANONICAL_FIELDS, aliasIndex, normalizeHeader } from "../headers";
 

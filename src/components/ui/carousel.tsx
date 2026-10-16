@@ -56,14 +56,36 @@ function Carousel({
     },
     plugins
   )
-  const [canScrollPrev, setCanScrollPrev] = React.useState(false)
-  const [canScrollNext, setCanScrollNext] = React.useState(false)
+  /*
+   * Embla *is* an external store, so its scroll state is read with
+   * `useSyncExternalStore` rather than mirrored into React state from an effect.
+   * The previous shape called `onSelect(api)` synchronously inside an effect to
+   * seed the two booleans, which is a cascading render on mount (and is flagged
+   * by `react-hooks/set-state-in-effect`).
+   */
+  const subscribeScroll = React.useCallback(
+    (onChange: () => void) => {
+      if (!api) return () => {}
+      api.on("select", onChange)
+      api.on("reInit", onChange)
+      return () => {
+        api.off("select", onChange)
+        api.off("reInit", onChange)
+      }
+    },
+    [api]
+  )
 
-  const onSelect = React.useCallback((api: CarouselApi) => {
-    if (!api) return
-    setCanScrollPrev(api.canScrollPrev())
-    setCanScrollNext(api.canScrollNext())
-  }, [])
+  const canScrollPrev = React.useSyncExternalStore(
+    subscribeScroll,
+    () => api?.canScrollPrev() ?? false,
+    () => false
+  )
+  const canScrollNext = React.useSyncExternalStore(
+    subscribeScroll,
+    () => api?.canScrollNext() ?? false,
+    () => false
+  )
 
   const scrollPrev = React.useCallback(() => {
     api?.scrollPrev()
@@ -86,26 +108,24 @@ function Carousel({
     [scrollPrev, scrollNext]
   )
 
-  React.useEffect(() => {
-    if (!api || !setApi) return
-    setApi(api)
-  }, [api, setApi])
+  /*
+   * `setApi` is called from a ref callback, not an effect: the api instance is
+   * created by embla's own ref, so handing it back in the same commit avoids a
+   * render whose only purpose was to notice that the effect had run.
+   */
+  const readyRef = React.useCallback(
+    (node: HTMLElement | null) => {
+      carouselRef(node)
+      if (node && api && setApi) setApi(api)
+    },
+    [carouselRef, api, setApi]
+  )
 
-  React.useEffect(() => {
-    if (!api) return
-    onSelect(api)
-    api.on("reInit", onSelect)
-    api.on("select", onSelect)
-
-    return () => {
-      api?.off("select", onSelect)
-    }
-  }, [api, onSelect])
 
   return (
     <CarouselContext.Provider
       value={{
-        carouselRef,
+        carouselRef: readyRef,
         api: api,
         opts,
         orientation:

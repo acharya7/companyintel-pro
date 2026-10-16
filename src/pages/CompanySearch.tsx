@@ -61,7 +61,18 @@ function readState(params: URLSearchParams): SearchState {
 export default function CompanySearch() {
   const [params, setParams] = useSearchParams();
   const state = useMemo(() => readState(params), [params]);
-  const [draft, setDraft] = useState(state.q);
+  /**
+   * What the user has typed, tagged with the URL query it was typed against.
+   *
+   * The input follows the URL (back/forward, a saved search, a suggestion click)
+   * and follows typing in between; deriving it here instead of copying the URL
+   * into state from an effect removes the second render on every navigation and
+   * makes "URL wins over an older draft" a single expression rather than a sync
+   * rule to remember.
+   */
+  const [typed, setTyped] = useState<{ q: string; value: string } | null>(null);
+  const draft = typed && typed.q === state.q ? typed.value : state.q;
+  const setDraft = (value: string) => setTyped({ q: state.q, value });
   const [showFilters, setShowFilters] = useState(
     Boolean(state.filters.industry || state.filters.country || state.filters.city || state.filters.hasContacts || state.filters.hasDomain),
   );
@@ -75,12 +86,6 @@ export default function CompanySearch() {
   const datasetMode = useDatasetMode();
   const saveSearch = useCreateSavedSearch();
   const saveLead = useInsertLead();
-
-  // Keep the input in sync when the URL changes (back/forward, saved search).
-  useEffect(() => {
-    setDraft(state.q);
-    setDebouncedDraft(state.q);
-  }, [state.q]);
 
   // Debounce typing before hitting the index for suggestions.
   useEffect(() => {

@@ -4,6 +4,8 @@
  *
  *   bun tools/indexer/src/cli.ts profile   --config tools/indexer/indexer.config.json
  *   bun tools/indexer/src/cli.ts run       --config <cfg> [--sample 100000] [--version v1] [--upload]
+ *   bun tools/indexer/src/cli.ts run --preflight-only   # checks auth, keys, TSV mapping,
+ *                                                      # disk and RAM, then stops
  *   bun tools/indexer/src/cli.ts validate  --config <cfg> --version v1
  *   bun tools/indexer/src/cli.ts publish   --config <cfg> --version v1 --yes
  *
@@ -19,7 +21,7 @@ import { createHash } from "node:crypto";
 import { ALL_CANONICAL_FIELDS, buildColumnMap } from "./mapping";
 import { preflight, publishVersion, runIndex, uploadOutput, type IndexerConfig, type ProgressEvent } from "./build";
 import { credentialsFromEnv } from "./r2";
-import { createSourceContext, credentialsHelp, missingCredentialBuckets, parseR2Source, sourceProfile } from "./source";
+import { createSourceContext, credentialsHelp, missingCredentialBuckets, parseR2Source, sourceProfile, type SourceContext } from "./source";
 
 function parseArgs(argv: string[]): { command: string; flags: Record<string, string | boolean> } {
   const [command = "help", ...rest] = argv;
@@ -163,6 +165,55 @@ async function cmdProfile(config: IndexerConfig): Promise<void> {
     console.log(`  canonical fields absent from this file: ${profile.missingCanonicalFields.join(", ") || "none"}`);
   }
   console.log("\nSet `columns` overrides in the config for anything the profiler mapped incorrectly.");
+  // The automatic view above sees the raw headers; a run additionally applies the
+  // config's `columns` overrides. Print the effective result too, so this command
+  // answers "is the mapping right?" rather than only "what did the profiler guess?".
+  console.log("\nEffective mapping (config overrides applied — this is what a run uses)");
+  await verifyEffectiveMapping(config, context);
+}
+
+/**
+ * Confirm the schema mapping a run will actually use — bounded sample read per
+ * source (500 rows, no cell values), the automatic header mapping *plus* every
+ * `columns` override from the config.
+ *
+ * This is the check that catches the expensive mistake: a typo in an override
+ * name or a delimiter that is not really a TAB would otherwise only surface
+ * after the run had streamed gigabytes. Returns false if anything is wrong.
+ */
+async function verifyEffectiveMapping(config: IndexerConfig, context: SourceContext): Promise<boolean> {
+  let ok = true;
+  for (const source of config.sources) {
+    const profile = await sourceProfile(
+      source,
+      { encoding: source.encoding, delimiter: source.delimiter, sampleRows: 500, knownFields: [...ALL_CANONICAL_FIELDS], maxSamplesPerColumn: 0 },
+      context,
+    );
+    const map = buildColumnMap(profile.headers);
+    let overrides = 0;
+    for (const [field, header] of Object.entries(source.columns ?? {})) {
+      const index = profile.headers.findIndex((value) => value.trim().toLowerCase() === header.trim().toLowerCase());
+      if (index === -1) {
+        ok = false;
+        console.error(`  FAIL ${source.id}: configured column "${header}" for "${field}" is not present in this file`);
+        continue;
+      }
+      map[field] = index;
+      overrides += 1;
+    }
+    const name = (field: string) => (map[field] === undefined ? "—" : `"${profile.headers[map[field]]}"`);
+    const absent = ALL_CANONICAL_FIELDS.filter((field) => map[field] === undefined);
+    const mappedIndexes = new Set(Object.values(map));
+    const unmapped = profile.headers.filter((_, index) => !mappedIndexes.has(index));
+    console.log(
+      `  ok   ${source.id}  ${profile.headers.length} columns · delimiter ${JSON.stringify(profile.delimiter)} · encoding ${profile.encoding} · ${overrides} override(s)`,
+    );
+    console.log(`       company id ← ${name("companyid")} · name ← ${name("companyname")} · domain ← ${name("companydomain")}`);
+    console.log(`       contact email ← ${name("email")} · phone ← ${name("phone")} · linkedin ← ${name("linkedin")}`);
+    if (absent.length) console.log(`       not present in this file: ${absent.join(", ")}`);
+    if (unmapped.length) console.log(`       unmapped headers (${unmapped.length}): ${unmapped.slice(0, 8).join(", ")}`);
+  }
+  return ok;
 }
 
 async function cmdRun(config: IndexerConfig, flags: Record<string, string | boolean>): Promise<void> {
@@ -170,13 +221,39 @@ async function cmdRun(config: IndexerConfig, flags: Record<string, string | bool
   const sample = flags.sample ? Number(flags.sample) : undefined;
   const version = typeof flags.version === "string" ? flags.version : config.datasetVersion;
   const upload = Boolean(flags.upload);
+  // `run --preflight-only` answers "is this machine and this config ready?"
+  // without reading the corpus: R2 auth + object keys, TSV schema mapping, free
+  // disk, memory, and the sample-based space estimate. Nothing is written.
+  const preflightOnly = Boolean(flags["preflight-only"]);
 
   // `sample` must reach preflight: a sample run's temporary-space estimate is based
   // on the sampled row count, so a machine that cannot hold the 60 GB job can still
   // run the dry run the specification requires before it.
   const report = await preflight(config, undefined, { sampleLimit: sample });
   printPreflight(report);
-  if (report.warnings.some((warning) => warning.includes("insufficient"))) {
+  const spaceProblem = report.warnings.some((warning) => warning.includes("insufficient"));
+
+  if (preflightOnly) {
+    // The mapping check is the cheapest and most valuable part of a preflight —
+    // two bounded sample reads — so it runs even on a machine that cannot hold
+    // the job, where the answer is still "this config is right, free space".
+    console.log("\nSchema mapping actually in use (automatic mapping + config overrides)");
+    const context = createSourceContext({ cacheDir: config.rawCacheDir === undefined ? undefined : config.rawCacheDir });
+    const mappingOk = await verifyEffectiveMapping(config, context);
+    const problems = [
+      ...(mappingOk ? [] : ["the schema mapping does not match the real files"]),
+      ...(spaceProblem ? ["free disk space is below the estimate above"] : []),
+    ];
+    console.log(
+      problems.length
+        ? `\nPreflight only: NOT ready — ${problems.join("; ")}. Nothing was read in bulk, no index was built, nothing was uploaded.`
+        : "\nPreflight only: ready. Authentication, source keys, TSV mapping, disk and memory all check out; nothing was built or uploaded.",
+    );
+    if (problems.length) process.exitCode = 1;
+    return;
+  }
+
+  if (spaceProblem) {
     console.error("Refusing to start: temporary space is insufficient for this run.");
     process.exitCode = 1;
     return;

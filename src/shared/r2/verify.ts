@@ -369,12 +369,23 @@ function emptyDataset(): DatasetState {
   };
 }
 
+/**
+ * Parsed JSON of arbitrary shape.
+ *
+ * These readers are deliberately permissive: their job is to inspect whatever a
+ * bucket actually contains — a manifest from an older run, a hand-edited
+ * pointer, a truncated object — and report what is wrong with it, so every
+ * field is optional and untyped by nature. `ReturnType<typeof JSON.parse>`
+ * states exactly that, instead of writing `any` at each access site.
+ */
+type ParsedJson = ReturnType<typeof JSON.parse>;
+
 /** Bounded JSON read: a manifest is small, and the bound proves it. */
 export async function readJsonBounded(
   bucket: ReadOnlyBucket,
   key: string,
   limit = JSON_READ_LIMIT,
-): Promise<{ ok: boolean; status: "ok" | "missing" | "unparsable"; value: any; bytes: number; truncated: boolean }> {
+): Promise<{ ok: boolean; status: "ok" | "missing" | "unparsable"; value: ParsedJson; bytes: number; truncated: boolean }> {
   let body: BucketBody | null;
   try {
     body = await bucket.get(key, { range: { offset: 0, length: limit } });

@@ -69,6 +69,16 @@ export class R2CandidateSource implements CandidateSource {
    * candidate set is (the engine may ask for up to 400 candidates in batches).
    */
   private readonly hydratedPartitions = new Set<number>();
+  /**
+   * Whether the partition cap ever dropped a candidate during this search.
+   *
+   * A short page has two very different causes: the budget ran out (more reads
+   * would find more companies — see the engine's adaptive second pass) or the
+   * stored partitions genuinely hold no record for the remaining candidates
+   * (more reads would find nothing). Only this class can tell them apart, so it
+   * records that distinction instead of leaving the engine to guess from counts.
+   */
+  private budgetHit = false;
 
   constructor(
     private readonly store: ShardReader,
@@ -91,6 +101,12 @@ export class R2CandidateSource implements CandidateSource {
     this.hydratedDocs.clear();
     this.hydratedPartitions.clear();
     this.byId.clear();
+    this.budgetHit = false;
+  }
+
+  /** True once the per-search partition cap has dropped at least one candidate. */
+  hydrationBudgetHit(): boolean {
+    return this.budgetHit;
   }
 
   /** Fetch one shard per distinct term and merge the postings. */
@@ -215,7 +231,10 @@ export class R2CandidateSource implements CandidateSource {
       // Already read: the ref simply is not in the stored object.
       if (this.hydratedPartitions.has(partition)) continue;
       if (!fresh.has(partition)) {
-        if (this.hydratedPartitions.size + fresh.size >= maxPartitions) continue;
+        if (this.hydratedPartitions.size + fresh.size >= maxPartitions) {
+          this.budgetHit = true;
+          continue;
+        }
         fresh.add(partition);
       }
       read.push(ref);

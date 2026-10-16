@@ -14,6 +14,7 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
@@ -244,7 +245,7 @@ describe("human report", () => {
 });
 
 describe("the runner is local and read-only", () => {
-  const source = require("node:fs").readFileSync(join(root, "scripts/verify-r2-remote.mjs"), "utf8") as string;
+  const source = readFileSync(join(root, "scripts/verify-r2-remote.mjs"), "utf8");
 
   test("it never deploys and never disables remote bindings", () => {
     // No `wrangler deploy` (or any "deploy" argument) exists in the runner, and

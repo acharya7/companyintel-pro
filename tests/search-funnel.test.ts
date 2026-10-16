@@ -226,10 +226,65 @@ describe("bounded R2 hydration", () => {
   test("hydration is capped by the batch it is asked for, not by the whole candidate list", async () => {
     const index = new SyntheticIndex(manyCompanies(1200));
     const source = new R2CandidateSource(index, directory(1200));
-    await searchCompanies(source, "alpha", { pageSize: 25, maxHydrate: 1 });
+    await searchCompanies(source, "alpha", { pageSize: 25, maxHydrate: 1, adaptiveHydration: false });
 
     expect(HYDRATE_BATCH).toBeGreaterThan(0);
     expect(index.partitionsRead.length).toBe(1);
+  });
+
+  test("an explicit tight budget is honoured exactly when adaptive hydration is off", async () => {
+    // The adaptive second pass exists to fill a short page; with it disabled the
+    // operator's `maxHydrate` is a hard byte ceiling, not a first guess.
+    const index = new SyntheticIndex(manyCompanies(1200));
+    await searchCompanies(new R2CandidateSource(index, directory(1200)), "alpha", {
+      pageSize: 100,
+      maxHydrate: 2,
+      adaptiveHydration: false,
+    });
+
+    expect(index.partitionsRead.length).toBe(2);
+  });
+
+  test("the adaptive pass only runs when the partition budget was the limit", async () => {
+    // ~40 companies genuinely match (an exact hit plus near names) out of 1,200,
+    // so a page of 100 can never fill. If the budget were not the limit, more
+    // reads could not find more rows — and the source says so, so the engine
+    // must not spend them.
+    const companies: Company[] = [];
+    for (let index = 0; index < 40; index += 1) companies.push(makeCompany(index, `Alpha ${index}`));
+    for (let index = 40; index < 1240; index += 1) companies.push(makeCompany(index, `Zzz ${index}`));
+    const index = new SyntheticIndex(companies);
+    const source = new R2CandidateSource(index, directory(companies.length));
+
+    const response = await searchCompanies(source, "alpha", { pageSize: 100, maxHydrate: 64 });
+
+    expect(response.hits.length).toBeGreaterThan(0);
+    expect(response.hits.length).toBeLessThan(100);
+    // 64 partitions is the whole index here, so nothing was ever dropped for
+    // budget: no second pass, and therefore no partition read twice.
+    expect(source.hydrationBudgetHit()).toBe(false);
+    expect(new Set(index.partitionsRead).size).toBe(index.partitionsRead.length);
+  });
+
+  test("a page cut short by the partition budget is refilled by the adaptive pass", async () => {
+    // One partition holds `SHARDING.companiesPerPartition` companies, so a query
+    // matching companies that hash across many partitions cannot fill a page of
+    // 100 from a single-partition budget.
+    const index = new SyntheticIndex(manyCompanies(1200));
+    const tight = await searchCompanies(new R2CandidateSource(index, directory(1200)), "alpha", {
+      pageSize: 100,
+      maxHydrate: 1,
+      adaptiveHydration: false,
+    });
+    const adaptive = await searchCompanies(new R2CandidateSource(index, directory(1200)), "alpha", {
+      pageSize: 100,
+      maxHydrate: 1,
+    });
+
+    expect(adaptive.hits.length).toBeGreaterThan(tight.hits.length);
+    expect(adaptive.retrieval.scored).toBeGreaterThanOrEqual(tight.retrieval.scored);
+    // Bounded by the doubled budget, never by the candidate list.
+    expect(adaptive.retrieval.scored).toBeLessThanOrEqual(2 * SHARDING.companiesPerPartition);
   });
 
   test("two searches on one source hydrate independently (no state leaks between them)", async () => {

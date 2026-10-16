@@ -6,7 +6,7 @@
  * those are reachable from every screen.
  */
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { NavLink, Outlet, useLocation, useNavigate } from "react-router";
 import { useTheme } from "next-themes";
 import {
@@ -31,6 +31,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { cn } from "@/lib/utils";
 import { DatasetModeBanner, StatusPill } from "@/components/common";
 import { useDatasetMode, useLeads, useSavedSearches } from "@/hooks/use-api";
+import { useHydrated } from "@/hooks/use-hydrated";
 import { apiMode, relativeTime } from "@/lib/format-bridge";
 
 const NAV = [
@@ -126,8 +127,10 @@ function DatasetPill() {
 
 function ThemeToggle() {
   const { theme, setTheme, resolvedTheme } = useTheme();
-  const [mounted, setMounted] = useState(false);
-  useEffect(() => setMounted(true), []);
+  // The resolved theme is only known after hydration (`next-themes` reads the
+  // document), so the icon is gated on that instead of on a `mounted` flag that
+  // a mount effect had to flip.
+  const mounted = useHydrated();
   const next = (resolvedTheme ?? theme) === "dark" ? "light" : "dark";
   return (
     <Button
@@ -142,15 +145,21 @@ function ThemeToggle() {
   );
 }
 
+/**
+ * The header search field clears itself when the header leaves the company-search
+ * area. That used to be an effect + `setState`; keying the field on it instead
+ * lets React remount a fresh (empty) field, with no cascading render and the same
+ * behaviour for back/forward navigation.
+ */
 function GlobalSearch() {
-  const navigate = useNavigate();
   const location = useLocation();
-  const [value, setValue] = useState("");
+  const onCompanies = location.pathname.startsWith("/companies");
+  return <GlobalSearchField key={onCompanies ? "companies" : "elsewhere"} />;
+}
 
-  // Keep the field in sync when arriving from a saved search or a link.
-  useEffect(() => {
-    if (!location.pathname.startsWith("/companies")) setValue("");
-  }, [location.pathname]);
+function GlobalSearchField() {
+  const navigate = useNavigate();
+  const [value, setValue] = useState("");
 
   return (
     <form
