@@ -64,31 +64,15 @@ export function compareExpected(expected, objects) {
 }
 
 /** Number of `"` characters. Escaped quotes are doubled, so parity is preserved. */
-export function quoteCount(text) {
-  let count = 0;
-  for (const character of String(text ?? "")) {
-    if (character === '"') count += 1;
-  }
-  return count;
-}
+export { quoteCount } from "../../src/shared/csv-parse.ts";
 
 /**
  * Trim a byte-range sample back to the last complete CSV record.
  *
- * Slicing at the final newline is not enough: if the range ends inside a quoted
- * field that spans lines, the last "line" is half a record and the quote in it is
- * unbalanced. Complete records always contain an even number of quotes, so an odd
- * count means "drop that line and check again" (bounded, so a pathological sample
- * cannot loop forever).
+ * One implementation, shared with the parser and the probe: re-exported from
+ * `src/shared/csv-parse.ts` rather than duplicated here, so the sample trimming and
+ * the record parsing can never disagree about where a record ends. (The previous
+ * copy here used a quote-counting heuristic, which discards a whole sample whenever
+ * a field contains a single stray `"`.)
  */
-export function truncateAtRecordBoundary(text, maxDrops = 50) {
-  let candidate = String(text ?? "");
-  for (let drop = 0; drop <= maxDrops; drop += 1) {
-    const lastNewline = candidate.lastIndexOf("\n");
-    if (lastNewline < 0) return ""; // no complete record in this sample
-    const complete = candidate.slice(0, lastNewline + 1);
-    if (quoteCount(complete) % 2 === 0) return complete;
-    candidate = candidate.slice(0, lastNewline);
-  }
-  return "";
-}
+export { truncateAtRecordBoundary } from "../../src/shared/csv-parse.ts";

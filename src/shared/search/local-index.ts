@@ -52,7 +52,9 @@ export class LocalCandidateSource implements CandidateSource {
   private readonly prefixMap = new Map<string, DocRef[]>();
   private readonly tokenMap = new Map<string, DocRef[]>();
   private readonly trigramMap = new Map<string, DocRef[]>();
-  private readonly df: Record<string, number> = {};
+  // Null-prototype: token/gram keys are arbitrary strings, and `df["constructor"]`
+  // on a plain object would read an inherited function out of `Object.prototype`.
+  private readonly df: Record<string, number> = Object.create(null) as Record<string, number>;
 
   /** Max prefix length indexed; longer prefixes fall back to the longest bucket. */
   static readonly MAX_PREFIX = 12;

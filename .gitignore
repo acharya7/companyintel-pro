@@ -4,6 +4,13 @@ node_modules
 dist
 src/convex/_generated
 
+# Private, fixed R2 credentials for the SERVER-SIDE tools only (fix-credentials
+# setup). Read by tools/indexer/src/credentials.ts — never imported by src/ (the
+# browser bundle) or worker/ (the deployed Worker, which uses the COMPANY_DATA
+# binding and needs no keys). Never commit, never bundle, never upload.
+.r2-credentials*.json
+.r2-credentials/
+
 # Real data must never be committed:
 #  - .raw-samples/ holds sampled bytes of the original CSVs (real contact records)
 #  - .indexer-work/ is the indexer spool/checkpoint area (derived from those records)

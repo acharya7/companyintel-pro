@@ -220,22 +220,28 @@ mappings, **no cell values**.
    `tests/verify-r2-remote-script.test.ts` (the runner's exit codes 0/1/2 over a stub
    probe), plus `tests/worker-r2-binding.test.ts` for the binding-only rule.
    **None of that is evidence about your bucket.**
-10. **Single next manual action:** in your own terminal,
-    `bun run verify:r2:remote --json > raw-verification.json`, then paste that file's
-    contents. That is the one step that turns Phase A from "ready" into "verified".
+10. **Done, with real requests:** the fixed credentials in the private `.r2-credentials.json` were
+    used to run `bun run r2:doctor` (signed LIST accepted), `bun run r2:schema` (both files sampled),
+    `bun run verify:r2` (inventory, sizes, ETags, body reads, dataset state) and `bun run index:profile`
+    (preflight over the real objects). Results: `docs/verification.md` §Phase A. The alternative
+    `bun run verify:r2:remote` path (Worker binding, no keys at all) still works and needs only your
+    authenticated Wrangler session.
 
-## 7. Still pending, and one config item to confirm
+## 7. Status, and what is still yours to do
 
-- **Nothing about your bucket is verified yet.** Phase A stays `NOT VERIFIED` until
-  the run in §6.10 happens, and I will not fill in filenames, sizes or mappings before
-  then.
-- The probe itself is implemented and tested (locally, against an in-memory bucket and
-  a stub HTTP probe) but has **not** been run against your account: it needs your
-  authenticated Wrangler session, which exists only on your Mac. No Cloudflare call was
-  made from here.
-- `wrangler.toml` sets `workers_dev = true`, so the app is also reachable at its
-  `*.workers.dev` hostname. The Worker itself fails closed (it requires a valid
-  Cloudflare Access JWT for every `/api/*` route, even there), but when you configure
-  Access, protect **both** hostnames — or disable the `workers.dev` route — so the
-  edge policy and the app agree. Not changed here: it is a deployment decision.
-- No full indexing, no deployment, no paid service, no bucket change was started.
+- **Your bucket is verified.** Phase A holds live results now: `raw/file1.csv` (10,223,471,749 B)
+  and `raw/file2.csv` (54,038,527,871 B), both read with signed ranged GETs, no published dataset,
+  and the two schemas mapped (`docs/verification.md` §Phase A).
+- **Credentials are configured server-side only:** the private, git-ignored `.r2-credentials.json`
+  (mode 600) is read automatically by the indexer and the verification scripts. Nothing of it is
+  imported by `src/**` (browser bundle) or `worker/**` (deployed Worker), no `VITE_*` variable is
+  read, and `bun run r2:doctor` refuses to print a report in which a credential value survived
+  redaction. The file must be recreated on your own machine — it is git-ignored, so it was never
+  and will never be pushed (see `docs/configuration.md` §5).
+- `wrangler.toml` now sets `workers_dev = false` for production (only `env.development` keeps the
+  alias), so the app is **not** reachable on an unmanaged `*.workers.dev` hostname. Add your
+  custom-domain `[routes]` entry before deploying; the Worker fails closed on any hostname because
+  it verifies the Cloudflare Access JWT itself for every `/api/*` route.
+- Still pending and waiting on you: the 1,000,000-record sample, the full 64.26 GB run with
+  `--upload`, `publish`, and the production deploy. No full indexing, no deployment, no paid service
+  and no bucket mutation was started.

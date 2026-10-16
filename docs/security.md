@@ -74,7 +74,9 @@ owner). `bun test` runs them.
 1. `wrangler.toml` keeps the R2 bucket private; do not enable the `r2.dev` public URL.
 2. Create the Access application for **every** hostname you deploy to, including
    `*.workers.dev`, and give each one an `Allow` policy for your email. No `Bypass` policy.
-3. Prefer `workers_dev = false` once a custom domain works, so the alias hostname disappears.
+3. `workers_dev = false` is already set for production in `wrangler.toml` (only `env.development`
+   keeps the alias), so the `*.workers.dev` hostname does not exist. Add your custom-domain
+   `[routes]` entry at deploy time.
 4. Set `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD` and `ALLOWED_EMAILS` as Worker secrets
    (never in `wrangler.toml`, never in chat).
 5. Verify from a terminal outside Access: `curl -i https://<host>/api/health` must return

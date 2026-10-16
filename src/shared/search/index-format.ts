@@ -228,6 +228,22 @@ export interface ShardPayload {
   terms: Record<string, Postings>;
 }
 
+/**
+ * Postings for one term, or `undefined` when the term is not in this shard.
+ *
+ * Own-property lookup is mandatory here, and this helper is the single place it
+ * happens. A shard payload arrives from `JSON.parse`, so its `terms` object has
+ * `Object.prototype` behind it: `terms["constructor"]` (a company really can be
+ * called "Constructor", and any query term reaches this code) returns the
+ * inherited `Object` constructor — truthy, but with no `refs`/`q`, which crashed
+ * both the indexer's finalize step and, at query time, the Worker.
+ */
+export function postingsFor(payload: ShardPayload | null | undefined, term: string): Postings | undefined {
+  const terms = payload?.terms;
+  if (!terms || !Object.prototype.hasOwnProperty.call(terms, term)) return undefined;
+  return terms[term];
+}
+
 /** Company profile partition (also used to hydrate search candidates). */
 export interface CompanyPartitionPayload {
   /** Global ref of the first record in this object. */
@@ -240,6 +256,20 @@ export interface ContactPartitionPayload {
   firstRef: number;
   /** companyRef → contacts (sorted by company ref inside the object). */
   byCompany: Record<string, unknown[]>;
+}
+
+/**
+ * Contacts of one company ref, or `undefined`.
+ *
+ * The keys are numeric strings so an inherited property is unlikely, but the
+ * payload is `JSON.parse`d data and `Object.prototype` has numeric-looking
+ * members on some engines, so the same own-property rule applies.
+ */
+export function contactsFor(payload: ContactPartitionPayload | null | undefined, ref: number): unknown[] | undefined {
+  const byCompany = payload?.byCompany;
+  const key = String(ref);
+  if (!byCompany || !Object.prototype.hasOwnProperty.call(byCompany, key)) return undefined;
+  return byCompany[key];
 }
 
 /**

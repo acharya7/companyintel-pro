@@ -33,7 +33,7 @@ export interface ShardReader {
 import type { CandidateSource, DocRef } from "../../src/shared/search/engine";
 import type { SearchDoc } from "../../src/shared/search/score";
 import { toSearchDoc } from "../../src/shared/search/local-index";
-import { SHARDING, type IndexDirectory, type IndexKind, type Postings, type ShardPayload } from "../../src/shared/search/index-format";
+import { SHARDING, postingsFor, type IndexDirectory, type IndexKind, type ShardPayload } from "../../src/shared/search/index-format";
 import { shardOf } from "../../src/shared/hash";
 import { R2Store, mapLimit } from "./store";
 
@@ -51,7 +51,9 @@ const STAGE_WEIGHT: Record<RetrievalKind, number> = {
 export class R2CandidateSource implements CandidateSource {
   readonly kind = "r2" as const;
   private readonly cheap = new Map<DocRef, number>();
-  private readonly observedDf: Record<string, number> = {};
+  // Null-prototype: keys are query terms, and a term such as "constructor" must
+  // not read through to `Object.prototype`.
+  private readonly observedDf: Record<string, number> = Object.create(null) as Record<string, number>;
   /** Companies hydrated during the last search, keyed by id (for enrichment). */
   private readonly byId = new Map<string, Company>();
 
@@ -84,7 +86,7 @@ export class R2CandidateSource implements CandidateSource {
       const payload = await this.store.getShard(this.datasetVersion, kind, shard);
       if (!payload) return;
       for (const term of shardTerms) {
-        const postings = (payload as ShardPayload).terms?.[term] as Postings | undefined;
+        const postings = postingsFor(payload, term);
         if (!postings) continue;
         if (typeof postings.df === "number") this.observedDf[term] = postings.df;
         const refs = postings.refs;
@@ -149,7 +151,7 @@ export class R2CandidateSource implements CandidateSource {
   async refForId(id: string): Promise<number | null> {
     const shard = shardOf(id, this.directory.shards.ids ?? SHARDING.idShards);
     const payload = await this.store.getShard(this.datasetVersion, "ids", shard);
-    const value = payload?.terms?.[id] as Postings | undefined;
+    const value = postingsFor(payload, id);
     return value?.refs?.[0] ?? null;
   }
 

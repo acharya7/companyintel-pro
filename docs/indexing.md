@@ -12,8 +12,8 @@ Worker, and the spec forbids a hosted database substitute.
 
 | Mode | `sources[].path` | Where the bytes come from | Credentials |
 | --- | --- | --- | --- |
-| **A — local file** | `D:/data/companies_part1.csv` (or any local path) | your disk | none |
-| **B — R2 object** | `r2://company-intel-data/raw/companies_part1.csv` | the real bucket, streamed | `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` |
+| **A — local file** | `D:/data/file1.csv` (or any local path) | your disk | none |
+| **B — R2 object** | `r2://company-intel-data/raw/file1.csv` | the real bucket, streamed | the private `.r2-credentials.json` file (see below) |
 
 Both modes feed the same parser, the same column mapping and the same pipeline, and a parity test
 asserts they produce identical records and identical profiles for the same bytes
@@ -38,34 +38,49 @@ S3-compatible API, signed with its own credentials. There is no API that hands a
 a local script, and `wrangler` has no "read a bounded range for me" command. That is why the
 production Worker and the read-only probe need **no** keys, while Mode B does.
 
-Least privilege, once you decide to run Mode B (do not create the token before then):
+Least privilege (the token that is already configured here was created this way):
 
 1. Cloudflare dashboard → **R2 → API → Manage API tokens → Create API token**.
 2. Permissions: **Object Read** is enough to read/index. Add **Object Read & Write** in a separate
-   token only when you upload the built index from the same shell.
+   token only when you upload the built index.
 3. Scope it to the single bucket `company-intel-data`. Never "all buckets".
-4. In your own terminal, for that session only:
-   `export R2_ACCOUNT_ID=… ; export R2_ACCESS_KEY_ID=… ; export R2_SECRET_ACCESS_KEY=…`
-5. `unset` them (or close the window) when the run finishes. Never commit them, never paste them in
-   chat, never put them in a hosting environment panel.
+4. Put the pair in the private, git-ignored `.r2-credentials.json` (see `docs/configuration.md` §5)
+   and `chmod 600` it. Every server-side tool reads that file automatically; `bun run r2:doctor`
+   proves the pair signs a real request. Never commit it, never paste it in chat, never put it in a
+   hosting environment panel.
 
 If you would rather avoid tokens entirely, copy the objects down with rclone and use Mode A:
 
 ```bash
-rclone copy r2:company-intel-data/raw/ ./raw-copy --progress   # needs ~60 GB of local disk
+rclone copy r2:company-intel-data/raw/ ./raw-copy --progress   # needs ~64 GB of local disk
 ```
 
-### Honest cost estimate for a 60 GB Mode B run
+### Honest cost estimate for a 64.26 GB Mode B run
 
-All figures are estimates to be replaced by your measured sample run:
+Two kinds of number appear below. **Measured** figures come from this workspace against the real
+bucket (identified); **extrapolated** figures are arithmetic on those measurements and are labelled
+as such. Replace the extrapolations with a 1,000,000-row sample run before the full job.
 
-| Resource | Estimate | Why |
+| Resource | Figure | Basis |
 | --- | --- | --- |
-| Network | ~60 GB down (once per object) | the bytes must be read; ~7,500 ranged GETs at 8 MiB |
-| Local disk | ~60 GB cache + ~1.1× input spool + ~0.12× output if `rawCacheDir` is on the same volume; `null` drops the 60 GB | spool rows dominate |
-| RAM | well under 2 GB | one hash-bucket batch and one partition at a time |
-| Duration | hours, bounded by disk and network (measure with `--sample 1000000`) | parsing is ~1 core |
-| R2 operations | ~7.5K Class B reads + uploads of the index | far inside the free allowance |
+| Source bytes | `raw/file1.csv` 10,223,471,749 B + `raw/file2.csv` 54,038,527,871 B = 64.26 GB | **measured** (LIST + HEAD) |
+| Network | ~64.26 GB down once per object ≈ 7,664 ranged GETs at 8 MiB | extrapolated; **measured** single ranged GET of 8 MiB took 0.88–1.07 s here (~8–9 MB/s) |
+| Parse throughput | file1 8,143 rows/s (17.7 MB/s, 2,176 B/row); file2 40,839 rows/s (22.8 MB/s, 558 B/row) | **measured** on this 1-vCPU sandbox |
+| Row counts | file1 ≈ 4.7 M organizations; file2 ≈ 96.8 M people ≈ 101 M rows total | extrapolated from the measured bytes/row |
+| Duration | ≈ 2–3 h single-threaded (download + parse, additive) | extrapolated; a 39,505-row Mode B sample run took 118 s end to end here |
+| Temporary space | 70.96 GB reported by preflight for the full input | **measured** preflight output |
+| Generated index | preflight estimates 7.71 GB; scaling the measured sample (10.4 MB gzipped for 20,265 companies + 19,414 contacts: 97 B/company, 96 B/contact) suggests 9–20 GB, contacts dominating | extrapolated — **the real number needs the 1 M sample** |
+| `rawCacheDir` | ~64 GB if enabled (skippable with `"rawCacheDir": null`) | the bytes have to land somewhere to resume |
+| RAM | bounded: one hash bucket + one partition at a time; 2 GB was enough for the sample | by design |
+| R2 operations | ~7.7 K Class B reads + one upload per generated object (Class A) | extrapolated |
+| Cloudflare cost | inside the free allowance at this volume (see `docs/cost.md`) | extrapolated |
+
+This workspace itself **cannot** run the full job: the sandbox has 1 vCPU, 1.64 GB free RAM and
+0.9 GB free disk. Preflight says so and refuses:
+
+```
+  ! Temporary space looks insufficient: about 0.9 GB free vs 71.0 GB estimated for spooling.
+```
 
 ## How a run works
 
@@ -91,8 +106,11 @@ skips finished passes (`--no-resume` to start over).
 All commands are run from the repository root, on Windows use PowerShell with forward slashes.
 
 ```bash
-# 0. Confirm the real object keys first — never guess them (read-only, no keys needed)
-bun run verify:r2:remote
+# 0. Confirm the real object keys first — never guess them (read-only)
+bun run r2:doctor          # credentials file + endpoint + one signed LIST of raw/
+bun run r2:schema          # both files: encoding, delimiter, columns, mapping + confidence
+bun run verify:r2          # inventory, sizes, ETags, bounded body read, dataset state
+bun run verify:r2:remote   # same ground truth through the Worker binding (no keys at all)
 
 # 1. Install dependencies once
 bun install
@@ -136,8 +154,8 @@ counts. **Nothing is fabricated:** before a first successful index the UI shows
 
 ```
 Preflight
-  ok   csv1  9.83 GB   D:/company-intel/raw/companies_part1.csv
-  ok   csv2  49.1 GB   D:/company-intel/raw/companies_part2.csv
+  ok   csv1  10.22 GB  r2://company-intel-data/raw/file1.csv
+  ok   csv2  54.04 GB  r2://company-intel-data/raw/file2.csv
   input total          58.93 GB
   free disk            412.5 GB
   temporary space need 88.4 GB

@@ -14,7 +14,17 @@ name = "companyintel"
 main = "worker/src/index.ts"
 compatibility_date = "2025-09-01"
 compatibility_flags = ["nodejs_compat"]
-workers_dev = true
+
+# No `*.workers.dev` alias for production: the application must only be reachable
+# through the hostname your Cloudflare Access application protects. Add the
+# production route/custom domain below when you deploy, otherwise the Worker has
+# no hostname at all (Access still protects the API from any other origin, and
+# every /api route verifies the Access JWT itself — this just removes the alias).
+#
+# [[routes]]
+# pattern = "intel.example.com"
+# custom_domain = true
+workers_dev = false
 
 # ---------------------------------------------------------------------------
 # Static frontend (built by `bun run build`, output in ./dist)

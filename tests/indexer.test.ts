@@ -94,6 +94,23 @@ describe("identity resolution", () => {
     expect(pickCanonicalKey(["n:acme"])).toBe("n:acme");
   });
 
+  test("the spool partition is the normalized company name, so both files can meet", () => {
+    // The join key: a company row and a contact row that name the same company
+    // must land in the same partition, whatever else they carry. Partitioning by
+    // the strongest identifier instead split organizations (domain) from people
+    // (name only), leaving every contact unassociated in the real dataset.
+    const companyRow = companyKeysFromInput(
+      { name: "Microsoft Corporation", domain: "microsoft.com", sourceId: "org_1" },
+      "csv1",
+    );
+    const contactRow = companyKeysFromInput({ name: "Microsoft Corp" }, "csv2");
+    expect(companyRow.partitionKey).toBe("n:microsoft");
+    expect(contactRow.partitionKey).toBe(companyRow.partitionKey);
+    // …while the strongest identifier still describes the row itself.
+    expect(companyRow.bucket).toBe("d:microsoft.com");
+    expect(contactRow.bucket).toBe("n:microsoft");
+  });
+
   test("name-only rows merge with name-only rows of the same normalized name", () => {
     const resolver = new CompanyResolver();
     const weak = resolver.resolve(companyKeysFromInput({ name: "Meridian Logistics" }, "csv1"));
@@ -261,21 +278,26 @@ describe("end-to-end indexing pipeline", () => {
     expect(result.counters.perSource.csv1.companies).toBeGreaterThan(0);
     expect(result.counters.perSource.csv2.companies).toBeGreaterThan(0);
 
-    // Tata appears in both files (domain in one, domain + LinkedIn page in the
-    // other) → one merged company carrying two contacts.
-    // Meridian GmbH and name-only Meridian Logistics stay separate records, and
-    // Acme Industries comes only from the second file.
-    expect(result.counters.uniqueCompanies).toBe(4);
+    // Rows are spooled into the partition of the NORMALIZED COMPANY NAME, which is
+    // the one signal both files can compute (see `partitionKey` in mapping.ts).
+    // Two different names that normalize alike therefore meet, which is what lets
+    // a contact-only file associate with a company-only file at all:
+    //   - Tata Consultancy Services Limited (csv1, domain) +
+    //     Tata Consultancy Services (csv2, domain + LinkedIn) → one company,
+    //     one contact from each file;
+    //   - Meridian Logistics GmbH (csv1, domain) + Meridian Logistics (csv1,
+    //     no domain) → one company, because the normalized names are identical
+    //     ("gmbh" is a legal suffix) and one row carries no contradicting
+    //     evidence — its contact attaches to the strong record;
+    //   - Acme Industries (csv2) → its own company.
+    expect(result.counters.uniqueCompanies).toBe(3);
     expect(result.counters.uniqueContacts).toBe(5);
 
-    // Both Meridian records survive as separate companies with their own single
-    // contact — sanity-checked below through the search path.
-    //
-    // The `ambiguous` flag is only raised when the contradiction is visible
-    // inside one hash partition (documented in docs/indexing.md). These two rows
-    // carry different identity buckets, so they are partitioned apart and the
-    // counter stays at zero: they are kept separate by construction, which is the
-    // behaviour that matters.
+    // The `ambiguous` counter is reserved for a real contradiction: two records
+    // whose normalized names collide while both carry *different* strong evidence
+    // (the Vertex case in tests/e2e-index.test.ts). An exact name match where one
+    // row has no contradicting evidence is an accepted association, not a
+    // conflict, so nothing is flagged here.
     expect(result.counters.ambiguousCompanies).toBe(0);
   });
 
@@ -332,10 +354,12 @@ describe("end-to-end indexing pipeline", () => {
     const exact = await searchCompanies(source, "tcs consultancy");
     expect(exact.hits[0]?.name).toBe("Tata Consultancy Services Limited");
 
+    // One Meridian record: the name-only row's contact is associated with the row
+    // that carries the domain, and the strong identity wins.
     const meridian = await searchCompanies(source, "Meridian Logistics");
-    expect(meridian.hits.length).toBe(2);
-    const ids = new Set(meridian.hits.map((hit) => hit.id));
-    expect(ids.size).toBe(2); // same name, opposite domains: never merged
+    expect(meridian.hits.length).toBe(1);
+    expect(meridian.hits[0]?.contactCount).toBe(2);
+    expect(meridian.hits[0]?.domain).toBe("meridian.example");
 
     const unrelated = await searchCompanies(source, "zzzzzzzz");
     expect(unrelated.hits).toHaveLength(0);
@@ -343,7 +367,7 @@ describe("end-to-end indexing pipeline", () => {
 
   test("re-running the indexer is idempotent and does not duplicate records", async () => {
     const again = await runIndex({ ...config, workDir: join(dir, "work2"), outputDir: join(dir, "out2") });
-    expect(again.counters.uniqueCompanies).toBe(4);
+    expect(again.counters.uniqueCompanies).toBe(3);
     expect(again.counters.uniqueContacts).toBe(5);
     expect(again.manifest.validationPassed).toBe(true);
   });

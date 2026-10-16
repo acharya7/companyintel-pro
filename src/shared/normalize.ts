@@ -168,11 +168,20 @@ export function stripLegalSuffixes(tokens: string[]): string[] {
   return out;
 }
 
-/** Expand known abbreviations token by token (aliases only). */
+/**
+ * Expand known abbreviations token by token (aliases only).
+ *
+ * The lookup is own-property-only on purpose. `ABBREVIATIONS` is an object
+ * literal, so a plain `ABBREVIATIONS[token]` also finds everything inherited from
+ * `Object.prototype`: a company actually called "Constructor" (or "ToString",
+ * "ValueOf", …) returned a *function*, and `expansion.split(" ")` then threw
+ * `expansion.split is not a function` in the middle of a run — which is exactly
+ * what happened to this dataset, 10,000 companies into a real sample pass.
+ */
 export function expandAbbreviations(tokens: string[]): string[] {
   const out: string[] = [];
   for (const t of tokens) {
-    const expansion = ABBREVIATIONS[t];
+    const expansion = Object.prototype.hasOwnProperty.call(ABBREVIATIONS, t) ? ABBREVIATIONS[t] : undefined;
     if (expansion) out.push(...expansion.split(" "));
     else out.push(t);
   }

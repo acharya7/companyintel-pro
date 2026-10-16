@@ -64,10 +64,15 @@ Optional vars: `ENVIRONMENT`, `APP_VERSION`, `MAX_SEARCHES_PER_MINUTE`.
 {
   "datasetVersion": "v1",
   "sources": [
-    // MODE B: read straight from R2 (bounded ranged reads; needs R2_* credentials)
-    { "id": "csv1", "path": "r2://company-intel-data/raw/companies_part1.csv", "encoding": "utf8", "delimiter": "," },
-    { "id": "csv2", "path": "r2://company-intel-data/raw/companies_part2.csv", "encoding": "utf8", "delimiter": "," }
-    // MODE A instead: a local path, e.g. "D:/company-intel/raw/companies_part1.csv"
+    // MODE B: read straight from R2 (bounded ranged reads; credentials come from
+    // the private file in §5 — no export commands needed)
+    // These are the REAL keys in the bucket, in the order this config uses them:
+    //   csv1 = organizations (10,223,471,749 bytes, 51 columns)
+    //   csv2 = people       (54,038,527,871 bytes, 39 columns)
+    // Both are TAB separated, UTF-8 without BOM.
+    { "id": "csv1", "path": "r2://company-intel-data/raw/file1.csv", "encoding": "utf-8", "delimiter": "\t" },
+    { "id": "csv2", "path": "r2://company-intel-data/raw/file2.csv", "encoding": "utf-8", "delimiter": "\t" }
+    // MODE A instead: a local path, e.g. "D:/company-intel/raw/file1.csv"
   ],
   "workDir": ".indexer-work",          // disk-backed spool/checkpoint area
   "outputDir": ".indexer-output",       // generated objects, one file per R2 object
@@ -84,7 +89,7 @@ Optional vars: `ENVIRONMENT`, `APP_VERSION`, `MAX_SEARCHES_PER_MINUTE`.
   wrong object key fails with HTTP 404 rather than silently indexing nothing.
 - **`rawCacheDir`** (Mode B): where each R2 object is cached once, so a re-run resumes from disk.
   `null` streams without caching. Never commit it — see `.gitignore`.
-- **Mode B credentials**: the three `R2_*` variables below are required when any source is an
+- **Mode B credentials**: resolved automatically from the private file in §5 when any source is an
   `r2://` URL; Wrangler's login cannot be handed to the indexer. Object Read is enough to index,
   Read & Write only for `--upload`/`publish`. Details and the least-privilege steps:
   `docs/indexing.md`.
@@ -94,46 +99,66 @@ Optional vars: `ENVIRONMENT`, `APP_VERSION`, `MAX_SEARCHES_PER_MINUTE`.
   bucket (not necessary).
 - Object sizes/partition counts inside a version are recorded in `directory.json`, so the
   Worker derives the same keys without configuration.
-- R2 credentials for Mode B reads and for upload/publish are **environment variables only** (see
-  below); they are never written to this file.
+- R2 credentials for Mode B reads and for upload/publish are never written to this file: they are
+  read from the private file in §5.
 
 ## 5. R2 credentials for the indexer and verification scripts (local machine only)
 
-Used by Mode B (`r2://`) sources, `run --upload`, `publish`, `scripts/verify-raw.mjs` and
-`scripts/profile-raw.mjs`. **Not** used by the read-only probe or the deployed Worker, which use
-the native `COMPANY_DATA` binding:
+Used by Mode B (`r2://`) sources, `run --upload`, `publish`, `scripts/verify-raw.mjs`,
+`scripts/r2-doctor.mjs` and `scripts/r2-schema.mjs`. **Not** used by the read-only probe or the
+deployed Worker, which use the native `COMPANY_DATA` binding:
 
 ```bash
 bun run verify:r2:remote          # no keys at all — your Wrangler login + the R2 binding
 ```
-You configured these already with rclone; the local code reads the same S3-compatible
-credentials from the environment — never from a file in this repository:
 
-```powershell
-# Windows PowerShell — set for the current session only
-$env:R2_ACCOUNT_ID="<your account id>"
-$env:R2_ACCESS_KEY_ID="<access key id>"
-$env:R2_SECRET_ACCESS_KEY="<secret access key>"
+The fixed credentials live in ONE private, git-ignored JSON file that every server-side tool
+picks up on its own — no exports, no per-run environment setup:
+
+```jsonc
+// .r2-credentials.json   (repository root; mode 600; listed in .gitignore)
+{
+  "endpoint": "https://<account-id>.r2.cloudflarestorage.com",
+  "accountId": "<account id>",
+  "accessKeyId": "<R2 access key id>",
+  "secretAccessKey": "<R2 secret access key>",
+  "bucket": "company-intel-data",
+  "region": "auto",
+  "rawPrefix": "raw/"
+}
 ```
 
 ```bash
-# macOS / Linux — same three, scoped to this shell session only
-export R2_ACCOUNT_ID="<account id>"
-export R2_ACCESS_KEY_ID="<access key id>"
-export R2_SECRET_ACCESS_KEY="<secret access key>"
+chmod 600 .r2-credentials.json     # keep it unreadable by other users
+bun run r2:doctor                  # confirms the file, the endpoint and a signed request
 ```
 
-No `R2_ENDPOINT`, `R2_REGION` or `R2_BUCKET_NAME` variable is read: the endpoint is derived
-from the account id, the signature scope is `auto`, and the bucket defaults to
-`company-intel-data` (`tools/indexer/src/r2.ts`).
+Resolution order (`tools/indexer/src/credentials.ts`, the single reader):
 
-Never commit these, never paste them into chat, and do not enter them in a hosting
-provider's Frontend/Backend environment panel: the production Worker uses the
-`COMPANY_DATA` binding and needs no keys, and the Backend panel of a Convex-backed project
-is read by Convex, not by this app. See `docs/r2-connection.md`.
+1. **environment override** — `R2_ACCOUNT_ID`/`CLOUDFLARE_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
+   `R2_SECRET_ACCESS_KEY` (plus optional `R2_ENDPOINT_URL`, `R2_BUCKET_NAME`, `R2_REGION`,
+   `R2_RAW_PREFIX`) for a one-off session with a different token or bucket;
+2. **private file** — `$COMPANYINTEL_R2_CREDENTIALS` if set, else
+   `<repo>/.r2-credentials.json`, else `<repo>/.r2-credentials/r2.json`, else
+   `~/.config/companyintel/r2-credentials.json`;
+3. otherwise no credentials: tools exit **2** with the setup recipe and never guess.
 
-If they are absent, `publish` stops and tells you to upload with rclone and then write
-`manifests/active.json` manually, and the verification scripts exit 2 with setup instructions.
+Guarantees this module keeps (asserted by tests):
+
+- no credential **value** is ever returned in a status object, thrown message or log line — only
+  presence booleans, the (non-secret) account id, the endpoint host, the bucket and the region;
+- the endpoint and bucket are validated, and an endpoint whose first label disagrees with the
+  account id is rejected instead of silently used;
+- `--secret`/`--access-key`-style arguments are refused, so nothing lands in shell history or `ps`;
+- nothing here is imported by `src/**` (the browser bundle) or `worker/**` (the deployed Worker),
+  and no `VITE_*` variable is read: a secret cannot reach the browser through this path.
+
+Do not paste these values into chat, into a hosting provider's Frontend/Backend environment panel,
+into `wrangler.toml` or into a tracked source file: the production Worker uses the `COMPANY_DATA`
+binding and needs no keys at all. See `docs/r2-connection.md`.
+
+If no credentials are configured, `publish` stops with instructions, and the verification scripts
+exit 2 with the setup recipe.
 
 ## 6. Read-only R2 probe (`probe/wrangler.toml`)
 

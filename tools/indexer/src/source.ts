@@ -28,7 +28,7 @@ import { createWriteStream, existsSync } from "node:fs";
 import { mkdir, rename, stat, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
-import { CsvParser, type CsvRecord } from "../../../src/shared/csv-parse";
+import { CsvParser, truncateAtRecordBoundary, type CsvRecord } from "../../../src/shared/csv-parse";
 import type { WriteStream } from "node:fs";
 import {
   consumeProfileRecord,
@@ -375,6 +375,7 @@ export async function sourceProfile(
       delimiter: source.delimiter,
       sampleRows: options.sampleRows,
       knownFields: options.knownFields,
+      maxSamplesPerColumn: options.maxSamplesPerColumn,
     });
   }
 
@@ -388,9 +389,10 @@ export async function sourceProfile(
   const encoding = source.encoding ?? "utf8";
   let text = new TextDecoder(encoding, { fatal: false, ignoreBOM: true }).decode(bytes);
   if (truncatedByBound) {
-    // The sample may end inside a quoted multiline record; drop the tail.
-    const lastNewline = text.lastIndexOf("\n");
-    text = lastNewline < 0 ? "" : text.slice(0, lastNewline + 1);
+    // The sample may end inside a quoted multiline record; drop the tail with the
+    // same quoting rules the parser uses (a plain lastIndexOf("\n") keeps a field
+    // that is still open, and its half record would be profiled as a real row).
+    text = truncateAtRecordBoundary(text, { delimiter: source.delimiter });
   }
 
   const accumulator = createProfileAccumulator({ sampleRows: options.sampleRows, maxSamplesPerColumn: options.maxSamplesPerColumn });

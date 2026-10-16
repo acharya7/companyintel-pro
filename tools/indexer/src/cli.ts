@@ -17,10 +17,9 @@ import { resolve } from "node:path";
 import { createHash } from "node:crypto";
 
 import { ALL_CANONICAL_FIELDS, buildColumnMap } from "./mapping";
-import { profileCsvFile } from "./csv";
 import { preflight, publishVersion, runIndex, uploadOutput, type IndexerConfig, type ProgressEvent } from "./build";
 import { credentialsFromEnv } from "./r2";
-import { createSourceContext, credentialsHelp, missingCredentialBuckets, parseR2Source } from "./source";
+import { createSourceContext, credentialsHelp, missingCredentialBuckets, parseR2Source, sourceProfile } from "./source";
 
 function parseArgs(argv: string[]): { command: string; flags: Record<string, string | boolean> } {
   const [command = "help", ...rest] = argv;
@@ -69,8 +68,14 @@ function printPreflight(report: Awaited<ReturnType<typeof preflight>>): void {
   console.log(`  memory free / total  ${gb(report.memoryBytes.free)} / ${gb(report.memoryBytes.total)}`);
   console.log(`  cpu cores            ${report.cpuCount}`);
   for (const warning of report.warnings) console.log(`  ! ${warning}`);
-  if (report.totalInputBytes > 0) {
-    const seconds = report.totalInputBytes / (ROWS_PER_SECOND_HINT * 900);
+  if (report.sampleLimit !== null) {
+    console.log(`  sample               ${report.sampleLimit.toLocaleString()} records per source (temporary space estimated from this, not from the full input)`);
+  }
+  // A sample run knows its row count; a full run only knows bytes, so the row
+  // count is approximated from the average spool row size.
+  const estimatedRows = report.estimatedRows ?? (report.totalInputBytes > 0 ? report.totalInputBytes / 900 : null);
+  if (estimatedRows !== null) {
+    const seconds = estimatedRows / ROWS_PER_SECOND_HINT;
     console.log(`  rough duration hint  ~${(seconds / 60).toFixed(0)} min at ${ROWS_PER_SECOND_HINT.toLocaleString()} rows/s (measure with a sample run)`);
   }
   console.log("");
@@ -110,15 +115,31 @@ async function cmdProfile(config: IndexerConfig): Promise<void> {
   if (!requireSourceAccess(config)) return;
   const report = await preflight(config);
   printPreflight(report);
+  const context = createSourceContext({
+    cacheDir: config.rawCacheDir === undefined ? undefined : config.rawCacheDir,
+    onNotice: (message) => console.log(`  ${message}`),
+  });
   for (const source of config.sources) {
-    const profile = await profileCsvFile(source.path, {
-      encoding: source.encoding,
-      delimiter: source.delimiter,
-      sampleRows: 500,
-      knownFields: [...ALL_CANONICAL_FIELDS],
-    });
+    const isR2 = Boolean(parseR2Source(source.path));
+    // MODE B goes through the shared source reader: a bounded range read of the
+    // real object, trimmed to a complete record. Calling the local-file profiler
+    // here would fail on an `r2://` path — the mode is not a file.
+    //
+    // Cell values are kept out of a MODE B report (0 samples per column): the
+    // profile is for the schema, and the objects hold real contact records.
+    const profile = await sourceProfile(
+      source,
+      {
+        encoding: source.encoding,
+        delimiter: source.delimiter,
+        sampleRows: 500,
+        knownFields: [...ALL_CANONICAL_FIELDS],
+        maxSamplesPerColumn: isR2 ? 0 : 3,
+      },
+      context,
+    );
     const map = buildColumnMap(profile.headers);
-    const mode = parseR2Source(source.path) ? "R2 object (bounded sample read)" : "local file";
+    const mode = isR2 ? "R2 object (bounded sample read, no cell values in this report)" : "local file";
     console.log(`\n${source.id} — ${source.path}`);
     console.log(`  input mode       ${mode}`);
     console.log(`  sampled rows     ${profile.sampledRows.toLocaleString()}`);
@@ -150,7 +171,10 @@ async function cmdRun(config: IndexerConfig, flags: Record<string, string | bool
   const version = typeof flags.version === "string" ? flags.version : config.datasetVersion;
   const upload = Boolean(flags.upload);
 
-  const report = await preflight(config);
+  // `sample` must reach preflight: a sample run's temporary-space estimate is based
+  // on the sampled row count, so a machine that cannot hold the 60 GB job can still
+  // run the dry run the specification requires before it.
+  const report = await preflight(config, undefined, { sampleLimit: sample });
   printPreflight(report);
   if (report.warnings.some((warning) => warning.includes("insufficient"))) {
     console.error("Refusing to start: temporary space is insufficient for this run.");

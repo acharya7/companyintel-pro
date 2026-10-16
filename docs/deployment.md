@@ -105,10 +105,12 @@ it the deployed bundle falls back to the clearly-labelled synthetic sample mode.
 bunx wrangler secret put CF_ACCESS_AUD
 ```
 
-**Also protect alternate hostnames.** In Zero Trust → Access → Applications, make sure a policy
-covers `*.workers.dev` for this Worker, or disable `workers_dev` in `wrangler.toml`
-(`workers_dev = false`) once you are happy with a custom domain. An unprotected alias hostname
-is a bypass.
+**Also protect alternate hostnames.** `wrangler.toml` already sets `workers_dev = false` for
+production, so no `*.workers.dev` alias exists for this Worker — you must add your custom-domain
+`[routes]` entry (there is a commented example in the file) and make sure the Access application
+covers it. Only `env.development` keeps the alias, for `wrangler dev`. An unprotected alternate
+hostname is a bypass; the Worker also fails closed on any hostname, because every `/api/*` route
+verifies the Access JWT itself.
 
 ## 7. Deploy
 

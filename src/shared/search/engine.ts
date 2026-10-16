@@ -120,7 +120,9 @@ function rarestFirst(values: string[], df: Record<string, number> | null, limit:
   const unique = uniqueInOrder(values);
   if (!df) return unique.slice(0, limit);
   return unique
-    .map((v) => ({ v, freq: df[v] ?? 0 }))
+    // Own-property lookup: `df` comes from a candidate source (or from parsed
+    // JSON), so an inherited member must never be read as a document frequency.
+    .map((v) => ({ v, freq: Object.prototype.hasOwnProperty.call(df, v) ? df[v] : 0 }))
     .sort((a, b) => a.freq - b.freq)
     .slice(0, limit)
     .map((x) => x.v);

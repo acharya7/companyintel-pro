@@ -132,9 +132,34 @@ export function extractContactInput(record: string[], map: Record<string, number
 export interface CompanyKeys {
   /** Every identifier this row carries, strongest first. */
   all: string[];
-  /** Partition key: the strongest identifier available, so rows of the same
-   *  company land in the same partition even when their identifier sets differ. */
+  /** Strongest identifier of this row (domain → LinkedIn → source id → name). */
   bucket: string;
+  /**
+   * Spool partition key — deliberately the NORMALIZED NAME, not the strongest
+   * identifier.
+   *
+   * Two rows can only be merged into one company when they are resolved in the
+   * same partition, and a row is resolved against the companies that share its
+   * partition. Partitioning by the strongest identifier works when both sources
+   * describe companies the same way, but this dataset does not: one file is
+   * organizations (name + domain + organization id) and the other is individual
+   * people whose only company signal is a sanitized company NAME. Partitioning
+   * organizations by domain and people by name would put every company and every
+   * contact in different partitions, so no contact would ever attach to its
+   * company — the exact association failure the specification requires us to
+   * avoid.
+   *
+   * The normalized name is the one signal both files can compute, so it is the
+   * join key. The full identifier set still travels with the row, so inside a
+   * partition domain / LinkedIn / source-id evidence is used exactly as before
+   * (and contradictory evidence still forces separate, flagged records).
+   *
+   * Known trade-off: two rows for one company whose names normalize differently
+   * (e.g. a rebrand) but share a domain now land in different partitions and stay
+   * separate records. That is visible and fixable later; silently attaching
+   * millions of people to the wrong companies is not.
+   */
+  partitionKey: string;
   strong: boolean;
   normalizedName: string;
 }
@@ -161,6 +186,7 @@ export function companyKeysFromInput(input: RawCompanyInput, sourceId: string): 
   return {
     all,
     bucket: all[0],
+    partitionKey: `n:${normalizedName}`,
     strong: all.length > 1,
     normalizedName,
   };

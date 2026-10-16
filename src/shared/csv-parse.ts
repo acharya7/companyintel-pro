@@ -189,20 +189,64 @@ export function quoteCount(text: string): number {
  *
  * Slicing at the final newline is not enough: if the range ends inside a quoted
  * field that spans lines, the last "line" is half a record and the quote in it is
- * unbalanced. Complete records always contain an even number of quotes, so an odd
- * count means "drop that line and check again" (bounded, so a pathological sample
- * cannot loop forever).
+ * unbalanced. So the sample is scanned with the same quoting rules as the parser
+ * and cut at the last newline that ends a record *outside* quotes.
+ *
+ * A quote-counting heuristic cannot replace this. Real exports contain a single `"`
+ * inside a field (an inch mark, a `5"` diameter, a stray escaped quote), and one
+ * unbalanced quote makes the parity of the whole prefix odd — a "drop lines until
+ * the count is even" loop then throws away EVERY complete record and returns an
+ * empty sample. That is exactly what happened to the first real source file here:
+ * 6 MB with 2,768 lines was reported as "no complete record", which is how a file
+ * with a perfectly good header looks when the boundary heuristic is wrong.
+ *
+ * Returns `""` only when the sample genuinely contains no complete record (for
+ * example a single record with no newline at all, which is what a truncated first
+ * chunk looks like).
  */
-export function truncateAtRecordBoundary(text: string, maxDrops = 50): string {
-  let candidate = String(text ?? "");
-  for (let drop = 0; drop <= maxDrops; drop += 1) {
-    const lastNewline = candidate.lastIndexOf("\n");
-    if (lastNewline < 0) return ""; // no complete record in this sample
-    const complete = candidate.slice(0, lastNewline + 1);
-    if (quoteCount(complete) % 2 === 0) return complete;
-    candidate = candidate.slice(0, lastNewline);
+export function truncateAtRecordBoundary(text: string, options: CsvParseOptions = {}): string {
+  const source = String(text ?? "");
+  if (!source) return "";
+  const delimiter = options.delimiter ?? ",";
+  const quote = options.quote ?? '"';
+
+  let inQuotes = false;
+  let atFieldStart = true;
+  /** Index just past the last newline that completed a record. */
+  let end = -1;
+
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (inQuotes) {
+      if (character === quote) {
+        // `""` is an escaped quote and stays inside the field.
+        if (source[index + 1] === quote) {
+          index += 1;
+          continue;
+        }
+        inQuotes = false;
+      }
+      continue;
+    }
+    if (character === quote && atFieldStart) {
+      inQuotes = true;
+      atFieldStart = false;
+      continue;
+    }
+    if (character === delimiter) {
+      atFieldStart = true;
+      continue;
+    }
+    if (character === "\n") {
+      end = index + 1;
+      atFieldStart = true;
+      continue;
+    }
+    if (character === "\r") continue; // part of a CRLF pair
+    atFieldStart = false;
   }
-  return "";
+
+  return end > 0 ? source.slice(0, end) : "";
 }
 
 export interface EncodingDetection {

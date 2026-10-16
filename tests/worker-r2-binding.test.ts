@@ -64,11 +64,20 @@ describe("the Worker code never uses S3 credentials", () => {
     expect(workerSource).toMatch(/env\.COMPANY_DATA/);
   });
 
-  test("the S3 client exists only outside worker/ (local indexer + scripts)", () => {
+  test("the S3 client and its credential resolver exist only outside worker/", () => {
+    // Signing lives in r2.ts; the credential *resolution* (environment first, then
+    // the private git-ignored file) lives in credentials.ts. Both are local-only.
     const s3Client = readFileSync(join(root, "tools/indexer/src/r2.ts"), "utf8");
-    expect(s3Client).toContain("process.env.R2_ACCESS_KEY_ID");
     expect(s3Client).toContain("cloudflarestorage.com");
-    // Imported by the local scripts, never by the Worker.
+    const resolver = readFileSync(join(root, "tools/indexer/src/credentials.ts"), "utf8");
+    expect(resolver).toContain('envValue("R2_ACCESS_KEY_ID")');
+    expect(resolver).toContain('envValue("R2_SECRET_ACCESS_KEY")');
+    expect(resolver).toContain("DEFAULT_CREDENTIAL_FILE_NAME");
+    // The loader must never read a build-time (Vite) variable: a secret that way
+    // would end up in the browser bundle.
+    expect(resolver).not.toContain("import.meta.env");
+    expect(resolver).not.toMatch(/from\s+["'].*src\//);
+    // Imported by the local scripts, never by the Worker or the browser bundle.
     expect(workerSource).not.toMatch(/from\s+["'].*tools\/indexer/);
   });
 });
@@ -148,5 +157,49 @@ describe("the read-only probe is isolated from the deployment", () => {
   test("the probe never imports the production worker or its business endpoints", () => {
     expect(probeSource).not.toContain("worker/src");
     expect(probeSource).not.toMatch(/saved-lead|savedLead|\/api\/leads|\/api\/exports|\/api\/settings/);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* Fixed server-side credentials stay server-side                             */
+/* -------------------------------------------------------------------------- */
+
+const gitignore = readFileSync(join(root, ".gitignore"), "utf8");
+const clientSource = walk(join(root, "src"))
+  .filter((path) => /\.(ts|tsx)$/.test(path))
+  .map((path) => readFileSync(path, "utf8"))
+  .join("\n");
+const credentialResolver = readFileSync(join(root, "tools/indexer/src/credentials.ts"), "utf8");
+
+describe("the fixed R2 credentials cannot reach a browser or a deployment", () => {
+  test("production has no workers.dev alias, while development keeps one", () => {
+    // Split on the development environment: the top-level settings apply to the
+    // deployed worker, so *that* half must have the alias switched off.
+    const [production, development = ""] = wranglerConfig.split("[env.development]");
+    expect(production).toMatch(/workers_dev\s*=\s*false/);
+    expect(production).not.toMatch(/workers_dev\s*=\s*true/);
+    expect(development).toMatch(/workers_dev\s*=\s*true/);
+  });
+
+  test("the private credential file and the real data it feeds are git-ignored", () => {
+    expect(gitignore).toMatch(/\.r2-credentials\*?\.json/);
+    expect(gitignore).toContain(".indexer-output/");
+    expect(gitignore).toContain(".indexer-work/");
+    expect(gitignore).toContain(".indexer-raw-cache/");
+    expect(gitignore).toContain(".raw-samples/");
+  });
+
+  test("no browser-bundle file can reach the credential resolver", () => {
+    expect(clientSource).not.toContain("r2-credentials");
+    expect(clientSource).not.toContain("R2_SECRET_ACCESS_KEY");
+    expect(clientSource).not.toContain("R2_ACCESS_KEY_ID");
+    expect(clientSource).not.toMatch(/tools\/indexer\/src\/credentials/);
+  });
+
+  test("the resolver reports presence, never a value", () => {
+    // It has no console output at all, and its status object exposes booleans.
+    expect(credentialResolver).not.toContain("console.log");
+    expect(credentialResolver).toMatch(/hasSecretAccessKey: boolean/);
+    expect(credentialResolver).toMatch(/hasAccessKeyId: boolean/);
   });
 });

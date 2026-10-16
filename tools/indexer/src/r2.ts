@@ -4,13 +4,13 @@
  * Only the indexer runs outside Cloudflare, and it is the only component that
  * needs write access to the bucket, so signing lives here rather than in the
  * Worker (the Worker uses the R2 binding and never sees S3 credentials).
+ * * Credentials are resolved by `./credentials` — this process's environment
+ * first, then the private, git-ignored local file (`.r2-credentials.json`) — and
+ * are never written to disk or printed:
  *
- * Credentials come from the environment and are never written to disk or
- * printed:
- *
- *   R2_ACCOUNT_ID        your Cloudflare account id
  *   R2_ACCESS_KEY_ID     R2 access key id
  *   R2_SECRET_ACCESS_KEY R2 secret access key
+ *   R2_ACCOUNT_ID        your Cloudflare account id (or R2_ENDPOINT_URL)
  *
  * If you would rather not create R2 API tokens at all, run
  * `rclone copy <outputDir> r2:<bucket>` instead — the layout is identical and
@@ -21,20 +21,10 @@ import { createHash, createHmac } from "node:crypto";
 import { readFile, stat } from "node:fs/promises";
 import { gzipSync } from "node:zlib";
 
-export interface R2Credentials {
-  accountId: string;
-  accessKeyId: string;
-  secretAccessKey: string;
-  bucket: string;
-}
+import { DEFAULT_REGION, credentialsFromEnv, endpointFor, type R2Credentials } from "./credentials";
 
-export function credentialsFromEnv(bucket = "company-intel-data"): R2Credentials | null {
-  const accountId = process.env.R2_ACCOUNT_ID;
-  const accessKeyId = process.env.R2_ACCESS_KEY_ID;
-  const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY;
-  if (!accountId || !accessKeyId || !secretAccessKey) return null;
-  return { accountId, accessKeyId, secretAccessKey, bucket };
-}
+export type { R2Credentials };
+export { credentialsFromEnv };
 
 function sha256Hex(data: string | Buffer): string {
   return createHash("sha256").update(data).digest("hex");
@@ -78,7 +68,9 @@ export class R2Client {
 
   constructor(credentials: R2Credentials) {
     this.credentials = credentials;
-    this.endpoint = `https://${credentials.accountId}.r2.cloudflarestorage.com`;
+    // `endpointFor` prefers an explicitly configured R2_ENDPOINT_URL and falls back
+    // to the canonical https://<account-id>.r2.cloudflarestorage.com.
+    this.endpoint = endpointFor(credentials).replace(/\/+$/, "");
   }
 
   /**
@@ -135,9 +127,12 @@ export class R2Client {
       .join("&");
     const canonicalRequest = [method, canonicalUri, canonicalQuery, canonicalHeaders, signedHeaders, payloadHash].join("\n");
 
-    const scope = `${dateStamp}/auto/s3/aws4_request`;
+    const scope = `${dateStamp}/${this.credentials.region ?? DEFAULT_REGION}/s3/aws4_request`;
     const stringToSign = ["AWS4-HMAC-SHA256", amzDate, scope, sha256Hex(canonicalRequest)].join("\n");
-    const signingKey = hmac(hmac(hmac(hmac(`AWS4${secretAccessKey}`, dateStamp), "auto"), "s3"), "aws4_request");
+    const signingKey = hmac(
+      hmac(hmac(hmac(`AWS4${secretAccessKey}`, dateStamp), this.credentials.region ?? DEFAULT_REGION), "s3"),
+      "aws4_request",
+    );
     const signature = createHmac("sha256", signingKey).update(stringToSign).digest("hex");
 
     const authorization = `AWS4-HMAC-SHA256 Credential=${accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`;

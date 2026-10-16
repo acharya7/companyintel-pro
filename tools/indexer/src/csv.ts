@@ -77,7 +77,7 @@ export async function* readCsvFile(path: string, options: CsvReadOptions = {}): 
  */
 export async function profileCsvFile(
   path: string,
-  options: CsvReadOptions & { sampleRows?: number; knownFields?: readonly string[] } = {},
+  options: CsvReadOptions & { sampleRows?: number; knownFields?: readonly string[]; maxSamplesPerColumn?: number } = {},
 ): Promise<FileProfile> {
   const accumulator = createProfileAccumulator(options);
   let bytes = 0;

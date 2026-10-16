@@ -12,8 +12,11 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { R2Client, credentialsFromEnv } from "../tools/indexer/src/r2";
+import { resetCredentialCache } from "../tools/indexer/src/credentials";
 
 const credentials = { accountId: "acct", accessKeyId: "AKIDEXAMPLE", secretAccessKey: "secret", bucket: "company-intel-data" };
 
@@ -43,20 +46,31 @@ afterEach(() => {
 });
 
 describe("R2 client credentials", () => {
-  test("credentials are read from the environment only, and never partially", () => {
+  test("credentials are read from the environment or the private file, and never partially", () => {
     const original = { ...process.env };
+    // Point the lookup at a path that does not exist so this test is hermetic: the
+    // developer's real .r2-credentials.json (if present) must not leak into it.
+    process.env.COMPANYINTEL_R2_CREDENTIALS = join(tmpdir(), "companyintel-no-such-credentials.json");
     delete process.env.R2_ACCOUNT_ID;
     delete process.env.R2_ACCESS_KEY_ID;
     delete process.env.R2_SECRET_ACCESS_KEY;
+    delete process.env.CLOUDFLARE_ACCOUNT_ID;
+    delete process.env.R2_ENDPOINT_URL;
+    delete process.env.R2_BUCKET_NAME;
+    resetCredentialCache();
     expect(credentialsFromEnv("company-intel-data")).toBeNull();
 
     process.env.R2_ACCOUNT_ID = "acct";
     process.env.R2_ACCESS_KEY_ID = "key";
-    expect(credentialsFromEnv()).toBeNull(); // missing secret ⇒ no credentials
+    // Missing secret ⇒ no credentials, and an incomplete environment is refused
+    // rather than silently falling back to the private file.
+    expect(() => credentialsFromEnv()).toThrow(/Incomplete R2 environment credentials/);
     process.env.R2_SECRET_ACCESS_KEY = "secret";
     expect(credentialsFromEnv("company-intel-data")?.bucket).toBe("company-intel-data");
+    expect(credentialsFromEnv("company-intel-data")?.secretAccessKey).toBe("secret");
 
     process.env = original;
+    resetCredentialCache();
   });
 });
 

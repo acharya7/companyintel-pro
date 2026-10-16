@@ -123,6 +123,8 @@ export interface PreflightReport {
   cpuCount: number;
   estimatedRows: number | null;
   estimatedDurationSeconds: number | null;
+  /** Records per source when this is a `--sample` report, else null. */
+  sampleLimit: number | null;
   warnings: string[];
 }
 
@@ -138,7 +140,24 @@ function sourceContextFor(config: IndexerConfig): SourceContext {
 /* Preflight                                                                  */
 /* -------------------------------------------------------------------------- */
 
-export async function preflight(config: IndexerConfig, context: SourceContext = sourceContextFor(config)): Promise<PreflightReport> {
+export interface PreflightOptions {
+  /**
+   * Records per source for a `--sample` run.
+   *
+   * A sample reads only the first N records of each source — a few megabytes even
+   * for a 50 GB object — so its temporary-space and duration estimates must be
+   * based on those N rows, not on the full input size. Without this, a sample run
+   * would be refused on a machine that cannot hold the 60 GB job, which is exactly
+   * the machine a sample run is for.
+   */
+  sampleLimit?: number;
+}
+
+export async function preflight(
+  config: IndexerConfig,
+  context: SourceContext = sourceContextFor(config),
+  options: PreflightOptions = {},
+): Promise<PreflightReport> {
   const sources: PreflightReport["sources"] = [];
   let totalInputBytes = 0;
   const warnings: string[] = [];
@@ -155,13 +174,21 @@ export async function preflight(config: IndexerConfig, context: SourceContext = 
 
   const freeDiskBytes = await freeDiskBytesFor(config.workDir);
   // Spool rows are the dominant temporary cost; output is compressed JSON.
-  const estimatedWorkBytes = Math.round(totalInputBytes * 1.1) + 256 * 1024 * 1024;
-  const estimatedOutputBytes = Math.round(totalInputBytes * 0.12);
+  // A sample run spools only `sampleLimit` rows per source, so it is estimated
+  // from the row count instead of from the (much larger) input size.
+  const sampleRows = options.sampleLimit === undefined ? null : options.sampleLimit * config.sources.length;
+  const spoolBytes = sampleRows === null ? Math.round(totalInputBytes * 1.1) : Math.round(sampleRows * BYTES_PER_SPOOL_ROW);
+  const estimatedWorkBytes = spoolBytes + (sampleRows === null ? 256 * 1024 * 1024 : 64 * 1024 * 1024);
+  const estimatedOutputBytes = sampleRows === null ? Math.round(totalInputBytes * 0.12) : Math.round(spoolBytes * 0.3);
+  const estimatedRows = sampleRows;
+  const estimatedDurationSeconds = sampleRows === null ? null : sampleRows / ROWS_PER_SECOND_BASELINE;
   const cpuCount = cpus().length || 1;
 
   if (freeDiskBytes !== null && freeDiskBytes < estimatedWorkBytes) {
     warnings.push(
-      `Temporary space looks insufficient: about ${(freeDiskBytes / 1e9).toFixed(1)} GB free vs ${(estimatedWorkBytes / 1e9).toFixed(1)} GB estimated for spooling.`,
+      `Temporary space looks insufficient: about ${(freeDiskBytes / 1e9).toFixed(1)} GB free vs ${(estimatedWorkBytes / 1e9).toFixed(1)} GB estimated for spooling${
+        sampleRows === null ? "" : ` in a ${options.sampleLimit?.toLocaleString()}-record sample per source`
+      }.`,
     );
   }
   if (freemem() < 1024 * 1024 * 1024) {
@@ -176,8 +203,9 @@ export async function preflight(config: IndexerConfig, context: SourceContext = 
     estimatedOutputBytes,
     memoryBytes: { free: freemem(), total: totalmem() },
     cpuCount,
-    estimatedRows: null,
-    estimatedDurationSeconds: null,
+    estimatedRows,
+    estimatedDurationSeconds,
+    sampleLimit: options.sampleLimit ?? null,
     warnings,
   };
 }
@@ -320,8 +348,10 @@ export interface RunResult {
 interface SpoolRow {
   /** Every identifier key this row carries (strongest first). */
   keys: string[];
-  /** Partition bucket = strongest identifier, so related rows share a partition. */
+  /** Strongest identifier of this row (used as its provisional company identity). */
   bucket: string;
+  /** Partition this row was spooled into (the normalized name — see mapping.ts). */
+  partitionKey: string;
   strong: boolean;
   normalizedName: string;
   company: RawCompanyInput;
@@ -336,7 +366,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     cacheDir: config.rawCacheDir === undefined ? undefined : config.rawCacheDir,
     onNotice: (message) => options.onProgress?.({ stage: "preflight", message, rowsRead: 0, rowsRejected: 0, companies: 0, contacts: 0, progress: null, rowsPerSecond: null, etaSeconds: null }),
   });
-  const report = await preflight(config, sourceContext);
+  const report = await preflight(config, sourceContext, { sampleLimit: options.sampleLimit });
   const emit = (event: Partial<ProgressEvent> & { stage: ProgressEvent["stage"]; message: string }) =>
     options.onProgress?.({
       rowsRead: 0,
@@ -382,12 +412,19 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       }
     }
     columnMaps.push(map);
+    // Report the columns that are STILL unmapped after the config overrides were
+    // applied, not the raw profiler view: the profiler cannot know about
+    // `source.columns`, so printing its list would show a mapping as missing in a
+    // file where the operator explicitly mapped it.
+    const mappedIndexes = new Set(Object.values(map));
+    const unmappedHeaders = profile.headers.filter((_, index) => !mappedIndexes.has(index));
+    const missingCanonical = ALL_CANONICAL_FIELDS.filter((field) => map[field] === undefined);
     emit({
       stage: "profiling",
-      message: `profiled ${source.id}: ${profile.headers.length} columns, ${profile.unmappedHeaders.length} unmapped, ${profile.missingCanonicalFields.length} canonical fields absent`,
+      message: `profiled ${source.id}: ${profile.headers.length} columns, ${unmappedHeaders.length} unmapped, ${missingCanonical.length} canonical fields absent`,
     });
-    if (profile.unmappedHeaders.length) {
-      emit({ stage: "profiling", message: `  unmapped in ${source.id}: ${profile.unmappedHeaders.slice(0, 12).join(", ")}` });
+    if (unmappedHeaders.length) {
+      emit({ stage: "profiling", message: `  unmapped in ${source.id}: ${unmappedHeaders.slice(0, 12).join(", ")}` });
     }
   }
 
@@ -451,10 +488,13 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
 
         const contactInput = extractContactInput(record.fields, map);
         const keys = companyKeysFromInput(companyInput, source.id);
-        const partition = partitionFor(keys.bucket, config.partitions);
+        // Partition by the normalized name, so a company row and the contact rows
+        // that name it are resolved in the same partition (see mapping.ts).
+        const partition = partitionFor(keys.partitionKey, config.partitions);
         const row: SpoolRow = {
           keys: keys.all,
           bucket: keys.bucket,
+          partitionKey: keys.partitionKey,
           strong: keys.strong,
           normalizedName: keys.normalizedName,
           company: companyInput,
@@ -503,9 +543,11 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
 
   let globalRef = 0;
   let companyBuffer: Company[] = [];
+  /** Ref of the first company in the current buffer (the object's `firstRef`). */
   let companyBufferStart = 0;
   let contactBuffer = new Map<number, Contact[]>();
-  let contactBufferStart = 0;
+  /** Object index currently being buffered, not a ref — see `flushContacts`. */
+  let contactBufferBucket = 0;
   let companyPartitionIndex = 0;
   let contactPartitionIndex = 0;
 
@@ -521,7 +563,13 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     if (!contactBuffer.size) return;
     const byCompany: Record<string, Contact[]> = {};
     for (const [ref, contacts] of contactBuffer) byCompany[String(ref)] = contacts;
-    const payload: ContactPartitionPayload = { firstRef: contactBufferStart, byCompany };
+    // `firstRef` must be the first ref in this object, and the object index must
+    // be derivable from it: the reader locates a company's contacts with
+    // `contactPartitionOfRef(ref) = floor(ref / companiesPerContactPartition)`.
+    const payload: ContactPartitionPayload = {
+      firstRef: contactBufferBucket * SHARDING.companiesPerContactPartition,
+      byCompany,
+    };
     await writer.writeJson(folderFor("contacts", config.datasetVersion, contactPartitionIndex), payload);
     contactPartitionIndex += 1;
     contactBuffer = new Map();
@@ -552,7 +600,13 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     for await (const line of lines) {
       if (!line.trim()) continue;
       const row = JSON.parse(line) as SpoolRow;
-      const decision = resolver.resolve({ all: row.keys, bucket: row.bucket, strong: row.strong, normalizedName: row.normalizedName });
+      const decision = resolver.resolve({
+        all: row.keys,
+        bucket: row.bucket,
+        partitionKey: row.partitionKey ?? `n:${row.normalizedName}`,
+        strong: row.strong,
+        normalizedName: row.normalizedName,
+      });
       let group = groups.get(decision.ref);
       if (!group) {
         group = {
@@ -655,15 +709,26 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
         await shardWriter.write("ids", shardOf(contact.id, config.shards.ids), contact.id, globalRef, 255);
       }
 
+      // Record where this object starts: the reader hydrates a candidate with
+      // `payload.companies[ref - payload.firstRef]`, so every object other than the
+      // first MUST carry its own firstRef (it was 0 for all of them, which silently
+      // made every company after the first partition unhydratable at scale).
+      if (!companyBuffer.length) companyBufferStart = globalRef;
       companyBuffer.push(company);
       if (companyBuffer.length >= SHARDING.companiesPerPartition) await flushCompanies();
 
+      // The reader derives a company's contact object from its ref alone
+      // (`contactPartitionOfRef`), so the object that holds ref R must be
+      // `floor(R / companiesPerContactPartition)` — exactly. The flush therefore
+      // has to happen BEFORE this ref's contacts are added: adding first put the
+      // first company of every block into the previous object, where the reader
+      // never looks for it (its contacts were unreachable in production).
       const bucket = Math.floor(globalRef / SHARDING.companiesPerContactPartition);
-      if (contacts.length) contactBuffer.set(globalRef, contacts);
-      if (bucket !== contactBufferStart) {
+      if (bucket !== contactBufferBucket) {
         await flushContacts();
-        contactBufferStart = bucket;
+        contactBufferBucket = bucket;
       }
+      if (contacts.length) contactBuffer.set(globalRef, contacts);
 
       globalRef += 1;
       counters.uniqueCompanies += 1;
@@ -696,7 +761,12 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     for (let shard = 0; shard < shards; shard += 1) {
       const linesPath = join(shardDir, `${kind}/${String(shard).padStart(4, "0")}.lines`);
       if (!existsSync(linesPath)) continue;
-      const terms: Record<string, Postings> = {};
+      // Null-prototype on purpose: `term` is a company name fragment, so a plain
+      // object literal would resolve a company called "Constructor" to
+      // `Object.prototype.constructor` (truthy, but with no `.refs`) and crash the
+      // run mid-way — the same class of bug as the abbreviation lookup in
+      // `src/shared/normalize.ts`.
+      const terms = Object.create(null) as Record<string, Postings>;
       const lastRef = new Map<string, number>();
       const lines = createInterface({ input: createReadStream(linesPath), crlfDelay: Infinity });
       for await (const line of lines) {

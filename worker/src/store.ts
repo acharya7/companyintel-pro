@@ -14,7 +14,7 @@
 
 import type { Company, Contact, DatasetStats, DatasetVersionSummary, SavedLead, SavedSearch, UserSettings, ActivityEntry } from "../../src/shared/models";
 import { R2_PREFIX, leadShardKey, statsKey, activeManifestKey, companyPartitionKey, contactPartitionKey, exportMetaKey, exportObjectKey, indexDirectoryKey, indexShardKey, manifestKey, partitionOfRef, contactPartitionOfRef, savedSearchesKey, settingsKey, activityKey, validationKey, progressKey, type IndexDirectory, type ShardPayload, type IndexKind, type CompanyPartitionPayload, type ContactPartitionPayload } from "../../src/shared/search/index-format";
-import { SHARDING, snapshotKey } from "../../src/shared/search/index-format";
+import { SHARDING, contactsFor, snapshotKey } from "../../src/shared/search/index-format";
 import { shardOf } from "../../src/shared/hash";
 
 export const LEAD_SHARDS = 64;
@@ -229,7 +229,9 @@ export class R2Store {
     const partition = contactPartitionOfRef(ref);
     const payload = await this.getJson<ContactPartitionPayload>(contactPartitionKey(version, partition));
     if (!payload) return [];
-    return (payload.byCompany[String(ref)] as Contact[] | undefined) ?? [];
+    // `contactsFor` does the own-property lookup: a parsed payload must never
+    // answer from `Object.prototype`.
+    return (contactsFor(payload, ref) as Contact[] | undefined) ?? [];
   }
 
   /* ----------------------------- app data --------------------------------- */
