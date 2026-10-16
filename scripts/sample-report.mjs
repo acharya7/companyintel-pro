@@ -179,6 +179,17 @@ if (association.contacts.total && association.associationRate < 0.5) {
   );
 }
 if (manifest.validationPassed === false) report.notes.push("The run's own validation did NOT pass — investigate before trusting these numbers.");
+// This report counts the shape of the name-join risk; it does not classify it.
+// Point the operator at the tool that does, so the next step is one command away.
+const ambiguousCompanies = association.companies?.ambiguous ?? 0;
+const contactsOnNameOnly = association.contacts?.onNameOnlyCompany ?? 0;
+if (ambiguousCompanies > 0 || contactsOnNameOnly > 0) {
+  report.notes.push(
+    `${ambiguousCompanies} ambiguous companies and ${contactsOnNameOnly} contact(s) on name-only companies: ` +
+      "this report counts the risk of the name-only join, it does not classify it. Run " +
+      "`bun run index:audit` for the per-association evidence (confirmed / plausible / unresolved / conflict).",
+  );
+}
 
 if (asJson) console.log(JSON.stringify(report, null, 2));
 else console.log(formatSampleReport(report));

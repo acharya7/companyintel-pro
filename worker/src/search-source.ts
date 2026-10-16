@@ -53,6 +53,17 @@ const STAGE_WEIGHT: Record<RetrievalKind, number> = {
 export class R2CandidateSource implements CandidateSource {
   readonly kind = "r2" as const;
   private readonly cheap = new Map<DocRef, number>();
+  /**
+   * Strongest retrieval evidence seen for each candidate: the stage and the
+   * exact index term that produced it.
+   *
+   * Recorded because a diagnostic has to be able to answer "why is THIS company
+   * in the result set" — a question no amount of scoring can answer, since by
+   * then the retrieval evidence is gone. The weakest stage wins the tie (a doc
+   * found by the exact index and by a trigram is reported as exact), because the
+   * strongest evidence is what justifies the match.
+   */
+  private readonly stageEvidence = new Map<DocRef, { kind: RetrievalKind; term: string }>();
   // Null-prototype: keys are query terms, and a term such as "constructor" must
   // not read through to `Object.prototype`.
   private readonly observedDf: Record<string, number> = Object.create(null) as Record<string, number>;
@@ -79,6 +90,15 @@ export class R2CandidateSource implements CandidateSource {
    * records that distinction instead of leaving the engine to guess from counts.
    */
   private budgetHit = false;
+  /**
+   * Logical reads this search asked for, reset by `beginSearch`.
+   *
+   * These are *requests*, not R2 GETs: a shard or partition served from the
+   * isolate cache is counted here but costs no R2 request. Reporting both is
+   * what lets the API show what the cache saved for a query.
+   */
+  private shardRequests = 0;
+  private partitionRequests = 0;
 
   constructor(
     private readonly store: ShardReader,
@@ -102,6 +122,24 @@ export class R2CandidateSource implements CandidateSource {
     this.hydratedPartitions.clear();
     this.byId.clear();
     this.budgetHit = false;
+    this.shardRequests = 0;
+    this.partitionRequests = 0;
+    this.stageEvidence.clear();
+  }
+
+  /** Stage + term that retrieved a candidate during the most recent search. */
+  stageEvidenceOf(ref: DocRef): { kind: RetrievalKind; term: string } | undefined {
+    return this.stageEvidence.get(ref);
+  }
+
+  /** Shard objects this search asked for (cache-served or R2). */
+  get shardReads(): number {
+    return this.shardRequests;
+  }
+
+  /** Company partitions this search asked for (cache-served or R2). */
+  get partitionReads(): number {
+    return this.partitionRequests;
   }
 
   /** True once the per-search partition cap has dropped at least one candidate. */
@@ -125,6 +163,9 @@ export class R2CandidateSource implements CandidateSource {
 
     const counts = new Map<DocRef, { matches: number; quality: number }>();
     const shardEntries = [...byShard.entries()];
+    // One request per distinct shard, counted before the read so a cache hit
+    // still shows up as a request that did not become an R2 GET.
+    this.shardRequests += shardEntries.length;
     await mapLimit(shardEntries, 8, async ([shard, shardTerms]) => {
       const payload = await this.store.getShard(this.datasetVersion, kind, shard);
       if (!payload) return;
@@ -141,6 +182,12 @@ export class R2CandidateSource implements CandidateSource {
           entry.matches += 1;
           entry.quality += q;
           counts.set(ref, entry);
+          // Keep the strongest stage that mentioned this ref, so a later (weaker)
+          // stage cannot downgrade the evidence a diagnostic reports.
+          const previous = this.stageEvidence.get(ref);
+          if (!previous || STAGE_WEIGHT[kind] > STAGE_WEIGHT[previous.kind]) {
+            this.stageEvidence.set(ref, { kind, term });
+          }
         }
       }
     });
@@ -211,7 +258,20 @@ export class R2CandidateSource implements CandidateSource {
     return this.byId.get(id);
   }
 
-  private async hydrateRefs(refs: DocRef[], maxPartitions: number = SHARDING.maxHydrate): Promise<SearchDoc[]> {
+  /**
+   * Hydrate refs and keep the ref each document came from.
+   *
+   * `docs()` throws the mapping away (the engine scores documents, not refs), but
+   * a diagnostic needs to say "candidate ref 12345 came from the trigram index on
+   * term `zzq` and resolved to this company", and hydration returns documents in
+   * its own score order rather than the caller's. Keeping the pair here is what
+   * lets `scripts/explain-query.mjs` attribute a result to retrieval evidence
+   * instead of guessing.
+   */
+  private async hydrateRefsWithRefs(
+    refs: DocRef[],
+    maxPartitions: number = SHARDING.maxHydrate,
+  ): Promise<{ ref: DocRef; doc: SearchDoc }[]> {
     const ordered = [...refs].sort((a, b) => (this.cheap.get(b) ?? 0) - (this.cheap.get(a) ?? 0)).slice(0, SHARDING.maxScored);
 
     const found = new Map<DocRef, SearchDoc>();
@@ -241,6 +301,11 @@ export class R2CandidateSource implements CandidateSource {
     }
 
     if (read.length) {
+      // Count the partitions this call is about to ask for (the store caps the
+      // number it actually fetches, and reports back through `budgetHit`).
+      const asked = new Set<number>();
+      for (const ref of read) asked.add(partitionOfRef(ref));
+      this.partitionRequests += asked.size;
       const companies = await this.store.getCompaniesByRefs(this.datasetVersion, read, maxPartitions);
       for (const partition of fresh) this.hydratedPartitions.add(partition);
       for (const ref of read) {
@@ -253,12 +318,12 @@ export class R2CandidateSource implements CandidateSource {
       }
     }
 
-    const docs: SearchDoc[] = [];
+    const pairs: { ref: DocRef; doc: SearchDoc }[] = [];
     for (const ref of ordered) {
       const doc = found.get(ref);
-      if (doc) docs.push(doc);
+      if (doc) pairs.push({ ref, doc });
     }
-    return docs;
+    return pairs;
   }
 
   /**
@@ -273,8 +338,14 @@ export class R2CandidateSource implements CandidateSource {
     return (this.cheap.get(ref) ?? 0) >= STAGE_WEIGHT.prefix ? "strong" : "weak";
   }
 
-  docs(refs: DocRef[], options?: { maxPartitions?: number }): Promise<SearchDoc[]> {
-    return this.hydrateRefs(refs, options?.maxPartitions ?? SHARDING.maxHydrate);
+  async docs(refs: DocRef[], options?: { maxPartitions?: number }): Promise<SearchDoc[]> {
+    const pairs = await this.hydrateRefsWithRefs(refs, options?.maxPartitions ?? SHARDING.maxHydrate);
+    return pairs.map((pair) => pair.doc);
+  }
+
+  /** Same hydration, with the document ref kept next to each document. */
+  docsWithRefs(refs: DocRef[], options?: { maxPartitions?: number }): Promise<{ ref: DocRef; doc: SearchDoc }[]> {
+    return this.hydrateRefsWithRefs(refs, options?.maxPartitions ?? SHARDING.maxHydrate);
   }
 
   async stats(): Promise<{ docCount: number; df: Record<string, number> }> {

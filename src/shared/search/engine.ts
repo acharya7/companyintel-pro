@@ -115,12 +115,19 @@ export interface SearchOptions {
   maxHydrate?: number;
   /**
    * When the page is still short *and the partition budget was what cut the
-   * candidate list short*, spend a second (doubled) budget to fill it. Default
+   * candidate list short*, spend a larger (doubled) budget to fill it. Default
    * true; set false to measure or to hold a hard byte ceiling for every query.
    * See `ADAPTIVE_HYDRATE_FACTOR`. A source that cannot report
-   * `hydrationBudgetHit` never takes the second pass.
+   * `hydrationBudgetHit` never takes the retry at all.
    */
   adaptiveHydration?: boolean;
+  /**
+   * How many doublings the adaptive ladder may take (default
+   * `ADAPTIVE_HYDRATE_MAX_STEPS`, so 16 → 32 → 64). Exposed so a benchmark can
+   * measure the previous single-retry behaviour against the current ladder on the
+   * same index instead of re-running an older build.
+   */
+  adaptiveHydrateSteps?: number;
 }
 
 /** Relevance values inside the same band are treated as equal for ordering. */
@@ -149,9 +156,9 @@ export const HYDRATE_BATCH = 32;
 export const WEAK_CEILING = 0.95;
 
 /**
- * How much the hydration budget is raised for a second pass when the requested
- * page is still short (`maxHydrate` → `2 × maxHydrate`, capped by
- * `SEARCH_LIMITS.maxHydrate`).
+ * How much the hydration budget is raised for the next attempt when the
+ * requested page is still short (`maxHydrate` → `2 × maxHydrate` → `4 × maxHydrate`,
+ * capped by `SEARCH_LIMITS.maxHydrate`).
  *
  * This is the completeness dial: broad, low-precision queries are exactly the
  * ones whose matches are spread over more partitions than the first budget
@@ -163,6 +170,24 @@ export const WEAK_CEILING = 0.95;
  * in `scripts/benchmark-hydration.mjs` against a real-data index.
  */
 export const ADAPTIVE_HYDRATE_FACTOR = 2;
+
+/**
+ * How many times the budget may be doubled (16 → 32 → 64 with the defaults).
+ *
+ * Two steps, not one, because the measured real-data benchmark showed the
+ * single retry still losing rows: `adaptive 16→32` returned exactly what
+ * `fixed 32` returned — 10 rows short of the reference — while `fixed 64`
+ * matched it. A ladder that keeps doubling until the page fills *or the
+ * candidate list is exhausted* reaches the same completeness as the 64-partition
+ * budget for the queries that need it, and still costs one round of reads for
+ * the queries that do not. `SEARCH_LIMITS.maxHydrate` bounds the ladder, so the
+ * work per search stays strictly bounded no matter how the ladder is configured.
+ *
+ * Each step is a *retry of the same candidate list with a bigger cap*, and the
+ * source memoises what it has already read, so a step never re-reads a partition
+ * (asserted by `tests/search-funnel.test.ts` and `tests/search-cache.test.ts`).
+ */
+export const ADAPTIVE_HYDRATE_MAX_STEPS = 2;
 
 /** Hard ceilings — also enforced server-side in the Worker. */
 export const SEARCH_LIMITS = {
@@ -218,6 +243,32 @@ export function prepareQuery(rawQuery: string) {
   return { query, normalizedQuery, variants, queryTokens, grams };
 }
 
+/** Max query tokens sent to the token index (the rarest ones). */
+export const MAX_TOKEN_QUERIES = 10;
+
+/**
+ * The exact term lists each retrieval stage is asked for.
+ *
+ * Exported (and used by `searchCompanies` itself) so a diagnostic — the search
+ * benchmark and `scripts/explain-query.mjs` — can replay the *same* retrieval a
+ * real query performs instead of re-deriving it. Two definitions of "what terms
+ * does this query look up" would eventually disagree, and the tool that exists
+ * to explain a surprising result would be the one lying.
+ */
+export function prefixQueriesFor(normalizedQuery: string, variants: string[]): string[] {
+  return uniqueInOrder([normalizedQuery, compact(normalizedQuery), ...variants])
+    .filter((v) => v.length >= 1)
+    .slice(0, SEARCH_LIMITS.maxPrefixQueries);
+}
+
+export function tokenQueriesFor(queryTokens: string[], df: Record<string, number> | null): string[] {
+  return rarestFirst(queryTokens, df, MAX_TOKEN_QUERIES);
+}
+
+export function trigramQueriesFor(grams: string[], df: Record<string, number> | null): string[] {
+  return rarestFirst(grams, df, SEARCH_LIMITS.maxTrigrams);
+}
+
 /** Prefer rare grams/tokens when the source can report document frequencies. */
 function rarestFirst(values: string[], df: Record<string, number> | null, limit: number): string[] {
   const unique = uniqueInOrder(values);
@@ -253,7 +304,39 @@ export async function searchCompanies(
   const maxHydrate = clamp(Math.floor(options.maxHydrate ?? SEARCH_LIMITS.defaultHydrate), 1, SEARCH_LIMITS.maxHydrate);
 
   const { query, normalizedQuery, variants, queryTokens, grams } = prepareQuery(rawQuery);
-  const retrieval = { exact: 0, prefix: 0, token: 0, trigram: 0, scored: 0, cached: false };
+  /**
+   * Per-search retrieval/hydration diagnostics, returned to the caller.
+   *
+   * Every field is a measurement of this search, never an estimate: the counters
+   * the engine owns (`candidates`, `truncated`, stage counts) and, for the R2
+   * source, what the source itself observed (`budgetLimited`). `scored` counts
+   * hydrated-and-accepted documents, which is what the CPU bound applies to.
+   */
+  const retrieval = {
+    exact: 0,
+    prefix: 0,
+    token: 0,
+    trigram: 0,
+    scored: 0,
+    cached: false,
+    /** Unique candidate refs the four stages produced (before the CPU budget). */
+    candidates: 0,
+    /** Candidates dropped by `resultBudget` — the only place a rank can be lost. */
+    truncated: 0,
+    /** Hydration sweeps run for this search (1, plus one per adaptive retry). */
+    hydrationPasses: 0,
+    /** Final partition budget the last sweep used. */
+    hydrateBudget: 0,
+    /** True when a partition cap dropped a candidate the source actually held. */
+    budgetLimited: false,
+    /** True when the token/trigram stages were skipped because whole-name evidence sufficed. */
+    fuzzyDeferred: false,
+    /** True when those skipped stages had to be run after all (a short page). */
+    fuzzyRecovered: false,
+  };
+
+  /** Candidates that must be found before another page row is known to exist. */
+  const rowsToFillPage = (page - 1) * pageSize + pageSize + 1;
 
   const empty = (message: string): CompanySearchResponse => ({
     query,
@@ -292,37 +375,73 @@ export async function searchCompanies(
   add(exactRefs);
 
   // Prefix retrieval also covers short queries, where trigrams are useless.
-  const prefixQueries = uniqueInOrder([normalizedQuery, compact(normalizedQuery), ...variants])
-    .filter((v) => v.length >= 1)
-    .slice(0, SEARCH_LIMITS.maxPrefixQueries);
+  const prefixQueries = prefixQueriesFor(normalizedQuery, variants);
   if (prefixQueries.length) {
     const prefixRefs = await source.prefix(prefixQueries, retrievalBudget);
     retrieval.prefix = prefixRefs.length;
     add(prefixRefs);
   }
 
-  if (queryTokens.length && normalizedQuery.length >= 3) {
-    const tokenQueries = rarestFirst(queryTokens, df, 10);
-    const tokenRefs = await source.tokens(tokenQueries, retrievalBudget);
-    retrieval.token = tokenRefs.length;
-    add(tokenRefs);
-  }
+  /** Token + trigram retrieval — the fuzzy workhorse, and the most R2 reads. */
+  const runFuzzyRetrieval = async (): Promise<void> => {
+    if (queryTokens.length && normalizedQuery.length >= 3) {
+      const tokenQueries = tokenQueriesFor(queryTokens, df);
+      const tokenRefs = await source.tokens(tokenQueries, retrievalBudget);
+      retrieval.token = tokenRefs.length;
+      add(tokenRefs);
+    }
 
-  if (fuzzy && normalizedQuery.length >= 3) {
-    const gramQueries = rarestFirst(grams, df, SEARCH_LIMITS.maxTrigrams);
-    const trigramRefs = await source.trigrams(gramQueries, retrievalBudget);
-    retrieval.trigram = trigramRefs.length;
-    add(trigramRefs);
-  }
+    if (fuzzy && normalizedQuery.length >= 3) {
+      const gramQueries = trigramQueriesFor(grams, df);
+      const trigramRefs = await source.trigrams(gramQueries, retrievalBudget);
+      retrieval.trigram = trigramRefs.length;
+      add(trigramRefs);
+    }
+  };
 
-  const budgetedRefs = [...candidates].slice(0, resultBudget);
+  /*
+   * Whole-name gating.
+   *
+   * Exact and prefix postings are whole-name evidence: a candidate they produce
+   * can score 1.0 or an alias/prefix value, and a query that has that many of
+   * them does not need the fuzzy stages to fill its page. Skipping them saves up
+   * to 24 shard reads (10 token + 14 trigram) for exactly the query shape that is
+   * most common — a real company name — while a query with a typo, a partial word
+   * or a rare name produces few or no whole-name candidates and still gets them.
+   *
+   * It is a *deferral*, not a decision: if hydration cannot fill the page from
+   * the whole-name candidates alone, the skipped stages run before the search
+   * returns (see the recovery step below), so completeness is unchanged.
+   */
+  const wholeNameCandidates = candidates.size;
+  const deferFuzzy = fuzzy && wholeNameCandidates >= rowsToFillPage;
+  retrieval.fuzzyDeferred = deferFuzzy;
+  if (!deferFuzzy) await runFuzzyRetrieval();
+
+  /**
+   * The candidate list at this instant, cut to the CPU budget.
+   *
+   * Re-derived (rather than captured once) because the deferred fuzzy stages can
+   * append to `candidates` after the first hydration sweep. The cut is not
+   * arbitrary: retrieval appends in descending evidence strength (exact → prefix
+   * → token → trigram) and each source returns its own candidates best-first, so
+   * what the budget drops is always the weakest evidence — never a strong
+   * candidate in favour of a weak one. `truncated` reports how many were dropped,
+   * so the API can say the result count is a floor rather than a total.
+   */
+  const budgetedRefs = (): DocRef[] => [...candidates].slice(0, resultBudget);
 
   /* ---------------------------- Stage 2: ranking --------------------------- */
 
   const minScore = minScoreFor(normalizedQuery.length);
   // Computed once and reused for every candidate (see score.ts).
   const queryTrigrams = trigramSet(normalizedQuery);
-  const scored: { doc: SearchDoc; hit: Omit<CompanySearchHit, "id" | "name"> & { id: string; name: string } }[] = [];
+  const scored: {
+    doc: SearchDoc;
+    hit: Omit<CompanySearchHit, "id" | "name"> & { id: string; name: string };
+    /** Domain-label evidence (0..2) — a tie-break inside a relevance band. */
+    identity: number;
+  }[] = [];
   /** Lowest relevance accepted so far — drives the early-stop barrier. */
   let worstRelevance = Infinity;
   let hydrated = 0;
@@ -340,6 +459,7 @@ export async function searchCompanies(
     if (result.score < worstRelevance) worstRelevance = result.score;
     scored.push({
       doc,
+      identity: result.detail.identityEvidence,
       hit: {
         id: doc.id,
         name: doc.name,
@@ -356,10 +476,9 @@ export async function searchCompanies(
 
   // Candidates arrive best-first, grouped by retrieval strength. Hydrate one
   // run of candidates per tier so the barrier below can be tested on a whole
-  // tier instead of a mixed batch.
-  // `start` (below) is the first row of the requested page; one extra row is
-  // needed to know whether another page exists.
-  const rowsToFillPage = (page - 1) * pageSize + pageSize + 1;
+  // tier instead of a mixed batch. `rowsToFillPage` (defined with the retrieval
+  // budgets) is the first row of the requested page plus the one extra row that
+  // tells the caller whether another page exists.
   const pageFull = () => scored.length >= rowsToFillPage;
 
   /** Documents already hydrated, so a second pass can never score one twice. */
@@ -373,15 +492,19 @@ export async function searchCompanies(
    * rather than on a mixed batch.
    */
   const hydrateCandidates = async (maxPartitions: number): Promise<void> => {
+    // Snapshot the candidate list for this sweep: a later sweep sees a list that
+    // may have grown (deferred fuzzy retrieval), and walking a live list while
+    // it is being appended to would make the tier runs inconsistent.
+    const refs = budgetedRefs();
     let cursor = 0;
-    while (cursor < budgetedRefs.length) {
-      const tier = source.tierOf ? source.tierOf(budgetedRefs[cursor]) : "strong";
+    while (cursor < refs.length) {
+      const tier = source.tierOf ? source.tierOf(refs[cursor]) : "strong";
       let end = cursor + 1;
       if (source.tierOf) {
-        while (end < budgetedRefs.length && source.tierOf(budgetedRefs[end]) === tier) end += 1;
+        while (end < refs.length && source.tierOf(refs[end]) === tier) end += 1;
       } else {
         // A source without tier knowledge keeps the original single-pass contract.
-        end = budgetedRefs.length;
+        end = refs.length;
       }
 
       // Early stop: every hit found so far scores strictly above what a
@@ -395,7 +518,7 @@ export async function searchCompanies(
       }
 
       for (let from = cursor; from < end; from += HYDRATE_BATCH) {
-        const batch = budgetedRefs.slice(from, Math.min(end, from + HYDRATE_BATCH));
+        const batch = refs.slice(from, Math.min(end, from + HYDRATE_BATCH));
         if (!batch.length) continue;
         /*
          * The whole run is asked for again on a retry pass, deliberately: the
@@ -418,30 +541,71 @@ export async function searchCompanies(
     }
   };
 
-  await hydrateCandidates(maxHydrate);
+  /** One hydration sweep, counted so the diagnostics can report the real retries. */
+  const sweep = async (maxPartitions: number): Promise<void> => {
+    retrieval.hydrationPasses += 1;
+    retrieval.hydrateBudget = maxPartitions;
+    await hydrateCandidates(maxPartitions);
+  };
 
-  // Adaptive second pass: a page that is still short is the one case where more
-  // bytes are worth spending, because the user is looking at an incomplete
+  await sweep(maxHydrate);
+
+  // Adaptive hydration ladder: a page that is still short is the one case where
+  // more bytes are worth spending, because the user is looking at an incomplete
   // result list. It re-walks the same candidate order with a doubled partition
-  // budget and costs nothing at all for the common case where the first pass
-  // already filled the page, or where the first pass had budget to spare (then
-  // more reads could not have found anything — `hydrationBudgetHit`).
+  // budget each time and costs nothing at all for the common case where a sweep
+  // already filled the page, or where the sweep had budget to spare (then more
+  // reads could not have found anything — `hydrationBudgetHit`).
   //
-  // Measured on the real-data sample (`scripts/benchmark-hydration.mjs`): this
-  // recovers every row the fixed 16-partition budget lost on broad queries
-  // (20 of 20 here) and pays for it only on short pages — ~2× the reads of that
-  // query, once, never more than `SEARCH_LIMITS.maxHydrate` partitions. A
-  // query whose true match count is below the page size pays it on every
-  // search; the only way to avoid that is to know the count before reading,
-  // which is a v3 format question, not a tuning one.
-  const adaptiveCeiling = Math.min(maxHydrate * ADAPTIVE_HYDRATE_FACTOR, SEARCH_LIMITS.maxHydrate);
+  // Two rungs (`ADAPTIVE_HYDRATE_MAX_STEPS`), because the measured real-data
+  // benchmark showed one retry still losing rows: `adaptive 16→32` returned
+  // exactly `fixed 32` — 10 rows short of the reference — while `fixed 64`
+  // matched it. The ladder stops as soon as the page fills, so it reaches the
+  // completeness of the 64-partition budget for the queries that need it and
+  // still costs a single round of reads for the queries that do not. It never
+  // exceeds `SEARCH_LIMITS.maxHydrate` partitions for one search, and every step
+  // after the first is spent only on partitions the previous step could not
+  // read (the source memoises), so no partition is ever read twice.
   const adaptive = options.adaptiveHydration ?? true;
-  const budgetWasTheLimit = source.hydrationBudgetHit?.() ?? false;
-  if (adaptive && budgetWasTheLimit && !pageFull() && hydrated < budgetedRefs.length && adaptiveCeiling > maxHydrate) {
-    await hydrateCandidates(adaptiveCeiling);
+  const adaptiveSteps = clamp(Math.floor(options.adaptiveHydrateSteps ?? ADAPTIVE_HYDRATE_MAX_STEPS), 0, ADAPTIVE_HYDRATE_MAX_STEPS);
+  let budgetLimited = source.hydrationBudgetHit?.() ?? false;
+  if (adaptive) {
+    for (let step = 0; step < adaptiveSteps; step += 1) {
+      if (stoppedEarly || pageFull() || !budgetLimited) break;
+      // Nothing left to hydrate: a bigger cap cannot add a row the candidate
+      // list does not contain, and re-walking it would only cost CPU.
+      if (hydrated >= budgetedRefs().length) break;
+      const next = Math.min(retrieval.hydrateBudget * ADAPTIVE_HYDRATE_FACTOR, SEARCH_LIMITS.maxHydrate);
+      if (next <= retrieval.hydrateBudget) break;
+      await sweep(next);
+      budgetLimited = source.hydrationBudgetHit?.() ?? false;
+    }
+  }
+
+  // Deferred fuzzy retrieval, recovered on demand.
+  //
+  // The whole-name gating above skipped the token/trigram stages because the
+  // exact/prefix evidence looked sufficient. If hydration could not actually
+  // fill the page from those candidates (a filter rejected them, or their scores
+  // fell under the query's threshold), the skipped stages run NOW — the same
+  // shard reads a non-deferred search would have done, just only when they can
+  // still change the answer. The candidate list grows, the CPU budget is
+  // re-applied to it, and the sweep is repeated; the memo means the refs already
+  // hydrated are map lookups, not reads.
+  if (deferFuzzy && !stoppedEarly && !pageFull()) {
+    const before = candidates.size;
+    await runFuzzyRetrieval();
+    if (candidates.size > before) {
+      retrieval.fuzzyRecovered = true;
+      await sweep(retrieval.hydrateBudget);
+      budgetLimited = source.hydrationBudgetHit?.() ?? false;
+    }
   }
 
   retrieval.scored = hydrated;
+  retrieval.candidates = candidates.size;
+  retrieval.truncated = Math.max(0, candidates.size - budgetedRefs().length);
+  retrieval.budgetLimited = budgetLimited;
 
   scored.sort((a, b) => {
     if (sort === "relevance") {
@@ -449,11 +613,18 @@ export async function searchCompanies(
       // inside a band the company with more indexed contacts wins. Without this,
       // a one-word query such as "tata" ranks the shortest name first (Tata
       // Motors) instead of the most prominent company (Tata Consultancy
-      // Services). Deterministic: band, then contact count, then name.
+      // Services). Deterministic: band, then identity evidence, then contact
+      // count, then name.
       const bandA = Math.round(a.hit.relevance / RELEVANCE_BAND);
       const bandB = Math.round(b.hit.relevance / RELEVANCE_BAND);
       const bandDelta = order === "desc" ? bandB - bandA : bandA - bandB;
       if (bandDelta !== 0) return bandDelta;
+      // Domain-label evidence orders candidates the score cannot separate: a
+      // company whose own domain answers the query ("tcs" vs tcs.com) is a
+      // stronger answer than a company of the same name relevance with more
+      // contacts but no such evidence. It is a tie-break on purpose — it can
+      // never lift a candidate out of its relevance band.
+      if (b.identity !== a.identity) return b.identity - a.identity;
       if (b.doc.contactCount !== a.doc.contactCount) return b.doc.contactCount - a.doc.contactCount;
       return a.doc.name.localeCompare(b.doc.name);
     }
@@ -495,15 +666,30 @@ export async function searchCompanies(
     notice = `No companies matched "${query}".`;
   }
 
+  // A short page that the partition budget cut short is reported as such, in the
+  // same field the UI already shows. It only fills a notice that would otherwise
+  // be empty, so the typo/prefix/no-match messages above are never masked.
+  const incomplete = budgetLimited && !pageFull();
+  if (!notice && incomplete && scored.length) {
+    notice =
+      `Showing the ${scored.length} best match${scored.length === 1 ? "" : "es"} found within this search's budget — ` +
+      "more companies may match.";
+  }
+
   const pageInfo: PageInfo = {
     page,
     pageSize,
     total,
-    // Three reasons the count is a floor rather than an exact number: retrieval
+    // Four reasons the count is a floor rather than an exact number: retrieval
     // was budget-bounded, the early-stop barrier skipped candidates that provably
-    // cannot enter this page, or the hydration budget ran out before every
-    // candidate it asked for came back.
-    totalIsLowerBound: candidates.size >= retrievalBudget || stoppedEarly || hydrated < budgetedRefs.length,
+    // cannot enter this page, the hydration budget ran out before every candidate
+    // it asked for came back, or the candidate list was cut to the CPU budget.
+    totalIsLowerBound:
+      candidates.size >= retrievalBudget ||
+      stoppedEarly ||
+      hydrated < budgetedRefs().length ||
+      retrieval.truncated > 0 ||
+      incomplete,
     hasMore: start + pageSize < total,
   };
 

@@ -17,8 +17,14 @@
  *     hydration strategies, including a *reference* run with an effectively
  *     unlimited budget (the complete answer the index can give), and
  *   - it reports, per strategy and per query: rows returned, rows lost against
- *     the reference, how many of the reference's top-25 rows survive, R2 GETs
- *     and bytes read.
+ *     the reference, how many of the reference's top-25 rows survive, R2 GETs,
+ *     bytes read, hydration sweeps and duplicate object reads.
+ *
+ * The strategies include both ends of the completeness dial — the old fixed-16
+ * default, the single-retry adaptive policy that used to be the default, the
+ * 16→32→64 ladder the engine now runs, fixed 64, and the unbounded reference —
+ * compiled on the *same* index so the comparison is like for like. `dup` must be
+ * 0 for every one of them: a search may never read one object twice.
  *
  *   bun scripts/benchmark-hydration.mjs
  *   bun scripts/benchmark-hydration.mjs --output-dir .indexer-output --version v1-dry5-250
@@ -98,7 +104,10 @@ const STRATEGIES = [
   { label: "fixed 16 (old default)", options: { maxHydrate: 16, adaptiveHydration: false } },
   { label: "fixed 32", options: { maxHydrate: 32, adaptiveHydration: false } },
   { label: "fixed 64", options: { maxHydrate: 64, adaptiveHydration: false } },
-  { label: "adaptive 16→32 (new default)", options: { maxHydrate: 16, adaptiveHydration: true } },
+  // The previous adaptive policy was a single retry; measuring it on the same
+  // index is what shows whether the second rung is what closes the gap.
+  { label: "adaptive 16→32 (1 retry)", options: { maxHydrate: 16, adaptiveHydration: true, adaptiveHydrateSteps: 1 } },
+  { label: "adaptive 16→32→64 (new)", options: { maxHydrate: 16, adaptiveHydration: true, adaptiveHydrateSteps: 2 } },
   // Reference: every partition the index has, so nothing is cap-limited.
   { label: "reference (all partitions)", options: { maxHydrate: 4096, adaptiveHydration: true }, reference: true },
 ];
@@ -110,6 +119,7 @@ async function run(query, options) {
   const started = performance.now();
   const response = await searchCompanies(source(), query, { ...BASE, ...options });
   const elapsed = performance.now() - started;
+  const keys = bucket.counters.readKeys;
   return {
     ids: response.hits.map((hit) => hit.id),
     rows: response.hits.length,
@@ -118,6 +128,16 @@ async function run(query, options) {
     gets: bucket.counters.gets,
     bytes: bucket.counters.bytesRead,
     scored: response.retrieval?.scored ?? 0,
+    candidates: response.retrieval?.candidates ?? 0,
+    truncated: response.retrieval?.truncated ?? 0,
+    hydrationPasses: response.retrieval?.hydrationPasses ?? 0,
+    hydrateBudget: response.retrieval?.hydrateBudget ?? 0,
+    budgetLimited: response.retrieval?.budgetLimited ?? false,
+    fuzzyDeferred: response.retrieval?.fuzzyDeferred ?? false,
+    fuzzyRecovered: response.retrieval?.fuzzyRecovered ?? false,
+    // A search may not read the same object twice: that is the cache-and-memo
+    // invariant, measured here on the real read path rather than argued for.
+    duplicateReads: keys.length - new Set(keys).size,
     elapsed,
   };
 }
@@ -159,9 +179,13 @@ const summary = STRATEGIES.map((strategy) => {
     top25Kept: runs.reduce((sum, run) => sum + run.top25Kept, 0),
     top25Possible: results.reduce((sum, row) => sum + Math.min(25, row.reference.rows), 0),
     gets: Math.max(...runs.map((run) => run.gets)),
+    meanGets: Number((runs.reduce((sum, run) => sum + run.gets, 0) / runs.length).toFixed(1)),
     meanBytes: Math.round(runs.reduce((sum, run) => sum + run.bytes, 0) / runs.length),
     worstBytes: Math.max(...runs.map((run) => run.bytes)),
     meanMs: Number((runs.reduce((sum, run) => sum + run.elapsed, 0) / runs.length).toFixed(1)),
+    meanPasses: Number((runs.reduce((sum, run) => sum + run.hydrationPasses, 0) / runs.length).toFixed(2)),
+    duplicateReads: Math.max(...runs.map((run) => run.duplicateReads)),
+    rowsLostWorstQuery: Math.max(...runs.map((run) => run.rowsLost)),
   };
 });
 
@@ -170,7 +194,7 @@ if (jsonOut) {
   process.exit(0);
 }
 
-console.log("strategy                        rows  lost  top25   mean bytes  worst bytes  R2 GETs  mean ms");
+console.log("strategy                        rows  lost  top25   mean bytes  worst bytes  R2 GETs  sweeps  dup  mean ms");
 for (const row of summary) {
   console.log(
     row.strategy.padEnd(30) +
@@ -180,12 +204,16 @@ for (const row of summary) {
       row.meanBytes.toLocaleString().padStart(13) +
       row.worstBytes.toLocaleString().padStart(13) +
       String(row.gets).padStart(9) +
+      row.meanPasses.toFixed(2).padStart(8) +
+      String(row.duplicateReads).padStart(5) +
       String(row.meanMs).padStart(9),
   );
 }
 
 const columnLabels = STRATEGIES.map((strategy) =>
-  strategy.reference ? "ref" : `${strategy.options.maxHydrate}${strategy.options.adaptiveHydration ? "+ad" : ""}`,
+  strategy.reference
+    ? "ref"
+    : `${strategy.options.maxHydrate}${strategy.options.adaptiveHydration ? `+ad${strategy.options.adaptiveHydrateSteps ?? 2}` : ""}`,
 );
 
 function table(title, cellOf) {
@@ -204,14 +232,44 @@ table("R2 bytes read per query (KB):", (value) => `${Math.round(value.bytes / 10
 
 table("Company buckets scored per query:", (value) => String(value.scored));
 
+table("Hydration sweeps per query (1 = the page filled on the first pass):", (value) => String(value.hydrationPasses));
+
+table("Duplicate object reads per query (must be 0):", (value) => String(value.duplicateReads));
+
 const base = summary[0];
+const oneRetry = summary.find((row) => row.strategy.includes("(1 retry)"));
+const ladder = summary.find((row) => row.strategy.includes("(new)"));
+const fixed64 = summary.find((row) => row.strategy.includes("fixed 64"));
 console.log(
-  `\nadaptive vs the old fixed-16 default: ${base.rowsLost - summary[3].rowsLost} fewer rows lost, ` +
-    `${Math.round((summary[3].meanBytes - base.meanBytes) / 1024)} KB more read per query on average, ` +
-    `${summary[3].meanMs - base.meanMs > 0 ? "+" : ""}${(summary[3].meanMs - base.meanMs).toFixed(1)} ms.`,
+  `\nnew default (16→32→64) vs the old fixed-16 default: ${base.rowsLost - ladder.rowsLost} fewer rows lost, ` +
+    `${Math.round((ladder.meanBytes - base.meanBytes) / 1024)} KB more read per query on average, ` +
+    `${ladder.meanMs - base.meanMs > 0 ? "+" : ""}${(ladder.meanMs - base.meanMs).toFixed(1)} ms, ` +
+    `${ladder.meanPasses.toFixed(2)} hydration sweeps per query.`,
 );
+if (oneRetry && ladder) {
+  console.log(
+    `the second rung is what closes the gap: 1 retry loses ${oneRetry.rowsLost} rows against the reference, ` +
+      `the ladder loses ${ladder.rowsLost}; fixed 64 loses ${fixed64?.rowsLost ?? "?"} while reading ` +
+      `${Math.round(((fixed64?.meanBytes ?? 0) - base.meanBytes) / 1024)} KB more than fixed 16 on every query.`,
+  );
+  // Rows *lost* is a count, and a count can hide a ranking difference: a strategy
+  // can return the same NUMBER of rows while keeping fewer of the reference's
+  // best ones. `top25` is the measure that shows it, so it is stated next to the
+  // row counts rather than left for the reader to compare column by column.
+  console.log(
+    `top-25 overlap with the reference: fixed 16 ${base.top25Kept}/${base.top25Possible} · 1 retry ` +
+      `${oneRetry.top25Kept}/${oneRetry.top25Possible} · ladder (new default) ${ladder.top25Kept}/${ladder.top25Possible}` +
+      ` · fixed 64 ${fixed64 ? `${fixed64.top25Kept}/${fixed64.top25Possible}` : "?"}.`,
+  );
+  console.log(
+    "The ladder stops as soon as the page is full, so a filled page can still hold a row the reference\n" +
+      "ranks higher — that is the residual gap, and closing it means reading further partitions (the operator\n" +
+      "dial: SEARCH_MAX_HYDRATE=64 turns the ladder into a single 64-partition sweep for every query).",
+  );
+}
 console.log(
   "\nrowsLost counts rows the reference returns and the strategy does not; top25 is how many of the\n" +
     "reference's top 25 rows the strategy also returned. A strategy that reads more bytes than the\n" +
-    "reference on a query it does not improve is paying for a retry that found nothing.",
+    "reference on a query it does not improve is paying for a retry that found nothing. `dup` is the\n" +
+    "largest number of duplicate object reads any one search made — it must be 0 for every strategy.",
 );

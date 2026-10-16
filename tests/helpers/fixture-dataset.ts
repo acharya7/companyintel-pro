@@ -32,6 +32,17 @@ export interface FixtureDataset {
   outputDir: string;
   workDir: string;
   version: string;
+  /**
+   * Remove the temp directory. **Do not call this from a test file.**
+   *
+   * `bun test` shares one module instance across test files in the same process,
+   * so this fixture is a single directory that every file reads — and each file
+   * can run in any order. A file that cleans up in `afterAll` deletes the index
+   * out from under the others; that is exactly how `tests/search-cache.test.ts`
+   * broke `tests/e2e-index.test.ts` and `tests/api-e2e.test.ts` with ENOENT on a
+   * company partition. Cleanup is for a caller that owns the whole process (a
+   * script), and the temp directory is otherwise left to the OS.
+   */
   cleanup: () => void;
 }
 

@@ -16,6 +16,7 @@ import type { Company, Contact, DatasetStats, DatasetVersionSummary, SavedLead, 
 import { R2_PREFIX, leadShardKey, statsKey, activeManifestKey, companyPartitionKey, contactPartitionKey, exportMetaKey, exportObjectKey, indexDirectoryKey, indexShardKey, manifestKey, partitionOfRef, contactPartitionOfRef, savedSearchesKey, settingsKey, activityKey, validationKey, progressKey, type IndexDirectory, type ShardPayload, type IndexKind, type CompanyPartitionPayload, type ContactPartitionPayload } from "../../src/shared/search/index-format";
 import { SHARDING, contactsFor, snapshotKey } from "../../src/shared/search/index-format";
 import { shardOf } from "../../src/shared/hash";
+import { isCacheableKey, type ObjectCache, type ReadMetrics } from "./search-cache";
 
 export const LEAD_SHARDS = 64;
 export const MAX_WRITE_RETRIES = 4;
@@ -42,8 +43,22 @@ export interface ExportIndexEntry {
   truncated: boolean;
 }
 
+export interface R2StoreOptions {
+  /**
+   * Bounded, per-isolate cache for immutable index objects. Optional: a store
+   * built without one behaves exactly as before, and all mutable `app-data/`
+   * reads bypass it either way (see `isCacheableKey`).
+   */
+  cache?: ObjectCache;
+  /** Counts the objects/bytes this store actually fetched from R2. */
+  metrics?: ReadMetrics;
+}
+
 export class R2Store {
-  constructor(private readonly bucket: R2Bucket) {}
+  constructor(
+    private readonly bucket: R2Bucket,
+    private readonly options: R2StoreOptions = {},
+  ) {}
 
   /* ------------------------------ primitives ----------------------------- */
 
@@ -53,6 +68,32 @@ export class R2Store {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Read one object body and report whether it is gzip-compressed.
+   *
+   * The metadata flag is the fast path, but the 1f 8b magic bytes decide when it
+   * is absent — which is what happens when an object reached the bucket through
+   * rclone/S3 rather than the indexer's uploader.
+   */
+  private async objectBytes(object: R2ObjectBody): Promise<{ bytes: Uint8Array; gzip: boolean }> {
+    const buffer =
+      typeof object.arrayBuffer === "function"
+        ? await object.arrayBuffer()
+        : await new Response(object.body as ReadableStream).arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    const gzip = object.httpMetadata?.contentEncoding === "gzip" || (bytes.length > 1 && bytes[0] === 0x1f && bytes[1] === 0x8b);
+    return { bytes, gzip };
+  }
+
+  /** Decode a stored object body (gzip when flagged) into JSON. */
+  private async decodeJson<T>(bytes: Uint8Array, gzip: boolean): Promise<T> {
+    if (gzip) {
+      const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+      return (await new Response(stream).json()) as T;
+    }
+    return JSON.parse(new TextDecoder().decode(bytes)) as T;
   }
 
   async getText(key: string): Promise<string | null> {
@@ -70,23 +111,36 @@ export class R2Store {
    * parsing would fail, and every shard would silently look empty.
    */
   async getJson<T>(key: string): Promise<T | null> {
+    const cache = this.options.cache;
+    if (cache !== undefined && isCacheableKey(key)) {
+      // `load` returns a cache hit, joins an in-flight read of the same key, or
+      // performs the read — so one object is fetched from R2 at most once, even
+      // when two batches ask for it at the same moment. Metrics are recorded
+      // inside the read callback because that callback is exactly the R2 fetch:
+      // a cache hit and a joined in-flight read both skip it.
+      const body = await cache
+        .load(key, async () => {
+          const object = await this.readObject(key);
+          if (!object) return null;
+          const read = await this.objectBytes(object);
+          this.options.metrics?.recordObject(key, read.bytes.length);
+          return read;
+        })
+        .catch(() => null);
+      if (!body) return null;
+      try {
+        return await this.decodeJson<T>(body.bytes, body.gzip);
+      } catch {
+        return null;
+      }
+    }
+
     const object = await this.readObject(key);
     if (!object) return null;
     try {
-      // Real R2 bodies always expose `arrayBuffer()`, but reading through the
-      // stream keeps this working with any binding shim as well.
-      const buffer =
-        typeof object.arrayBuffer === "function"
-          ? await object.arrayBuffer()
-          : await new Response(object.body as ReadableStream).arrayBuffer();
-      const view = new Uint8Array(buffer);
-      const gzip =
-        object.httpMetadata?.contentEncoding === "gzip" || (view.length > 1 && view[0] === 0x1f && view[1] === 0x8b);
-      if (gzip) {
-        const stream = new Blob([view]).stream().pipeThrough(new DecompressionStream("gzip"));
-        return (await new Response(stream).json()) as T;
-      }
-      return JSON.parse(new TextDecoder().decode(view)) as T;
+      const body = await this.objectBytes(object);
+      this.options.metrics?.recordObject(key, body.bytes.length);
+      return await this.decodeJson<T>(body.bytes, body.gzip);
     } catch {
       return null;
     }

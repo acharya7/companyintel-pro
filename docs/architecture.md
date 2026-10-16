@@ -105,18 +105,32 @@ the budget is spent across the engine's hydration batches — so a search reads 
    the rest of the candidate list can neither reorder nor extend that page, so its tiers are
    never fetched. The count then becomes a floor, which the API already reports as `N+`
    (`page.totalIsLowerBound`).
-4. **Adaptive second pass** (`SearchOptions.adaptiveHydration`, default on, factor
-   `ADAPTIVE_HYDRATE_FACTOR = 2`). A short page is the one case where more bytes are worth
+4. **Adaptive hydration ladder** (`SearchOptions.adaptiveHydration`, default on, factor
+   `ADAPTIVE_HYDRATE_FACTOR = 2`, rungs `ADAPTIVE_HYDRATE_MAX_STEPS = 2`)
+   — 16 → 32 → 64. A short page is the one case where more bytes are worth
    spending, so the engine re-walks the same candidate order with a doubled partition budget —
-   but only when the first pass was cut short *by that budget*. The source reports
+   but only when the previous sweep was cut short *by that budget*. The source reports
    `hydrationBudgetHit()`, which is the difference between "more budget would find more
    companies" and "there are no more companies to find"; without it, a sparse query (an exact
-   name with four matches) would pay for a second round of reads that cannot find anything.
-   The ceiling is still `SEARCH_LIMITS.maxHydrate` (64), so a search can never read more than
+   name with four matches) would pay for a round of reads that cannot find anything. It stops
+   when the page fills, when the cap stops it, when the source says more reads cannot help, or
+   at `SEARCH_LIMITS.maxHydrate` (64), so a search can never read more than
    `64 × ~25 KB ≈ 1.6 MB`.
+5. **Whole-name gating** (`retrieval.fuzzyDeferred` / `fuzzyRecovered`). When the exact and
+   prefix stages already produced at least a page of candidates, the token and trigram
+   *retrieval* stages are skipped — up to 24 shard reads saved for the most common query
+   shape. It is a deferral, not a decision: if hydration cannot fill the page without them,
+   they run before the search returns.
+6. **Truncation accounting** (`retrieval.truncated`). The candidate list is cut to
+   `resultBudget` from the weakest evidence upward; how many were dropped is reported and
+   makes the result count a floor, instead of being invisible.
 
 `retrieval.scored` reports the documents actually hydrated, so the number in the search
-sidebar is the real work done, not the candidate budget.
+sidebar is the real work done, not the candidate budget. `retrieval.hydrationPasses`,
+`hydrateBudget`, `budgetLimited`, `candidates` and `truncated` are the rest of the per-search
+measurement, and the Worker adds `retrieval.r2` (objects, bytes, shard/partition reads, cache
+hits) on the way out. The measurements, the before/after comparisons and the residual gaps
+are in **`docs/search-quality.md`**.
 
 ### Measured query cost
 
@@ -146,24 +160,26 @@ than the budget covers. `bun scripts/benchmark-hydration.mjs` measures exactly t
 real-data sample (`.indexer-output`, 20,265 companies, 82 company partitions) and is the
 command to re-run after any tuning change:
 
-| strategy | rows returned (8 query classes) | rows lost vs the complete answer | R2 bytes read per query | worst-case partitions |
-| --- | --- | --- | --- | --- |
-| fixed 16 (old default) | 70 | 20 | 421 KB | 16 |
-| fixed 32 | 90 | 0 | 770 KB | 32 |
-| fixed 64 | 90 | 0 | 1.46 MB | 64 |
-| adaptive 16 → 32 (current) | 90 | 0 | 770 KB | 32 |
-| reference (every partition) | 90 | 0 | 1.46 MB | 82 |
+| strategy | rows returned (8 query classes) | rows lost vs the complete answer | top-25 of the reference kept | R2 bytes read per query | R2 GETs |
+| --- | --- | --- | --- | --- | --- |
+| fixed 16 (old default) | 70 | 20 | 56/90 | 421 KB | 36 |
+| fixed 32 | 90 | 0 | 75/90 | 749 KB | 52 |
+| fixed 64 | 90 | 0 | 90/90 | 1.34 MB | 84 |
+| adaptive 16 → 32 (previous default) | 90 | 0 | 75/90 | 749 KB | 52 |
+| **adaptive 16 → 32 → 64 (current)** | **90** | **0** | **75/90** | **1.15 MB** | **84** |
+| reference (every partition) | 90 | 0 | 90/90 | 1.34 MB | 84 |
 
 Broad queries ("global", "services", "consulting") were the ones losing 5–8 rows each; the
-adaptive pass recovers all of them, and the cost is paid only by a query whose page is still
-short after the first pass. Two consequences worth keeping in view:
+ladder recovers all of them, and the cost is paid only by a query whose page is still short
+after the first sweep. Two consequences worth keeping in view:
 
-- the rows are recovered at the *same* byte cost as simply raising the default to 32, so the
-  adaptive pass is strictly better than a bigger fixed budget: precise queries (exact names,
-  short prefixes) keep their 16-partition latency;
-- a query whose true match count is **below** the page size pays the doubled read on every
-  search and cannot fill its page either way. Only knowing the match count before reading
-  removes that cost, which is a format question, not a tuning one.
+- `rows lost` is a count and can hide a ranking difference: three of those queries return a
+  *full* page of 25 rows at every strategy while keeping only 75 of the reference's 90 best
+  rows. `top-25` is the column that shows it, which is why the benchmark prints it next to
+  the row counts.
+- a query whose true match count is **below** the page size pays the rungs on every search and
+  cannot fill its page either way. Only knowing the match count before reading removes that
+  cost, which is a format question, not a tuning one (see `docs/search-quality.md` §9).
 
 Alternatives evaluated for the next format version (v3) but **not** adopted yet, because v2
 stays until a 1 M-record run can measure them:
@@ -239,7 +255,13 @@ is opened). Search, contact retrieval, exports and the app shell never list the 
    R2 reads are already bounded (≤ 30 small objects per fuzzy query) and mostly absorbed by
    layers 1–2. Nothing mutable is ever cached anywhere shared, and Access verification happens
    before any cache or dataset work.
-4. **R2 versioned indexes** — immutable objects as the durable layer.
+4. **Isolate object cache** (`worker/src/search-cache.ts`) — a bounded LRU (512 entries,
+   16 MiB, 10-minute maximum age) of *immutable* index objects only: `indexes/`, `companies/`,
+   `contacts/`. Mutable `app-data/` and `manifests/` reads bypass it, concurrent reads of one
+   key are joined into a single R2 GET, and the cache is held per R2 binding, so two datasets
+   can never serve each other's bytes. Measured: a repeated query on a warm isolate reads
+   **zero** objects from R2 (docs/search-quality.md §7).
+5. **R2 versioned indexes** — immutable objects as the durable layer.
 
 Cache keys include the dataset version, normalized query, fuzzy flag, filters, sort, page and
 page size (`buildSearchCacheKey` / `buildContactCacheKey`), so `"Microsft"` and `"microsft "`

@@ -289,6 +289,25 @@ export const companySearchResponseSchema = z.object({
     trigram: z.number().int(),
     scored: z.number().int(),
     cached: z.boolean(),
+    candidates: z.number().int(),
+    truncated: z.number().int(),
+    hydrationPasses: z.number().int(),
+    hydrateBudget: z.number().int(),
+    budgetLimited: z.boolean(),
+    fuzzyDeferred: z.boolean(),
+    fuzzyRecovered: z.boolean(),
+    r2: z
+      .object({
+        objectsRead: z.number().int(),
+        bytesRead: z.number().int(),
+        shardGets: z.number().int(),
+        partitionGets: z.number().int(),
+        shardRequests: z.number().int(),
+        partitionRequests: z.number().int(),
+        cacheHits: z.number().int(),
+        cacheMisses: z.number().int(),
+      })
+      .optional(),
   }),
 });
 

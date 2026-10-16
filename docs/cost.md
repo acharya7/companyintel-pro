@@ -47,12 +47,29 @@ before/after measurements). Exact and short queries read fewer still — a query
 fills from confident hits stops before the fuzzy tail — and the four cache layers absorb
 repeats, so realistic figures are far below these cold numbers.
 
-The **adaptive second pass** (see docs/architecture.md) spends a doubled partition budget
-only when the first pass ran out of budget *and* the page is still short, so it adds cost to
-one query shape: a broad query whose page cannot fill from 16 partitions (measured: 421 KB →
-770 KB for those queries, unchanged for exact/short ones; 90 rows instead of 70 across the
-sample's 8 query classes). The per-query ceiling is still 64 partitions ≈ 1.6 MB, so even the
-worst case stays inside the operation and byte budgets below.
+The **adaptive hydration ladder** (16 → 32 → 64, see docs/architecture.md and
+`docs/search-quality.md` §5) doubles the partition budget only while the page is still short
+*and* the previous sweep was cut short by the partition cap, so it adds cost to one query
+shape: a broad query whose page cannot fill from 16 partitions (measured on the real-data
+sample: 421 KB at fixed 16 → 1.15 MB mean for the ladder, unchanged for exact/short queries;
+90 rows instead of 70 across the sample's 8 query classes). The per-query ceiling is still 64
+partitions ≈ 1.6 MB, so even the worst case stays inside the operation and byte budgets below.
+
+**Measured reads per query, cold and warm** (real-data sample, real read path —
+`bun run bench:real -- --version <version>`):
+
+| query | cold R2 objects | cold bytes | warm R2 objects | warm bytes |
+| --- | --- | --- | --- | --- |
+| exact company name | 80 | 1.63 MB | 0 | 0 |
+| alias ("Infosys Ltd") | 80 | 1.63 MB | 0 | 0 |
+| abbreviation ("ibm") | 45 | 0.97 MB | 0 | 0 |
+| typo | 75 | 1.60 MB | 0 | 0 |
+| no result | 11 | 75 KB | 0 | 0 |
+
+A repeat query on a warm isolate reads **nothing** from R2, because the immutable index
+objects are now held in a bounded per-isolate cache (512 entries / 16 MiB, LRU, immutable
+prefixes only — see `docs/search-quality.md` §7). That is the line that changes the Class B
+arithmetic above for real traffic: the table assumes every search pays the cold cost.
 
 | Usage | Searches/month | R2 Class B (at ~30 reads/search) | Class B cost (10M free) |
 | --- | --- | --- | --- |

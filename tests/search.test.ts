@@ -1,7 +1,8 @@
 import { beforeAll, describe, expect, test } from "bun:test";
 import { LocalCandidateSource } from "../src/shared/search/local-index";
 import { buildSearchCacheKey, prepareQuery, searchCompanies } from "../src/shared/search/engine";
-import { minScoreFor, scoreDoc } from "../src/shared/search/score";
+import { MIN_QUERY_TRIGRAM_COVERAGE, minScoreFor, scoreDoc } from "../src/shared/search/score";
+import { normalizeName } from "../src/shared/normalize";
 import { boundedLevenshtein, diceCoefficient, editSimilarity, trigramSet } from "../src/shared/search/similarity";
 import { FIXTURE_COMPANIES, RELEVANCE_CASES, fixtureCompanies } from "./fixtures/companies";
 
@@ -99,6 +100,59 @@ describe("scoring", () => {
 
   test("thresholds grow stricter for short queries", () => {
     expect(minScoreFor(2)).toBeGreaterThan(minScoreFor(10));
+  });
+
+  /*
+   * The whole-string fuzzy gate, asserted at the scorer rather than through the
+   * engine, because the failure it prevents is a *scoring* one: `0.85 × Dice` and
+   * `0.9 × editSimilarity` are both normalized by length, so a 2–7 character name
+   * is one edit from any short query and shares a couple of grams with a long
+   * nonsense one. Every name below scored 0.378–0.680 against `zzzzzzqqqqq` under
+   * the previous rule (threshold 0.36 at that length) and was therefore *shown*.
+   */
+  const junkNames = ["zz", "ZZP'er", "zzz", "zzzz", "zzzzz", "zzq", "qqq", "zzqq", "zzzzzz", "zzzzzzz", "Qqq"];
+
+  function scorerDoc(name: string, domain?: string) {
+    const normalizedName = normalizeName(name);
+    return {
+      id: `c_${normalizedName}`,
+      name,
+      normalizedName,
+      aliases: [],
+      tokens: normalizedName.split(" ").filter(Boolean),
+      contactCount: 0,
+      domain,
+    };
+  }
+
+  test("a nonsense query does not score any short junk name", () => {
+    const prepared = prepareQuery("zzzzzzqqqqq");
+    for (const name of junkNames) {
+      const result = scoreDoc(scorerDoc(name), { ...prepared, fuzzy: true });
+      expect({ name, score: result?.score ?? 0 }).toEqual({ name, score: 0 });
+      // When the gate is the only reason it did not score, it says which rule fired.
+      if (result) expect(["short-name", "low-coverage"]).toContain(result.detail.fuzzyGate);
+    }
+  });
+
+  test("the gate still lets a real typo through, with the score it had before", () => {
+    const prepared = prepareQuery("Microsft");
+    const result = scoreDoc(scorerDoc("Microsoft"), { ...prepared, fuzzy: true });
+    expect(result).not.toBeNull();
+    expect(result!.detail.fuzzyGate).toBe("ok");
+    expect(result!.score).toBeGreaterThanOrEqual(minScoreFor(prepared.normalizedQuery.length));
+    expect(result!.score).toBeGreaterThan(0.8);
+  });
+
+  test("the coverage gate withholds the whole-string term for a loosely related name", () => {
+    const prepared = prepareQuery("global technology");
+    const result = scoreDoc(scorerDoc("Global Solutions"), { ...prepared, fuzzy: true });
+    // The shared *token* ("global") still matches, so this is not a null result...
+    expect(result).not.toBeNull();
+    // ...but the whole-string evidence is withheld, and the diagnostic says why.
+    expect(result!.detail.fuzzyGate).toBe("low-coverage");
+    expect(result!.detail.wholeScore).toBe(0);
+    expect(result!.detail.trigramCoverage).toBeLessThan(MIN_QUERY_TRIGRAM_COVERAGE);
   });
 });
 

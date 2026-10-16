@@ -40,10 +40,11 @@ import { leadId } from "../../src/shared/hash";
 import { searchCompanies } from "../../src/shared/search/engine";
 import { R2Store } from "./store";
 import { R2CandidateSource } from "./search-source";
+import { ReadMetrics, searchCacheFor } from "./search-cache";
 import { AccessError, verifyAccess } from "./access";
 import type { AccessIdentity, Env } from "./env";
 
-type Variables = { identity: AccessIdentity; requestId: string; store: R2Store };
+type Variables = { identity: AccessIdentity; requestId: string; store: R2Store; metrics: ReadMetrics };
 
 export const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 
@@ -60,7 +61,16 @@ const MAX_RAW_OBJECTS = 25;
 app.use("*", async (c, next) => {
   const requestId = crypto.randomUUID().slice(0, 8);
   c.set("requestId", requestId);
-  c.set("store", new R2Store(c.env.COMPANY_DATA));
+  // Per-request R2 accounting, plus the isolate-wide cache of immutable index
+  // objects (one cache per bucket binding; mutable `app-data/` reads bypass it).
+  c.set("metrics", new ReadMetrics());
+  c.set(
+    "store",
+    new R2Store(c.env.COMPANY_DATA, {
+      cache: searchCacheFor(c.env.COMPANY_DATA),
+      metrics: c.get("metrics"),
+    }),
+  );
   await next();
   c.header("x-request-id", requestId);
   c.header("x-content-type-options", "nosniff");
@@ -445,6 +455,11 @@ app.get("/api/companies/search", async (c) => {
   // read per search. Unset or unparseable falls through to the engine default
   // (16), which the engine clamps to its own ceiling.
   const configuredHydrate = Number(c.env.SEARCH_MAX_HYDRATE);
+  // Snapshot the isolate-wide cache counters so the reported hit/miss numbers are
+  // this search's, not the isolate's lifetime totals.
+  const cache = searchCacheFor(c.env.COMPANY_DATA);
+  const metrics = c.get("metrics");
+  const cacheBefore = metrics.snapshotCache(cache);
   const response = await searchCompanies(dataset.source, parsed.q, {
     page: parsed.page,
     pageSize: parsed.pageSize,
@@ -455,7 +470,16 @@ app.get("/api/companies/search", async (c) => {
     filters: parsed.filters,
     maxHydrate: Number.isFinite(configuredHydrate) && configuredHydrate > 0 ? configuredHydrate : undefined,
   });
-  return c.json({ ...response, hits: enrichHits(response.hits, dataset.source) });
+  metrics.recordCacheDelta(cache, cacheBefore);
+  // Logical reads the search asked for; `shardGets`/`partitionGets` already hold
+  // the subset that had to become real R2 GETs.
+  metrics.shardRequests += dataset.source.shardReads;
+  metrics.partitionRequests += dataset.source.partitionReads;
+  return c.json({
+    ...response,
+    hits: enrichHits(response.hits, dataset.source),
+    retrieval: { ...response.retrieval, r2: metrics.toJSON() },
+  });
 });
 
 app.get("/api/companies/:id", async (c) => {

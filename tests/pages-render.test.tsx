@@ -24,6 +24,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import Dashboard from "../src/pages/Dashboard";
 import DatasetManagement from "../src/pages/DatasetManagement";
 import CompanySearch from "../src/pages/CompanySearch";
+import { Pager } from "../src/components/common";
 import { queryKeys } from "../src/hooks/use-api";
 import type { DatasetStatusResponse, UserSettings } from "../src/shared/models";
 
@@ -218,5 +219,32 @@ describe("pages render without a missing API method", () => {
   test("Company search renders without a query and without a dataset status", async () => {
     const html = await renderPage(<CompanySearch />, { path: "/companies" });
     expect(html).toContain("Search the company index");
+  });
+});
+
+/**
+ * The completeness signal the search engine reports (`totalIsLowerBound`) has to
+ * reach the user as a *number that does not claim to be exhaustive*. That is a
+ * one-line UI contract, and it is asserted here rather than assumed: a total the
+ * engine says is a floor renders as "of 40+", an exact total as "of 40".
+ */
+describe("search completeness shown to the user", () => {
+  const pager = (totalIsLowerBound?: boolean) =>
+    renderToString(
+      <Pager page={1} pageSize={25} total={40} hasMore totalIsLowerBound={totalIsLowerBound} onPage={() => {}} />,
+    );
+
+  test("a lower-bound total renders as N+, an exact total does not", () => {
+    expect(pager(true)).toContain("of 40+");
+    const exact = pager(false);
+    expect(exact).toContain("of 40");
+    expect(exact).not.toContain("of 40+");
+  });
+
+  test("a total of zero is an answer, not a lower bound", () => {
+    expect(pager(true)).not.toContain("No results");
+    expect(
+      renderToString(<Pager page={1} pageSize={25} total={0} hasMore={false} onPage={() => {}} />),
+    ).toContain("No results");
   });
 });

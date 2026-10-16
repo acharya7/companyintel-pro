@@ -170,7 +170,10 @@ export interface CompanySearchResponse {
   page: PageInfo;
   datasetVersion: string;
   tookMs: number;
-  /** Which retrieval stages produced candidates — useful for debugging relevance. */
+  /**
+   * Which retrieval stages produced candidates, and what the search budget did —
+   * useful for debugging relevance and for reasoning about R2 cost.
+   */
   retrieval: {
     exact: number;
     prefix: number;
@@ -178,6 +181,42 @@ export interface CompanySearchResponse {
     trigram: number;
     scored: number;
     cached: boolean;
+    /** Unique candidates the four stages produced, before the CPU budget. */
+    candidates: number;
+    /** Candidates dropped by the CPU (`resultBudget`) cut. */
+    truncated: number;
+    /** Hydration sweeps run (1, plus one per adaptive retry). */
+    hydrationPasses: number;
+    /** Partition budget the final sweep used. */
+    hydrateBudget: number;
+    /** True when a partition cap dropped a candidate the index actually holds. */
+    budgetLimited: boolean;
+    /** True when the token/trigram stages were skipped (whole-name evidence sufficed). */
+    fuzzyDeferred: boolean;
+    /** True when those deferred stages had to run after all. */
+    fuzzyRecovered: boolean;
+    /**
+     * R2 object accounting for this search. Present only when the caller's
+     * data layer reports it (the Worker does; the in-browser preview does not).
+     */
+    r2?: {
+      /** Objects fetched from R2 while answering this search. */
+      objectsRead: number;
+      /** Object bytes transferred (the stored, still-compressed size). */
+      bytesRead: number;
+      /** Index shard objects fetched from R2 (the directory is not counted). */
+      shardGets: number;
+      /** Company profile partitions fetched from R2. */
+      partitionGets: number;
+      /** Shard objects the search asked for, cache-served or fetched. */
+      shardRequests: number;
+      /** Company partitions the search asked for, cache-served or fetched. */
+      partitionRequests: number;
+      /** Reads served from the per-isolate cache instead of R2. */
+      cacheHits: number;
+      /** Reads that had to go to R2 (the cache's misses). */
+      cacheMisses: number;
+    };
   };
 }
 
