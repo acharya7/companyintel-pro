@@ -13,6 +13,7 @@
     "test": "bun test",
     "check": "bun scripts/check.mjs",
     "bench": "bun scripts/benchmark-search.mjs",
+    "bench:hydration": "bun scripts/benchmark-hydration.mjs",
     "r2:doctor": "bun scripts/r2-doctor.mjs",
     "r2:schema": "bun scripts/r2-schema.mjs",
     "verify:r2": "bun scripts/verify-raw.mjs",

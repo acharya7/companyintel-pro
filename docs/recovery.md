@@ -41,7 +41,7 @@ If a new version looks wrong after publishing, roll back first and investigate a
 
 | Failure | Behaviour |
 | --- | --- |
-| Interrupted during pass 1 (CSV streaming) | `workDir/checkpoint.json` records the stage; re-running resumes and re-does only what was not completed. |
+| Interrupted during pass 1 (CSV streaming) | `workDir/checkpoint.json` records the stage **and the run it belongs to** (version, sample limit, partitions, source paths/delimiters/overrides); re-running the same command resumes and re-does only what was not completed. A different command against the same `workDir` stops with the differences listed instead of merging two spools — see the row below. |
 | Interrupted during pass 2 | Pass 1 spool files are reused; the partition loop restarts (bounded by partition count). |
 | Network failure during upload | Objects are uploaded individually with retries and exponential backoff; already-uploaded objects are skipped, so a re-run is idempotent. |
 | Bad rows | Never silently dropped: written to `workDir/rejected.jsonl` with source, line number, reason and the first fields. Counts appear in the manifest and on the Dataset page. |
@@ -104,7 +104,8 @@ rebuilt by re-saving affected leads through the API; nothing else depends on it.
 | Search returns `503 dataset_unavailable` | No active version, or its directory is missing: check `/dataset`, then publish a validated version. |
 | Search results look stale after a publish | Hard-reload once; confirmed case is a version-scoped cache — clear it from Settings → "Clear cached data". |
 | A published version has bad data | Dataset Management → Activate the previous version, then re-index into a new version id. |
-| Indexer crashed mid-run | Re-run the same command; it resumes from `workDir/checkpoint.json` (use `--no-resume` to start clean). |
+| Indexer crashed mid-run | Re-run the same command; it resumes from `workDir/checkpoint.json` (use `--no-resume` to start clean, which also clears the stale spool in `workDir/spool/`). |
+| `workDir already holds a checkpoint for a different run` | Expected when the version, sample size, partition count or source paths changed: the spool belongs to the earlier run and resuming would mix two inputs. Re-run with `--no-resume`, or use a separate `workDir`. Nothing was read or written before the stop. |
 | Upload partially completed | Re-run `run --upload`: existing objects are skipped, missing ones are uploaded. |
 | Lead edits lost | Inspect `backups/app-data/<date>/` and restore the shard as shown above. |
 | Access broken (401 on every request) | Confirm `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD` and `ALLOWED_EMAILS` secrets and that the Access application covers the hostname you are using. |

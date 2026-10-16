@@ -83,6 +83,29 @@ export interface SourceContext {
   onNotice?: (message: string) => void;
   /** Ranged GET attempts per chunk before a run fails. */
   attempts?: number;
+  /**
+   * How much R2 traffic this run caused, counted as it happens.
+   *
+   * A benchmark is only useful if its cost is measured, not guessed: this is the
+   * number that goes into the Cloudflare cost estimate (Class A/B operation
+   * pricing) alongside the byte volume. Every request is counted, including the
+   * retried ones, so `retries` tells the operator whether a flaky link inflated
+   * it. `bytesRead` counts object bytes actually transferred.
+   */
+  stats: SourceStats;
+}
+
+export interface SourceStats {
+  /** Total HTTP requests issued (head requests and every ranged GET attempt). */
+  requests: number;
+  /** Requests that had to be retried after a transient failure. */
+  retries: number;
+  /** Response bytes transferred from R2. */
+  bytesRead: number;
+  /** Objects opened for streaming (one per source, per run). */
+  objectsOpened: number;
+  /** Bytes served from the local cache instead of R2. */
+  cachedBytes: number;
 }
 
 export interface SourceContextOptions {
@@ -105,6 +128,7 @@ export function createSourceContext(options: SourceContextOptions = {}): SourceC
     credentialsFor: options.credentialsFor ?? ((bucket: string) => credentialsFromEnv(bucket)),
     onNotice: options.onNotice,
     attempts: options.attempts ?? 3,
+    stats: { requests: 0, retries: 0, bytesRead: 0, objectsOpened: 0, cachedBytes: 0 },
   };
 }
 
@@ -163,6 +187,7 @@ export async function sourceBytes(source: SourceLike, context: SourceContext): P
   const location = parseR2Source(source.path);
   if (!location) return fileSize(source.path);
   const client = clientFor(location.bucket, context);
+  context.stats.requests += 1;
   const head = await client.headDetailed(location.key);
   return head.exists ? head.size : null;
 }
@@ -205,17 +230,30 @@ async function writeChunk(stream: WriteStream, chunk: Buffer): Promise<void> {
 }
 
 /** Read one ranged chunk, retrying transient failures with backoff. */
-async function rangedChunk(client: R2Client, key: string, offset: number, length: number, attempts: number): Promise<Buffer> {
+async function rangedChunk(
+  client: R2Client,
+  key: string,
+  offset: number,
+  length: number,
+  attempts: number,
+  stats: SourceStats,
+): Promise<Buffer> {
   let lastError: unknown = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return await client.getRange(key, length, offset);
+      stats.requests += 1;
+      const body = await client.getRange(key, length, offset);
+      stats.bytesRead += body.length;
+      return body;
     } catch (error) {
       lastError = error;
       const message = error instanceof Error ? error.message : String(error);
       // A 404/403 will not succeed on retry; a 5xx or a network error may.
       if (/HTTP 4\d\d/.test(message) && !/HTTP 429/.test(message)) break;
-      if (attempt < attempts) await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** (attempt - 1)));
+      if (attempt < attempts) {
+        stats.retries += 1;
+        await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** (attempt - 1)));
+      }
     }
   }
   throw new Error(`failed to read bytes ${offset}-${offset + length - 1} of ${key}: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
@@ -243,9 +281,11 @@ export async function* r2SourceRecords(
   const target = cacheTargetFor(context, location);
   if (target && (await cachedComplete(target, remoteBytes))) {
     context.onNotice?.(`using the cached copy of ${source.path} (${remoteBytes ?? "unknown"} bytes) — no download needed`);
+    context.stats.cachedBytes += remoteBytes ?? 0;
     yield* readCsvFile(target.final, options);
     return;
   }
+  context.stats.objectsOpened += 1;
 
   const parser = new CsvParser(options);
   const decoder = new TextDecoder(options.encoding ?? "utf8", { fatal: false, ignoreBOM: true });
@@ -277,7 +317,7 @@ export async function* r2SourceRecords(
       const want = context.chunkBytes;
       const remaining = remoteBytes === null ? want : Math.min(want, remoteBytes - offset);
       if (remaining <= 0) break;
-      const chunk = await rangedChunk(client, location.key, offset, remaining, context.attempts ?? 3);
+      const chunk = await rangedChunk(client, location.key, offset, remaining, context.attempts ?? 3, context.stats);
       if (!chunk.length) break;
       offset += chunk.length;
       if (sink) await writeChunk(sink, chunk);
@@ -384,7 +424,7 @@ export async function sourceProfile(
   if (!head.exists) throw new Error(unreachableMessage(source.id, location, head.status));
   const sampleBytes = options.sampleBytes ?? DEFAULT_SAMPLE_BYTES;
   const want = head.size === null ? sampleBytes : Math.min(sampleBytes, head.size);
-  const bytes = await rangedChunk(client, location.key, 0, want, context.attempts ?? 3);
+  const bytes = await rangedChunk(client, location.key, 0, want, context.attempts ?? 3, context.stats);
   const truncatedByBound = head.size !== null && head.size > bytes.length;
   const encoding = source.encoding ?? "utf8";
   let text = new TextDecoder(encoding, { fatal: false, ignoreBOM: true }).decode(bytes);

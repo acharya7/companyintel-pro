@@ -47,6 +47,13 @@ before/after measurements). Exact and short queries read fewer still — a query
 fills from confident hits stops before the fuzzy tail — and the four cache layers absorb
 repeats, so realistic figures are far below these cold numbers.
 
+The **adaptive second pass** (see docs/architecture.md) spends a doubled partition budget
+only when the first pass ran out of budget *and* the page is still short, so it adds cost to
+one query shape: a broad query whose page cannot fill from 16 partitions (measured: 421 KB →
+770 KB for those queries, unchanged for exact/short ones; 90 rows instead of 70 across the
+sample's 8 query classes). The per-query ceiling is still 64 partitions ≈ 1.6 MB, so even the
+worst case stays inside the operation and byte budgets below.
+
 | Usage | Searches/month | R2 Class B (at ~30 reads/search) | Class B cost (10M free) |
 | --- | --- | --- | --- |
 | 100 searches/day | 3,000 | 90,000 | $0 |

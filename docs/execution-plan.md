@@ -137,7 +137,10 @@ Full detail and the pricing sources: `docs/cost.md`.
 
 - `partitions: 256` (keep it — it sets the working set and the number of spool files).
 - `workDir: .indexer-work` on the fastest local disk; `checkpoint.json` records the completed
-  stage, so an interrupted run resumes instead of restarting. `--no-resume` forces a clean start.
+  stage *and the run identity* (version, sample limit, partitions, sources), so an interrupted run
+  resumes instead of restarting. `--no-resume` forces a clean start (and clears the stale spool).
+  Give the 1 M benchmark its own `workDir` if you want to keep the full run's spool around — a
+  checkpoint for a different run is refused rather than merged.
 - Rejected rows are never dropped: inspect `workDir/rejected.jsonl` (`{source, line, reason}`).
 - Upload is idempotent (existing objects are skipped), so `run --upload` can be repeated safely.
 - Publish is a single pointer write. **Keep one previous version** in R2 — the pointer now records

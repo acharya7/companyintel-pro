@@ -6,6 +6,8 @@
  *   bun tools/indexer/src/cli.ts run       --config <cfg> [--sample 100000] [--version v1] [--upload]
  *   bun tools/indexer/src/cli.ts run --preflight-only   # checks auth, keys, TSV mapping,
  *                                                      # disk and RAM, then stops
+ *   bun tools/indexer/src/cli.ts run --no-resume         # ignore the checkpoint and rebuild;
+ *                                                      # clears the stale spool in workDir
  *   bun tools/indexer/src/cli.ts validate  --config <cfg> --version v1
  *   bun tools/indexer/src/cli.ts publish   --config <cfg> --version v1 --yes
  *
@@ -14,8 +16,8 @@
  */
 
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { readFile, readdir, stat } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 
 import { ALL_CANONICAL_FIELDS, buildColumnMap } from "./mapping";
@@ -78,9 +80,61 @@ function printPreflight(report: Awaited<ReturnType<typeof preflight>>): void {
   const estimatedRows = report.estimatedRows ?? (report.totalInputBytes > 0 ? report.totalInputBytes / 900 : null);
   if (estimatedRows !== null) {
     const seconds = estimatedRows / ROWS_PER_SECOND_HINT;
-    console.log(`  rough duration hint  ~${(seconds / 60).toFixed(0)} min at ${ROWS_PER_SECOND_HINT.toLocaleString()} rows/s (measure with a sample run)`);
+    // Seconds below a minute and a half: `~0 min` reads as "no idea" and hides
+    // exactly the sample runs whose whole point is a measurable duration.
+    const duration = seconds < 90 ? `~${Math.round(seconds)} s` : `~${(seconds / 60).toFixed(0)} min`;
+    console.log(`  rough duration hint  ${duration} at ${ROWS_PER_SECOND_HINT.toLocaleString()} rows/s (measure with a sample run)`);
   }
   console.log("");
+}
+
+/**
+ * Measure the two numbers a benchmark cannot get from its own output: peak RSS
+ * and peak temporary disk.
+ *
+ * Sampling is deliberately coarse (every 5 s) and cheap: the spool is a few
+ * hundred files and the raw cache at most two, so a stat sweep cannot perturb a
+ * run on one core. Returning peaks rather than an average is the point — a
+ * multi-hour run's planning number is its worst moment, not its mean.
+ */
+function startResourceSampler(dirs: string[]) {
+  let peakRssBytes = process.memoryUsage().rss;
+  let peakDiskBytes = 0;
+  let stopped = false;
+
+  const directoryBytes = async (dir: string, depth = 3): Promise<number> => {
+    if (depth < 0) return 0;
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+    let total = 0;
+    for (const entry of entries) {
+      const path = join(dir, entry.name);
+      if (entry.isDirectory()) total += await directoryBytes(path, depth - 1);
+      else total += (await stat(path).catch(() => null))?.size ?? 0;
+    }
+    return total;
+  };
+
+  const sample = async () => {
+    peakRssBytes = Math.max(peakRssBytes, process.memoryUsage().rss);
+    let total = 0;
+    for (const dir of dirs) total += await directoryBytes(dir);
+    peakDiskBytes = Math.max(peakDiskBytes, total);
+  };
+
+  const timer = setInterval(() => void sample(), 5_000);
+  // `unref` keeps the sample timer from holding the process open after a run.
+  timer.unref?.();
+
+  return {
+    async stop() {
+      if (!stopped) {
+        stopped = true;
+        clearInterval(timer);
+        await sample();
+      }
+      return { peakRssBytes, peakDiskBytes };
+    },
+  };
 }
 
 const ROWS_PER_SECOND_HINT = 120_000;
@@ -216,6 +270,43 @@ async function verifyEffectiveMapping(config: IndexerConfig, context: SourceCont
   return ok;
 }
 
+/**
+ * Run the indexer while sampling peak memory and peak temporary disk, so the
+ * benchmark's two hard-to-measure numbers come from the run itself.
+ *
+ * The sampler is stopped on the failure path too: a run that dies at hour two is
+ * exactly the one whose peak usage the operator needs.
+ */
+/**
+ * Human-readable size for the run summary.
+ *
+ * Two decimals of GB shows a 1.5 MB index as "0.00 GB", which is worse than
+ * useless in the number an operator writes down. Below 0.1 GB the summary
+ * switches to MB.
+ */
+function formatBytes(bytes: number): string {
+  if (bytes < 0.1e9) return `${(bytes / 1e6).toFixed(1)} MB`;
+  return `${(bytes / 1e9).toFixed(2)} GB`;
+}
+
+async function withResourcePeaks<T>(
+  dirs: string[],
+  run: () => Promise<T>,
+): Promise<{ result: T; peaks: { peakRssBytes: number; peakDiskBytes: number } }> {
+  const sampler = startResourceSampler(dirs);
+  try {
+    const result = await run();
+    return { result, peaks: await sampler.stop() };
+  } catch (error) {
+    const peaks = await sampler.stop();
+    console.error(
+      `  peak memory       ${formatBytes(peaks.peakRssBytes)} RSS\n` +
+        `  peak temp disk    ${formatBytes(peaks.peakDiskBytes)} (measured before the failure)`,
+    );
+    throw error;
+  }
+}
+
 async function cmdRun(config: IndexerConfig, flags: Record<string, string | boolean>): Promise<void> {
   if (!requireSourceAccess(config)) return;
   const sample = flags.sample ? Number(flags.sample) : undefined;
@@ -225,6 +316,12 @@ async function cmdRun(config: IndexerConfig, flags: Record<string, string | bool
   // without reading the corpus: R2 auth + object keys, TSV schema mapping, free
   // disk, memory, and the sample-based space estimate. Nothing is written.
   const preflightOnly = Boolean(flags["preflight-only"]);
+  // `--no-resume` is the operator's "rebuild from the sources" switch: it
+  // ignores any checkpoint, clears the stale spool and re-reads. It is also the
+  // documented answer to a checkpoint that belongs to a different run — the
+  // indexer stops rather than merging two inputs (see CheckpointIdentity in
+  // build.ts).
+  const noResume = Boolean(flags["no-resume"]);
 
   // `sample` must reach preflight: a sample run's temporary-space estimate is based
   // on the sampled row count, so a machine that cannot hold the 60 GB job can still
@@ -259,9 +356,13 @@ async function cmdRun(config: IndexerConfig, flags: Record<string, string | bool
     return;
   }
 
-  const result = await runIndex(
-    { ...config, datasetVersion: version, upload: { enabled: upload, bucket: config.upload?.bucket ?? "company-intel-data" } },
-    { sampleLimit: sample, onProgress: progressLogger() },
+  const { result, peaks } = await withResourcePeaks(
+    [config.workDir, ...(config.rawCacheDir ? [config.rawCacheDir] : [])],
+    () =>
+      runIndex(
+        { ...config, datasetVersion: version, upload: { enabled: upload, bucket: config.upload?.bucket ?? "company-intel-data" } },
+        { sampleLimit: sample, resume: !noResume, onProgress: progressLogger() },
+      ),
   );
 
   console.log(`\nBuilt version ${result.version}`);
@@ -269,8 +370,22 @@ async function cmdRun(config: IndexerConfig, flags: Record<string, string | bool
   console.log(`  rows rejected     ${result.counters.rowsRejected.toLocaleString()}`);
   console.log(`  unique companies  ${result.counters.uniqueCompanies.toLocaleString()}`);
   console.log(`  unique contacts   ${result.counters.uniqueContacts.toLocaleString()}`);
+  console.log(`  ambiguous kept apart ${result.counters.ambiguousCompanies.toLocaleString()}  (name collisions with conflicting strong evidence)`);
+  console.log(`  missing company id   ${result.counters.recordsMissingCompanyId.toLocaleString()}`);
   console.log(`  objects written   ${result.objects.length.toLocaleString()}`);
   console.log(`  elapsed           ${(result.elapsedMs / 1000).toFixed(1)} s`);
+  console.log(`  peak memory       ${formatBytes(peaks.peakRssBytes)} RSS`);
+  console.log(`  peak temp disk    ${formatBytes(peaks.peakDiskBytes)} (${config.workDir}${config.rawCacheDir ? " + raw cache" : ""})`);
+  console.log(`  index output      ${formatBytes(result.outputBytes)} in ${config.outputDir}`);
+  if (result.sourceStats.requests > 0) {
+    console.log(
+      `  r2 requests       ${result.sourceStats.requests.toLocaleString()} (${result.sourceStats.retries.toLocaleString()} retried, ` +
+        `${formatBytes(result.sourceStats.bytesRead)} read, ${result.sourceStats.objectsOpened} object(s) streamed)`,
+    );
+  }
+  if (result.sourceStats.cachedBytes > 0) {
+    console.log(`  served from cache ${formatBytes(result.sourceStats.cachedBytes)} (no R2 requests for those bytes)`);
+  }
   for (const [id, perSource] of Object.entries(result.counters.perSource)) {
     console.log(`  ${id}: ${perSource.rowsRead.toLocaleString()} rows, ${perSource.rowsRejected.toLocaleString()} rejected`);
   }
@@ -371,11 +486,15 @@ Sources (sources[].path in the config) accept either mode:
                 shell because Wrangler's login cannot be used by a local script)
 
 Flags
-  --config <path>   indexer configuration (required for every command)
-  --sample <n>      limit each source to n records (sample runs)
-  --version <id>    dataset version id (default from the config)
-  --upload          upload generated objects to R2
-  --yes             confirm a publish operation
+  --config <path>     indexer configuration (required for every command)
+  --sample <n>        limit each source to n records (sample runs)
+  --version <id>      dataset version id (default from the config)
+  --preflight-only    run: check auth, keys, TSV mapping, disk and RAM, then stop
+                      (nothing is read in bulk, built or uploaded)
+  --no-resume         ignore the checkpoint and rebuild from the sources; clears
+                      the stale spool in workDir
+  --upload            upload generated objects to R2
+  --yes               confirm a publish operation
 
 Example (Windows PowerShell)
   bun tools/indexer/src/cli.ts profile  --config tools/indexer/indexer.config.json

@@ -69,7 +69,7 @@ as such. Replace the extrapolations with a 1,000,000-row sample run before the f
 | Row counts | file1 ≈ 4.7 M organizations; file2 ≈ 96.8 M people ≈ 101 M rows total | extrapolated from the measured bytes/row |
 | Duration | ≈ 2–3 h single-threaded (download + parse, additive) | extrapolated; a 39,505-row Mode B sample run took 118 s end to end here |
 | Temporary space | 70.96 GB reported by preflight for the full input | **measured** preflight output |
-| Generated index | preflight estimates 7.71 GB; scaling the measured sample (10.4 MB gzipped for 20,265 companies + 19,414 contacts: 97 B/company, 96 B/contact) suggests 9–20 GB, contacts dominating | extrapolated — **the real number needs the 1 M sample** |
+| Generated index | preflight estimates 7.71 GB. Measured bytes/record from the real-data sample (10.46 MB gzipped for 20,265 companies + 19,414 contacts): **99 B/company**, **96 B/contact**, **324 B/company of index shards**. Applied to the extrapolated corpus (4.7 M organizations + 96.8 M people): 0.5 GB + 9.3 GB + 1.5 GB ≈ **11 GB, contacts dominating** (range 9–20 GB) | bytes/record **measured**; the corpus row count is extrapolated, so the total is too — **confirm with the 1 M run** |
 | `rawCacheDir` | ~64 GB if enabled (skippable with `"rawCacheDir": null`) | the bytes have to land somewhere to resume |
 | RAM | bounded: one hash bucket + one partition at a time; 2 GB was enough for the sample | by design |
 | R2 operations | ~7.7 K Class B reads + one upload per generated object (Class A) | extrapolated |
@@ -177,10 +177,43 @@ Preflight
   rough duration hint  ~10 min at 120,000 rows/s (measure with a sample run)
 ```
 
-The run refuses to start when temporary space is clearly insufficient — which is correct for this
-sandbox and is why the full job belongs on your machine. The output-size and duration figures are
-hints, not measurements: replace them with your own sample-run timings (the measured parse rates
-and transfer rates in the cost table above are the numbers to plan with).
+`bun run index:benchmark-1m:preflight` is the same check for the **1 M-record sample**, and it is
+sample-aware: the temporary-space estimate covers the sampled rows, not all 64.26 GB, so the
+benchmark can be run on a machine that cannot hold the full job. Real output from this working
+tree (the R2 reads and mapping checks are real; free disk is the sandbox's):
+
+```
+Preflight
+  ok   csv1  10.22 GB  r2://company-intel-data/raw/file1.csv
+  ok   csv2  54.04 GB  r2://company-intel-data/raw/file2.csv
+  input total          64.26 GB
+  free disk            0.66 GB
+  temporary space need 1.87 GB
+  estimated output     0.54 GB
+  memory free / total  1.63 GB / 2.09 GB
+  cpu cores            1
+  ! Temporary space looks insufficient: about 0.7 GB free vs 1.9 GB estimated for spooling in a 1,000,000-record sample per source.
+  sample               1,000,000 records per source (temporary space estimated from this, not from the full input)
+
+Schema mapping actually in use (automatic mapping + config overrides)
+  ok   csv1  51 columns · delimiter "\t" · encoding utf-8 · 10 override(s)
+       company id ← "organization_id" · name ← "organization_name" · domain ← "organization_domain"
+  ok   csv2  39 columns · delimiter "\t" · encoding utf-8 · 13 override(s)
+       contact email ← "person_email" · phone ← "person_phone" · linkedin ← "person_linkedin_url"
+
+Preflight only: NOT ready — free disk space is below the estimate above. Nothing was read in bulk, no index was built, nothing was uploaded.
+```
+
+So the benchmark's prerequisites are checked **before** any bulk read: R2 credentials (the two
+`ok` lines are real HEAD requests), both object keys, the TSV delimiter and both column mappings
+against the live files, free disk, free memory, and CPU count. On this sandbox it correctly
+refuses; on a machine with ~2 GB free it proceeds. Exit code 1 means "not ready" and nothing was
+written.
+
+The run itself refuses to start when temporary space is insufficient, and watch for the mid-run
+floor (512 MB) as well. The output-size and duration figures are hints, not measurements: replace
+them with your own sample-run timings (the measured parse rates and transfer rates in the cost
+table above are the numbers to plan with).
 
 ## Recommended sequence (approval gates included)
 
@@ -193,11 +226,56 @@ and transfer rates in the cost table above are the numbers to plan with).
 5. Full run with `--version v1 --upload`, then `validate`, then `publish`.
 
 `index:benchmark-1m` exists so step 3 can be done with a real number instead of
-an extrapolation. Record from its output: elapsed seconds, peak RSS, `objects
-written`, the total size of `outputDir`, and rows/s per source; then re-check the
-cost table above and this workspace's estimates. It is deliberately a manual
-command — a benchmark that runs itself on a developer machine (or in CI) would
-download gigabytes without being asked to.
+an extrapolation. It is deliberately a manual command — a benchmark that runs
+itself on a developer machine (or in CI) would download gigabytes without being
+asked to.
+
+### Collecting the benchmark numbers
+
+Every number the specification asks for is printed by the run itself, so nothing
+has to be measured by hand. They come from the run, not from an estimate:
+
+| Number | Where it comes from |
+| --- | --- |
+| Records processed | `files read` (and per source: `csv1: N rows, M rejected`) |
+| Wall-clock duration | `elapsed` (also `rough duration hint` in the preflight block) |
+| Peak memory usage | `peak memory  X MB/GB RSS` — sampled every 5 s across the whole run |
+| Peak temporary disk | `peak temp disk` — sampled over `workDir` + `rawCacheDir` |
+| Index output size | `index output` — bytes written into `outputDir` |
+| Object count | `objects written` |
+| R2 request count | `r2 requests  N (M retried, X GB read, K object(s) streamed)` — counted per HTTP attempt, so retries are visible |
+| Rejected rows | `rows rejected`, with a per-source split |
+| Company / contact counts | `unique companies`, `unique contacts` |
+| Association ambiguity | `ambiguous kept apart (name collisions with conflicting strong evidence)` |
+| Checkpoint / resume | re-run the *same* command: `elapsed` drops, `files read` is restored from the checkpoint, and `r2 requests` shows `0 object(s) streamed` |
+
+For a Mode B run the counters also tell you what the local cache saved:
+`served from cache  X GB (no R2 requests for those bytes)`.
+
+A worked example (this workspace, real bucket, `--sample 2000 --version v1-check-b`):
+3,941 rows read, 163 rejected, 2,069 companies, 1,922 contacts, 13 ambiguous kept
+apart, 1,808 objects, **22.4 s** first run and **17.6 s** resumed, **0.51–0.54 GB**
+peak RSS, **1.2 MB** index output, and **6 R2 requests** (0 retried, 12.6 MB read).
+That is 4,000 records — scale it with the per-source parse rates above, not with
+this duration.
+
+### Checkpoints belong to one run
+
+`workDir/checkpoint.json` records a **run identity** next to the counters: dataset
+version, sample limit, partition count, and each source's path, delimiter and
+number of column overrides. Resuming is allowed only when the identity matches,
+because the spool partitions in `workDir/spool/` belong to the run that wrote
+them:
+
+- running the 1 M benchmark after a full run (or a sample after the benchmark)
+  **stops** with the exact differences listed, instead of merging two different
+  inputs into one version;
+- `--no-resume` is the answer: it ignores the checkpoint, clears the stale
+  `part-*.jsonl` spool (pass 1 *appends* to those files, so leaving them would add
+  a second copy of every row) and rebuilds from the sources;
+- a checkpoint written by an older build (no identity) is refused the same way —
+  unknown provenance is not resumed;
+- pointing `workDir` at an empty directory keeps both runs side by side.
 6. Verify in the app: `/dataset` shows the new active version, `/companies` returns results.
 
 No paid service is enabled by any of these steps. Nothing is published until a version passes
@@ -242,6 +320,8 @@ volume fills, but it does not create space: an under-sized machine fails at hour
 | High rejected-row count | Check the encoding/delimiter for that file; inspect `workDir/rejected.jsonl` reasons. |
 | `Refusing to start: temporary space is insufficient` | Free space on the `workDir` volume, or lower `partitions`. |
 | `Stopping before the disk fills: … below the … floor` | The mid-run guard (512 MB free on `outputDir`). Nothing written was lost and the checkpoint is still at `pass2-merge`: free space and re-run the same command to resume. |
+| `workDir already holds a checkpoint for a different run: …` | The spool belongs to another run (different version, sample size, partitions or source paths). Re-run with `--no-resume`, or point `workDir` somewhere empty. Nothing was read or written before the stop. |
+| `was written without a run identity; refusing to resume it` | A checkpoint from a build older than the run-identity change. Re-run with `--no-resume` once. |
 | A resumed run reports `source_missing_rows` (csv1=0, csv2=0) | Fixed: pass-1 counters are restored from the checkpoint, so a resumed run no longer fails validation over its own bookkeeping. If you see it on an older build, re-run with `--no-resume` once. |
 | `R2 credentials are not set` on publish | Export `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` for the session. |
 | Version uploaded but the app still shows the old data | `publish` was not run (or failed) — `manifests/active.json` still points at the previous version. |

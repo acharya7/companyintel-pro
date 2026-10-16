@@ -63,7 +63,7 @@ import {
   type RawCompanyInput,
 } from "./mapping";
 import { credentialsFromEnv, R2Client } from "./r2";
-import { createSourceContext, sourceBytes, sourceProfile, sourceRecords, type SourceContext } from "./source";
+import { createSourceContext, sourceBytes, sourceProfile, sourceRecords, type SourceContext, type SourceStats } from "./source";
 
 export interface SourceConfig {
   id: string;
@@ -141,6 +141,67 @@ const ROWS_PER_SECOND_BASELINE = 120_000;
  * `pass2-merge`, so re-running the same command resumes instead of starting over.
  */
 const DISK_FLOOR_BYTES = 512 * 1024 * 1024;
+
+/**
+ * Provenance recorded in `workDir/checkpoint.json` alongside the counters.
+ *
+ * The checkpoint marks a spool in `workDir/spool/` as belonging to one specific
+ * run. Without recording which one, a *different* run against the same workDir —
+ * the one-million-record benchmark after a dry run, a sample after a full run, a
+ * rebuild with new `columns` overrides — would silently merge a stale spool into
+ * a new version, and the resulting index would mix rows from two different
+ * inputs without anything failing. That is why every field that changes what the
+ * spool would contain is part of the identity, and why a mismatch stops the run
+ * instead of guessing.
+ */
+export interface CheckpointIdentity {
+  version: string;
+  sampleLimit: number | null;
+  partitions: number;
+  sources: { id: string; path: string; delimiter: string; columns: number }[];
+}
+
+interface CheckpointFile {
+  stage: string;
+  identity?: CheckpointIdentity;
+  counters?: Partial<IndexingCounters>;
+}
+
+/** The identity of the run about to start, compared against a stored checkpoint. */
+function identityFor(config: IndexerConfig, sampleLimit: number | undefined): CheckpointIdentity {
+  return {
+    version: config.datasetVersion,
+    sampleLimit: sampleLimit ?? null,
+    partitions: config.partitions,
+    sources: config.sources.map((source) => ({
+      id: source.id,
+      path: source.path,
+      delimiter: source.delimiter ?? "\t",
+      columns: Object.keys(source.columns ?? {}).length,
+    })),
+  };
+}
+
+/** Human-readable difference between two run identities, for the stop message. */
+function identityDiff(stored: CheckpointIdentity, current: CheckpointIdentity): string[] {
+  const differences: string[] = [];
+  if (stored.version !== current.version) differences.push(`version ${stored.version} → ${current.version}`);
+  if (stored.sampleLimit !== current.sampleLimit) {
+    differences.push(`sample ${stored.sampleLimit ?? "none"} → ${current.sampleLimit ?? "none"}`);
+  }
+  if (stored.partitions !== current.partitions) differences.push(`partitions ${stored.partitions} → ${current.partitions}`);
+  for (const source of current.sources) {
+    const previous = stored.sources.find((entry) => entry.id === source.id);
+    if (!previous) differences.push(`source ${source.id} is new`);
+    else if (previous.path !== source.path) differences.push(`${source.id} path → ${source.path}`);
+    else if (previous.delimiter !== source.delimiter) differences.push(`${source.id} delimiter changed`);
+    else if (previous.columns !== source.columns) differences.push(`${source.id} column overrides changed`);
+  }
+  for (const source of stored.sources) {
+    if (!current.sources.some((entry) => entry.id === source.id)) differences.push(`source ${source.id} is gone`);
+  }
+  return differences;
+}
 
 /** Source context (Mode A local files / Mode B R2 objects) for one config. */
 function sourceContextFor(config: IndexerConfig): SourceContext {
@@ -356,6 +417,14 @@ export interface RunResult {
   manifest: DatasetVersionSummary;
   profiles: FileProfile[];
   elapsedMs: number;
+  /**
+   * R2 traffic caused by this run, measured (see `SourceStats`). Zero for Mode A.
+   * A benchmark reports this as the operation count in the cost estimate, so it
+   * must come from the run itself rather than from an estimate of chunk size.
+   */
+  sourceStats: SourceStats;
+  /** Bytes this run wrote into `outputDir` (the generated index, on disk). */
+  outputBytes: number;
 }
 
 interface SpoolRow {
@@ -400,11 +469,58 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   const checkpointPath = join(workDir, "checkpoint.json");
   const diskFloorBytes = options.diskFloorBytes ?? DISK_FLOOR_BYTES;
   const resume = options.resume !== false;
-  const checkpoint = resume && existsSync(checkpointPath) ? JSON.parse(await readFile(checkpointPath, "utf8")) : null;
+  const stored: CheckpointFile | null = resume && existsSync(checkpointPath)
+    ? (JSON.parse(await readFile(checkpointPath, "utf8")) as CheckpointFile)
+    : null;
+  const identity = identityFor(config, options.sampleLimit);
+
+  /*
+   * A checkpoint from a different run must never be resumed into this one: the
+   * spool in `spoolDir` holds that run's rows, and pass 2 would merge them into
+   * this version's index. Stop and let the operator choose, rather than either
+   * silently mixing two inputs or silently deleting hours of spooled work.
+   */
+  if (stored && stored.identity && identityDiff(stored.identity, identity).length) {
+    const differences = identityDiff(stored.identity, identity);
+    throw new Error(
+      `workDir already holds a checkpoint for a different run: ${differences.join("; ")}.\n` +
+        `  Resume is refused because the spool partitions in ${spoolDir} belong to that run.\n` +
+        "  Either re-run with --no-resume (discards the spool and rebuilds from the sources),\n" +
+        "  or point `workDir` at an empty directory to keep both runs.",
+    );
+  }
+  if (stored && !stored.identity) {
+    // Written by an older build, which recorded no provenance. Its spool may or
+    // may not match this run, so it is treated as unknown rather than resumed.
+    console.warn(
+      `! ${checkpointPath} was written without a run identity; refusing to resume it.\n` +
+        "  Re-run with --no-resume to rebuild from the sources (this clears the old spool).",
+    );
+    throw new Error("Refusing to resume a checkpoint with unknown provenance.");
+  }
+  const checkpoint = stored;
 
   await mkdir(spoolDir, { recursive: true });
   await mkdir(shardDir, { recursive: true });
   await mkdir(config.outputDir, { recursive: true });
+
+  /*
+   * Starting fresh means the spool is empty, so any `part-*.jsonl` still on disk
+   * belongs to a previous run and MUST go: pass 1 appends to these files, and
+   * leaving them would add a second copy of every row to the new index (rows are
+   * deduplicated later, but company/contact counts, facets and rejected-row
+   * accounting would all be wrong). Only the spool is cleared — `outputDir`,
+   * generated objects and the raw cache are left alone.
+   */
+  if (!checkpoint) {
+    const stale = (await readdir(spoolDir).catch(() => [] as string[])).filter(
+      (name) => name.startsWith("part-") && name.endsWith(".jsonl"),
+    );
+    for (const name of stale) await rm(join(spoolDir, name), { force: true });
+    if (stale.length) {
+      emit({ stage: "pass1-partition", message: `cleared ${stale.length} stale spool partition file(s) from a previous run` });
+    }
+  }
 
   /* ------------------------------- profiling ------------------------------ */
 
@@ -464,13 +580,13 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   // perfectly good index ("csv1=0, csv2=0"). The checkpoint carries the
   // counters measured before the interruption; restore them so resume keeps the
   // real numbers instead of failing validation over its own bookkeeping.
-  const resumed = Boolean(checkpoint && checkpoint.stage !== "preflight" && checkpoint.counters);
-  if (resumed) {
+  const savedCounters = checkpoint?.stage === "preflight" ? undefined : checkpoint?.counters;
+  if (savedCounters) {
     // Only pass-1-owned counters are restored; everything pass 2 derives
     // (unique companies/contacts, duplicates, ambiguity, per-source
     // contribution) is recomputed by the resumed merge and would otherwise be
     // counted twice.
-    const saved = checkpoint.counters as Partial<IndexingCounters>;
+    const saved: Partial<IndexingCounters> = savedCounters;
     for (const key of ["rowsRead", "rowsRejected", "recordsMissingCompanyId"] as const) {
       if (typeof saved[key] === "number") counters[key] = saved[key] as number;
     }
@@ -568,7 +684,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       emit({ stage: "pass1-partition", rowsRead: counters.rowsRead, message: `pass 1: finished ${source.id} (${rows.toLocaleString()} rows)` });
     }
 
-    await writeFile(checkpointPath, JSON.stringify({ stage: "pass2-merge", counters }, null, 2));
+    await writeFile(checkpointPath, JSON.stringify({ stage: "pass2-merge", identity, counters } satisfies CheckpointFile, null, 2));
   }
 
   /* --------------------------------- pass 2 ------------------------------- */
@@ -969,7 +1085,19 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       : "index built but validation reported problems — see manifests/validation.json",
   });
 
-  return { version: config.datasetVersion, counters, objects: writer.objects, directory, manifest, profiles, elapsedMs };
+  return {
+    version: config.datasetVersion,
+    counters,
+    objects: writer.objects,
+    directory,
+    manifest,
+    profiles,
+    elapsedMs,
+    // Reported instead of estimated: the benchmark's Cloudflare cost line and its
+    // "R2 request count" both come from here.
+    sourceStats: sourceContext.stats,
+    outputBytes: writer.objects.reduce((sum, object) => sum + object.bytes, 0),
+  };
 }
 
 /* -------------------------------------------------------------------------- */

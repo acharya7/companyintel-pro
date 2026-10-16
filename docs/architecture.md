@@ -105,6 +105,15 @@ the budget is spent across the engine's hydration batches — so a search reads 
    the rest of the candidate list can neither reorder nor extend that page, so its tiers are
    never fetched. The count then becomes a floor, which the API already reports as `N+`
    (`page.totalIsLowerBound`).
+4. **Adaptive second pass** (`SearchOptions.adaptiveHydration`, default on, factor
+   `ADAPTIVE_HYDRATE_FACTOR = 2`). A short page is the one case where more bytes are worth
+   spending, so the engine re-walks the same candidate order with a doubled partition budget —
+   but only when the first pass was cut short *by that budget*. The source reports
+   `hydrationBudgetHit()`, which is the difference between "more budget would find more
+   companies" and "there are no more companies to find"; without it, a sparse query (an exact
+   name with four matches) would pay for a second round of reads that cannot find anything.
+   The ceiling is still `SEARCH_LIMITS.maxHydrate` (64), so a search can never read more than
+   `64 × ~25 KB ≈ 1.6 MB`.
 
 `retrieval.scored` reports the documents actually hydrated, so the number in the search
 sidebar is the real work done, not the candidate budget.
@@ -131,15 +140,44 @@ dominated by `JSON.parse` + gzip inflate + scoring, so the ~4× byte reduction i
 that matters for the Worker CPU budget; the read count rises slightly because small objects
 are what buy the byte reduction.
 
-**The trade-off, stated plainly:** the 16-partition ceiling can return fewer rows than
-hydrating all 400 candidates, for broad low-precision queries whose matches are spread over
-more partitions than the budget covers (measured: 68 rows across 14 query classes at 16
-partitions, 19 at 32, 4 at 64; the rows that *are* returned keep their order and score).
-Under-filled pages are reported as `N+`, never as a fake total. Raising `SEARCH_MAX_HYDRATE`
-buys those rows back at proportionally more bytes; the recall-correct fix is a layout whose
-candidates cluster (refs ordered by normalized name), which was measured and **did not** pay
-off on this data — the 400-candidate sets still spanned 20–50 of 82 partitions — so the
-partition ceiling stays the honest knob until a 1 M-record run can be measured.
+**The trade-off, stated plainly.** The partition ceiling can return fewer rows than hydrating
+every candidate, for broad low-precision queries whose matches are spread over more partitions
+than the budget covers. `bun scripts/benchmark-hydration.mjs` measures exactly that on the
+real-data sample (`.indexer-output`, 20,265 companies, 82 company partitions) and is the
+command to re-run after any tuning change:
+
+| strategy | rows returned (8 query classes) | rows lost vs the complete answer | R2 bytes read per query | worst-case partitions |
+| --- | --- | --- | --- | --- |
+| fixed 16 (old default) | 70 | 20 | 421 KB | 16 |
+| fixed 32 | 90 | 0 | 770 KB | 32 |
+| fixed 64 | 90 | 0 | 1.46 MB | 64 |
+| adaptive 16 → 32 (current) | 90 | 0 | 770 KB | 32 |
+| reference (every partition) | 90 | 0 | 1.46 MB | 82 |
+
+Broad queries ("global", "services", "consulting") were the ones losing 5–8 rows each; the
+adaptive pass recovers all of them, and the cost is paid only by a query whose page is still
+short after the first pass. Two consequences worth keeping in view:
+
+- the rows are recovered at the *same* byte cost as simply raising the default to 32, so the
+  adaptive pass is strictly better than a bigger fixed budget: precise queries (exact names,
+  short prefixes) keep their 16-partition latency;
+- a query whose true match count is **below** the page size pays the doubled read on every
+  search and cannot fill its page either way. Only knowing the match count before reading
+  removes that cost, which is a format question, not a tuning one.
+
+Alternatives evaluated for the next format version (v3) but **not** adopted yet, because v2
+stays until a 1 M-record run can measure them:
+
+| candidate design | why it is not in v2 |
+| --- | --- |
+| candidate→partition clustering (refs ordered so one partition holds likely co-matches) | measured on this data and did not pay off: the 400-candidate sets still spanned 20–50 of 82 partitions |
+| search-aware partition ordering during retrieval | already effectively present — partitions are taken in candidate (prominence) order, so the cap spends itself on the best candidates first |
+| compact metadata side index (name/tokens/contact count per partition, one small object) | the honest fix for the sparse-query case above: it would let the engine stop early with a *proven* total instead of a floor. Needs a new object class + format version + a full rebuild, so it must be validated against the 1 M benchmark first |
+| Top-K retrieval / score-bound early stopping | the existing `WEAK_CEILING` barrier already implements the provable case; a tighter bound needs per-partition max-score metadata (same dependency as above) |
+| exact-match fast path / prefix optimisation | already present: exact hits short-circuit the fuzzy passes and short queries use the prefix index (`maxPrefixLength = 12`) |
+
+Under-filled pages are reported as `N+` (`totalIsLowerBound`), never as a fake total, and the
+search sidebar shows the real hydrated document count (`retrieval.scored`).
 
 Match categories returned to the UI: `exact`, `alias`, `prefix`, `fuzzy`, `possible`. The UI
 shows *"Showing similar results for …"* for corrected queries and *"Possible match"* for

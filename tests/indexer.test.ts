@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -388,6 +388,48 @@ describe("end-to-end indexing pipeline", () => {
     expect(resumed.counters.perSource.csv2.rowsRead).toBe(2);
     expect(resumed.counters.uniqueCompanies).toBe(first.counters.uniqueCompanies);
     expect(resumed.counters.uniqueContacts).toBe(first.counters.uniqueContacts);
+  });
+
+  test("a checkpoint from a different run is refused instead of silently merged", async () => {
+    const workDir = join(dir, "work-provenance");
+    await runIndex({ ...config, workDir, outputDir: join(dir, "out-prov") }, {});
+
+    // Same workDir, different version: the spool belongs to the first run, so
+    // resuming would merge two different inputs into one index.
+    await expect(
+      runIndex({ ...config, datasetVersion: "test-v2", workDir, outputDir: join(dir, "out-prov-2") }, {}),
+    ).rejects.toThrow(/different run/);
+
+    // `--no-resume` is the documented answer: it rebuilds from the sources.
+    const rebuilt = await runIndex(
+      { ...config, datasetVersion: "test-v2", workDir, outputDir: join(dir, "out-prov-3") },
+      { resume: false },
+    );
+    expect(rebuilt.manifest.validationPassed).toBe(true);
+    expect(rebuilt.counters.rowsRead).toBe(5);
+    expect(rebuilt.counters.uniqueCompanies).toBe(3);
+    expect(rebuilt.counters.uniqueContacts).toBe(5);
+  });
+
+  test("a fresh run clears the stale spool so rows cannot be counted twice", async () => {
+    const workDir = join(dir, "work-stale-spool");
+    const spoolLines = async () => {
+      const files = (await readdir(join(workDir, "spool"))).filter((name) => name.endsWith(".jsonl"));
+      let lines = 0;
+      for (const name of files) {
+        lines += (await readFile(join(workDir, "spool", name), "utf8")).split("\n").filter(Boolean).length;
+      }
+      return lines;
+    };
+
+    await runIndex({ ...config, workDir, outputDir: join(dir, "out-stale-1") }, {});
+    // Five data rows are spooled (three from csv1, two from csv2).
+    expect(await spoolLines()).toBe(5);
+
+    // Pass 1 appends to `part-*.jsonl`. Without clearing, this second fresh run
+    // would leave ten rows in the spool and double every count downstream.
+    await runIndex({ ...config, workDir, outputDir: join(dir, "out-stale-2") }, { resume: false });
+    expect(await spoolLines()).toBe(5);
   });
 
   test("a run stops cleanly when free space drops below its floor", async () => {

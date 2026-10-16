@@ -22,9 +22,10 @@ No Convex, no SQL database, no KV/D1/Durable Objects, no Redis, no search server
 - Fixed server-side credentials: one private, git-ignored `.r2-credentials.json` (mode 600) read
   automatically by the indexer and the verification scripts — never by the browser bundle or the
   deployed Worker, which uses the `COMPANY_DATA` binding
-- Tests: `bun test` (255 tests, 1141 assertions) — normalization, relevance, prototype-chain safety,
-  CSV/indexer, R2 store, end-to-end index + Worker API over a generated index, lead recovery,
-  security, the R2 probe and its runner, and the S3 verification scripts over a stub transport
+- Tests: `bun test` (304 tests, 1296 assertions) — normalization, relevance, prototype-chain safety,
+  CSV/indexer, R2 store, end-to-end index + Worker API over a generated index, the bounded
+  hydration funnel, lead recovery, security, the R2 probe and its runner, and the S3 verification
+  scripts over a stub transport
 
 ## Documentation
 
@@ -46,6 +47,7 @@ No Convex, no SQL database, no KV/D1/Durable Objects, no Redis, no search server
 ```bash
 bun install
 bun run check             # typechecks (frontend, worker, indexer, probe) + full test suite
+bun run bench:hydration   # completeness vs R2 cost of the search hydration budget (real-data sample)
 bun run r2:doctor         # credentials file + endpoint + one signed LIST of the real raw/ prefix
 bun run r2:schema         # both real source files: encoding, delimiter, columns, mapping
 bun run verify:r2         # inventory, sizes, ETags, bounded body reads, dataset state
@@ -77,7 +79,14 @@ bun run index:publish
 
 Iterating on search quality or the theme does not require data:
 `bun run bench` measures latency, retrieval cost and labelled relevance (recall@1/@5, false
-positives) on a synthetic corpus.
+positives) on a synthetic corpus, and `bun run bench:hydration` measures what the per-search
+hydration budget costs in rows lost vs. bytes read against the real-data sample index.
+
+The 1 M-record benchmark checks its prerequisites first and writes nothing until they hold:
+`bun run index:benchmark-1m:preflight` verifies R2 credentials, both object keys, the TSV mapping
+and free disk/memory, then stops. `workDir/checkpoint.json` records the run it belongs to, so
+running the benchmark in a workDir that holds another run's spool stops with an explanation
+instead of merging two inputs (`--no-resume` rebuilds from the sources).
 
 Before any of that, Phase A verifies what is really in R2 — read-only, bounded, both source files
 untouched (`docs/r2-connection.md`). The recommended path needs **no credentials at all**: it uses
@@ -101,7 +110,8 @@ The equivalent S3-key path remains available: `bun scripts/verify-raw.mjs[--json
 | Area | Status |
 | --- | --- |
 | Frontend, Worker, indexer, probe typechecks | **IMPLEMENTED AND TESTED** — `bun run check` → 5/5 PASS |
-| Test suite (255 tests, 1141 assertions) | **IMPLEMENTED AND TESTED** — normalization, prototype-chain safety, relevance, CSV parsing, indexer pipeline + R2 streaming sources, R2 store, Access security, end-to-end index build + Worker route handlers, the read-only probe |
+| Test suite (304 tests, 1296 assertions) | **IMPLEMENTED AND TESTED** — normalization, prototype-chain safety, relevance, CSV parsing, indexer pipeline + R2 streaming sources, R2 store, Access security, end-to-end index build + Worker route handlers, the bounded hydration funnel (including checkpoint provenance), the read-only probe |
+| Build and bundles | **IMPLEMENTED AND TESTED** — `bun run build` exits 0 and the `dist/` scan finds no server identifier; `wrangler deploy --dry-run` bundles the Worker (737 KiB) and the probe (39 KiB) with the expected bindings and `workers_dev = false` |
 | Worker → R2 access path | **IMPLEMENTED AND TESTED** — `tests/worker-r2-binding.test.ts` proves the Worker reaches R2 only through the `COMPANY_DATA` binding, never with S3 secrets, and that the bucket is not published |
 | Read-only R2 probe (native binding, no keys) | **IMPLEMENTED AND TESTED locally** — `tests/r2-probe.test.ts`, `tests/r2-probe-schema.test.ts`, `tests/verify-r2-remote-script.test.ts` cover routing, bound clamping, the production refusal, 405 on writes, no write/delete call existing anywhere in the probe, 1 KB/6 MB read budgets, missing-object handling, the schema report and the runner's 0/1/2 exit codes. **Not run against your account** |
 | Read-only R2 verification scripts (S3 keys) | **VERIFIED ON THE REAL BUCKET** (`r2:doctor`, `r2:schema`, `verify:r2`, `index:profile`) — plus the stub-transport tests: bounded 25-object `raw/` listing, size/ETag + 1 KB ranged body read, missing-object and denied-credential exit codes, `--json` reports with no cell values |
