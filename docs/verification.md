@@ -203,7 +203,7 @@ link — which is exactly how the indexer joins them.
 | --- | --- |
 | companies / contacts | 20,265 / 19,414 |
 | companies with a domain | 14,937 (73.7%) |
-| contacts on an identified (domain-bearing) company | 14,515 (74.8%) |
+| contacts on an identified company (has a domain or a LinkedIn page — LinkedIn coverage is 0% on this data, so domain is what counts) | 14,515 (74.8%) |
 | contacts on a name-only company | 4,899 |
 | ambiguous companies (same name, contradictory identity — kept apart) | 220 |
 | contacts sitting on a company whose name is shared by >1 record | 227 (1.17%) |

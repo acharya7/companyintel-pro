@@ -150,24 +150,28 @@ counts. **Nothing is fabricated:** before a first successful index the UI shows
 
 ## Preflight report
 
-`profile` and `run` both print the preflight block first:
+`profile` and `run` both print the preflight block first. This is the real output from
+`bun run index:profile` against the live bucket (the free-disk and CPU figures describe the
+development sandbox, not your machine):
 
 ```
 Preflight
   ok   csv1  10.22 GB  r2://company-intel-data/raw/file1.csv
   ok   csv2  54.04 GB  r2://company-intel-data/raw/file2.csv
-  input total          58.93 GB
-  free disk            412.5 GB
-  temporary space need 88.4 GB
-  estimated output     12.1 GB
-  memory free / total  21.4 GB / 32.0 GB
-  cpu cores            12
-  ! Less than 1 GB of free memory: ...
-  rough duration hint  ~54 min at 120,000 rows/s (measure with a sample run)
+  input total          64.26 GB
+  free disk            0.94 GB
+  temporary space need 70.96 GB
+  estimated output     7.71 GB
+  memory free / total  1.64 GB / 2.09 GB
+  cpu cores            1
+  ! Temporary space looks insufficient: about 0.9 GB free vs 71.0 GB estimated for spooling.
+  rough duration hint  ~10 min at 120,000 rows/s (measure with a sample run)
 ```
 
-The run refuses to start when temporary space is clearly insufficient. The duration figure is
-an explicit hint, not a measurement — replace it with your own sample-run timing.
+The run refuses to start when temporary space is clearly insufficient — which is correct for this
+sandbox and is why the full job belongs on your machine. The output-size and duration figures are
+hints, not measurements: replace them with your own sample-run timings (the measured parse rates
+and transfer rates in the cost table above are the numbers to plan with).
 
 ## Recommended sequence (approval gates included)
 
