@@ -22,10 +22,10 @@
  */
 
 import { createHash, type Hash } from "node:crypto";
-import { createWriteStream, existsSync, type WriteStream } from "node:fs";
+import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, type WriteStream, writeSync } from "node:fs";
 import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { cpus, freemem, totalmem } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { gzipSync } from "node:zlib";
 
 import type { Company, Contact, DatasetStats, DatasetVersionSummary, FacetBucket, IndexingCounters, SourceRef } from "../../../src/shared/models";
@@ -245,6 +245,60 @@ export interface PreflightReport {
 const DISK_FLOOR_BYTES = 512 * 1024 * 1024;
 
 /**
+ * Pass-2 progress thresholds.
+ *
+ * A partition is read whole and merged before the next one starts, so "how long
+ * has THIS step been running" is the only honest way to tell working from slow
+ * from stuck:
+ *
+ *   - `PARTITION_HEARTBEAT_RECORDS` / `PARTITION_HEARTBEAT_MS`: while a partition
+ *     is being consumed, report where inside it the merge is (at most every 15 s),
+ *     so a large partition cannot look like a stall;
+ *   - `SLOW_PARTITION_MS`: a single partition taking longer than this is reported
+ *     as slow, with its row count and how far above the average it is — a partition
+ *     is buffered whole before it is written, so a skewed one really is slower;
+ *   - `STALL_PARTITION_MS`: beyond this the message says plainly that no other
+ *     explanation is available and points at the volume.
+ */
+const PARTITION_HEARTBEAT_RECORDS = 25_000;
+const PARTITION_HEARTBEAT_MS = 15_000;
+const SLOW_PARTITION_MS = 10_000;
+const STALL_PARTITION_MS = 120_000;
+
+/**
+ * Classify one completed pass-2 partition in plain language.
+ *
+ * Pass 2 has exactly one unit of work that can be slow — one partition, read whole
+ * and merged before the next one starts — so "how long did that step take, and how
+ * big was it" is the whole diagnostic. Kept pure and exported so the wording for
+ * working / slow / stalled is asserted directly instead of by waiting ten seconds
+ * for a real partition to trip the threshold.
+ */
+export function pass2StepNotes(params: { partitionMs: number; rows: number; averageRows: number }): string[] {
+  const { partitionMs, rows, averageRows } = params;
+  const skew = averageRows > 0 ? rows / averageRows : 1;
+  if (partitionMs >= STALL_PARTITION_MS) {
+    return [
+      `this partition took ${(partitionMs / 1000).toFixed(0)}s and nothing in the merge loop explains that (${rows.toLocaleString()} rows), ` +
+        "so treat it as a stall: check the volume the spool is on and the one the output is written to, and whether another process is using them",
+    ];
+  }
+  if (partitionMs >= SLOW_PARTITION_MS) {
+    return [
+      skew >= 1.5
+        ? `slow step, and expected: ${rows.toLocaleString()} rows is ${skew.toFixed(1)}x the ${Math.round(averageRows).toLocaleString()}-row average, and a partition is buffered whole before it is merged — not a stall`
+        : `slow step at ${(partitionMs / 1000).toFixed(1)}s for ${rows.toLocaleString()} rows of an average size: I/O contention or a cold cache rather than a stall, unless it keeps growing`,
+    ];
+  }
+  if (skew >= 3 && rows >= 1_000) {
+    return [
+      `${rows.toLocaleString()} rows in this partition, ${skew.toFixed(1)}x the average — merge cost grows with partition size, so expect the large ones to take longer`,
+    ];
+  }
+  return [];
+}
+
+/**
  * Provenance recorded in `workDir/checkpoint.json` alongside the counters.
  *
  * The checkpoint marks a spool in `workDir/spool/` as belonging to one specific
@@ -308,6 +362,39 @@ function identityDiff(stored: CheckpointIdentity, current: CheckpointIdentity): 
 /** Source context (Mode A local files / Mode B R2 objects) for one config. */
 function sourceContextFor(config: IndexerConfig): SourceContext {
   return createSourceContext({ cacheDir: config.rawCacheDir === undefined ? undefined : config.rawCacheDir });
+}
+
+/**
+ * Read `workDir/checkpoint.json`.
+ *
+ * A damaged checkpoint is a hard stop and NOT the same thing as "no checkpoint".
+ * If it were treated as absent, pass 1 would run again and APPEND a second copy of
+ * every row to the spool partitions that are already there (they are opened with
+ * flag `a`), silently doubling the dataset. Stopping leaves the spool untouched and
+ * says exactly what to inspect. It is written atomically (`writeJsonAtomic`), so
+ * this should be unreachable for anything written by this build.
+ */
+async function readCheckpoint(path: string): Promise<CheckpointFile> {
+  let text: string;
+  try {
+    text = await readFile(path, "utf8");
+  } catch (error) {
+    throw new Error(
+      `Could not read ${path} (${error instanceof Error ? error.message : String(error)}).\n` +
+        "  Pass 1 cannot be shown to belong to this run without it, and re-reading the sources would append a second\n" +
+        "  copy of every row to the existing spool. The spool itself is untouched: `bun run index:spool-doctor`\n" +
+        "  inspects it read-only, and --no-resume rebuilds it from the sources if that is what you want.",
+    );
+  }
+  try {
+    return JSON.parse(text) as CheckpointFile;
+  } catch (error) {
+    throw new Error(
+      `${path} is not valid JSON (${error instanceof Error ? error.message : String(error)}), so the run it describes is\n` +
+        "  unknown. The spool is untouched: `bun run index:spool-doctor` inspects it read-only, and --no-resume\n" +
+        "  rebuilds it from the sources.",
+    );
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -465,60 +552,146 @@ async function freeDiskBytesFor(path: string): Promise<number | null> {
 
 type ShardKind = "exact" | "prefix" | "token" | "trigram" | "ids";
 
+const SHARD_KINDS: ShardKind[] = ["exact", "prefix", "token", "trigram", "ids"];
+const SHARD_KIND_INDEX: Record<ShardKind, number> = { exact: 0, prefix: 1, token: 2, trigram: 3, ids: 4 };
+/** Room for every shard number under one kind; keys stay small integers. */
+const SHARD_KEY_STRIDE = 1 << 20;
+
 /**
- * Appends `term␁ref␁quality` lines to one file per shard, keeping a bounded
- * number of file handles open. Postings are never accumulated in memory, which
- * is what makes a 10M-company trigram index possible on a laptop.
+ * How much posting text one buffer may hold before it is written out.
+ *
+ * This is the only posting state the writer keeps in memory, and it is bounded in
+ * BYTES rather than in postings, so the footprint is the same whether a company
+ * emits 40 short postings or 4 long ones. 8 MiB is a rounding error next to the
+ * per-partition `groups` map pass 2 already holds (~200 MB for a 1 M-row run) and
+ * it is written out as one append per shard file — see `ShardWriter.flush`.
+ */
+export const SHARD_FLUSH_BYTES = 8 * 1024 * 1024;
+
+/** What the posting writer did, so the cost claim is measurable, not asserted. */
+export interface ShardWriteStats {
+  /** Posting lines handed to the writer. */
+  appends: number;
+  /** Bytes of posting text written. */
+  bytes: number;
+  /** Shard files opened for append: one per (kind, shard) per flush. */
+  fileOpens: number;
+  /** Times a buffered batch was written out. */
+  flushes: number;
+  /** Highest number of buffered bytes at once (the memory bound). */
+  peakBufferedBytes: number;
+  /** Highest number of file handles open at once. */
+  peakOpenHandles: number;
+}
+
+/**
+ * Appends `term␁ref␁quality` lines to one file per shard, batched by shard.
+ *
+ * WHY BATCHED (this is the 1 M benchmark's other half of being "extremely slow")
+ * -----------------------------------------------------------------------------
+ * The previous writer opened a `WriteStream` (asynchronously, with a `mkdir` in
+ * front of it) for a shard that was not already in a 64-entry LRU cache, and the
+ * real config has 1,792 shard files. One company's postings are spread across all
+ * of them, so the cache could never hold the working set: measured on a 10,000-
+ * company corpus with the real shard counts, the merge opened and closed
+ * **550,958 streams for ~1.15 M postings**. On Windows each of those is an open,
+ * a buffered write and a close against NTFS, which is why pass 2 appeared stalled.
+ *
+ * The fix is to decide where each line goes first and write each shard file once:
+ * lines are buffered in memory grouped by shard, keys are visited in ascending
+ * order when the buffer fills, and each group becomes ONE append of one Buffer to
+ * one file descriptor. The file system sees ~1,800 large appends per flush instead
+ * of ~280,000 small ones, and because the keys are always visited in the same
+ * order the produced shard files are a pure function of the input.
+ *
+ * It also closes two correctness holes in the old writer:
+ *   - `stream.end()` on an evicted handle was never awaited, so `close()` could
+ *     return while a shard file was still being flushed (and the process could exit
+ *     before it was); `flush()` here is synchronous and every fd is closed before
+ *     it returns;
+ *   - posting order within a shard used to depend on which streams happened to be
+ *     open, where now it depends only on the emission order, which is itself
+ *     deterministic (partitions in order, companies in ref order).
  */
 class ShardWriter {
-  private readonly handles = new Map<string, WriteStream>();
-  private readonly order: string[] = [];
-  private readonly pending: Promise<void>[] = [];
+  private readonly groups = new Map<number, string[]>();
+  private readonly readyDirs = new Set<string>();
+  private bufferedBytes = 0;
+  private openHandles = 0;
+  readonly stats: ShardWriteStats = {
+    appends: 0,
+    bytes: 0,
+    fileOpens: 0,
+    flushes: 0,
+    peakBufferedBytes: 0,
+    peakOpenHandles: 0,
+  };
 
   constructor(
     private readonly root: string,
-    private readonly maxHandles = 64,
+    private readonly flushBytes = SHARD_FLUSH_BYTES,
   ) {}
 
-  private async handle(kind: ShardKind, shard: number): Promise<WriteStream> {
-    const key = `${kind}/${String(shard).padStart(4, "0")}`;
-    const existing = this.handles.get(key);
-    if (existing) return existing;
-
-    if (this.handles.size >= this.maxHandles) {
-      const evictKey = this.order.shift();
-      if (evictKey) {
-        const stream = this.handles.get(evictKey);
-        this.handles.delete(evictKey);
-        stream?.end();
-      }
+  /**
+   * Buffer one posting. Synchronous on purpose: the merge loop is one hot path and
+   * an `await` per posting cost a microtask hop per posting on top of the I/O.
+   */
+  write(kind: ShardKind, shard: number, term: string, ref: number, quality: number): void {
+    const key = SHARD_KIND_INDEX[kind] * SHARD_KEY_STRIDE + shard;
+    let group = this.groups.get(key);
+    if (!group) {
+      group = [];
+      this.groups.set(key, group);
     }
-
-    const path = join(this.root, `${key}.lines`);
-    await mkdir(dirname(path), { recursive: true });
-    const stream = createWriteStream(path, { flags: "a" });
-    this.handles.set(key, stream);
-    this.order.push(key);
-    return stream;
-  }
-
-  async write(kind: ShardKind, shard: number, term: string, ref: number, quality: number): Promise<void> {
-    const stream = await this.handle(kind, shard);
     // `escapeTerminators` keeps U+2028/U+2029 out of the record for the same
     // reason `encodeJsonlLine` does for the spool: a term containing one used to
     // split the posting across two "lines" and lose it.
     const line = `${escapeTerminators(term)}\u0001${ref}\u0001${quality}\n`;
-    if (!stream.write(line)) {
-      await new Promise<void>((resolve) => stream.once("drain", () => resolve()));
-    }
+    group.push(line);
+    this.bufferedBytes += line.length;
+    this.stats.appends += 1;
+    this.stats.bytes += line.length;
+    if (this.stats.peakBufferedBytes < this.bufferedBytes) this.stats.peakBufferedBytes = this.bufferedBytes;
+    if (this.bufferedBytes >= this.flushBytes) this.flush();
   }
 
-  async close(): Promise<void> {
-    for (const stream of this.handles.values()) {
-      this.pending.push(new Promise<void>((resolve) => stream.end(resolve)));
+  /** Write every buffered shard file: one open, one append, one close each. */
+  flush(): void {
+    if (!this.groups.size) return;
+    const keys = [...this.groups.keys()].sort((a, b) => a - b);
+    for (const key of keys) {
+      const lines = this.groups.get(key)!;
+      const kind = SHARD_KINDS[Math.floor(key / SHARD_KEY_STRIDE)];
+      const shard = key % SHARD_KEY_STRIDE;
+      const dir = join(this.root, kind);
+      if (!this.readyDirs.has(dir)) {
+        mkdirSync(dir, { recursive: true });
+        this.readyDirs.add(dir);
+      }
+      const path = join(dir, `${String(shard).padStart(4, "0")}.lines`);
+      const body = Buffer.from(lines.join(""), "utf8");
+      const fd = openSync(path, "a");
+      this.stats.fileOpens += 1;
+      this.openHandles += 1;
+      if (this.stats.peakOpenHandles < this.openHandles) this.stats.peakOpenHandles = this.openHandles;
+      try {
+        // `writeSync` may write fewer bytes than requested, so the remainder is
+        // written in a loop rather than assumed away.
+        let written = 0;
+        while (written < body.length) written += writeSync(fd, body, written, body.length - written);
+      } finally {
+        closeSync(fd);
+        this.openHandles -= 1;
+      }
     }
-    this.handles.clear();
-    await Promise.all(this.pending);
+    this.groups.clear();
+    this.bufferedBytes = 0;
+    this.stats.flushes += 1;
+  }
+
+  /** Flush what is buffered. Synchronous: there is no pending write to wait for. */
+  close(): void {
+    this.flush();
   }
 }
 
@@ -566,6 +739,158 @@ class ObjectWriter {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Pass-2 restart safety                                                      */
+/* -------------------------------------------------------------------------- */
+
+type Emit = (event: Partial<ProgressEvent> & { stage: ProgressEvent["stage"]; message: string }) => void;
+
+/** What a pass-2 restart deleted before replaying the merge. */
+export interface Pass2ResetReport {
+  /** Temporary shard posting files removed from `workDir/shards` (all of them). */
+  shardFiles: number;
+  /** Generated output files removed for this version. */
+  outputFiles: number;
+  /** Bytes those output files occupied (for the disk-space report). */
+  outputBytes: number;
+  /** Version-scoped paths that were cleared, relative to `outputDir`. */
+  cleared: string[];
+}
+
+/** Recursively count files and bytes under a path. A missing path counts as zero. */
+async function measureTree(root: string): Promise<{ files: number; bytes: number }> {
+  const entries = await readdir(root, { withFileTypes: true }).catch(() => null);
+  if (!entries) return { files: 0, bytes: 0 };
+  let files = 0;
+  let bytes = 0;
+  for (const entry of entries) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) {
+      const nested = await measureTree(path);
+      files += nested.files;
+      bytes += nested.bytes;
+    } else {
+      files += 1;
+      bytes += (await stat(path).catch(() => null))?.size ?? 0;
+    }
+  }
+  return { files, bytes };
+}
+
+/**
+ * A spool partition's length is a recorded fact, so check it before merging.
+ *
+ * Completeness before content: a truncated partition is a shorter but perfectly
+ * valid JSONL file, so its length has to be compared with what pass 1 recorded,
+ * not with whether the records that survive happen to parse.
+ */
+async function assertPartitionLength(entry: SpoolManifestEntry, spoolDir: string): Promise<void> {
+  const info = await stat(join(spoolDir, entry.file)).catch(() => null);
+  if (!info) {
+    throw new Error(
+      `Spool partition ${entry.file} is recorded in ${SPOOL_MANIFEST_FILE} but is missing from ${spoolDir}. ` +
+        "Nothing was merged for it and nothing was deleted; re-run with --no-resume to rebuild the spool.",
+    );
+  }
+  if (info.size !== entry.bytes) {
+    throw new Error(
+      `Spool partition ${entry.file} is truncated: ${info.size.toLocaleString()} B on disk, ${entry.bytes.toLocaleString()} B recorded by pass 1.\n` +
+        "  Merging it would silently drop the rows that are missing, so the run stops here. Nothing was deleted.\n" +
+        "  Re-run with --no-resume to rebuild the spool from the sources (`bun run index:spool-doctor` reports every\n" +
+        "  partition first if you want to see the full picture).",
+    );
+  }
+}
+
+/**
+ * Delete everything pass 2 is about to regenerate, and nothing else.
+ *
+ * WHY THIS IS NEEDED
+ * ------------------
+ * There is no partition-level resume: after an interruption pass 2 is replayed
+ * from partition 1. But pass 2 *appends* and *overwrites*, and two kinds of state
+ * survive an interrupted merge:
+ *
+ *   1. `workDir/shards/<kind>/<NNNN>.lines`, the temporary per-shard posting
+ *      files. They are opened with flag `a`, so replaying partitions 1..k appended
+ *      a second copy of every posting already written for them. The finalize step
+ *      only drops a posting that repeats the *previous* line, so the duplicate
+ *      refs survived into the published shard payloads: a company could be
+ *      returned twice, and its quality byte counted twice;
+ *   2. the generated output of the abandoned attempt — `companies|contacts|indexes|
+ *      manifests/<version>/` and `objects.jsonl`. Anything left there is picked up
+ *      by `validate`, by `upload` and by the local manifest even though this run
+ *      never produced it, and a company/contact object from a *different* run of
+ *      the same version would be hydrated as if it belonged to this one.
+ *
+ * Both are outputs of pass 2, so both are wiped before it runs again.
+ *
+ * WHAT IT MUST NOT TOUCH
+ * ----------------------
+ * The whole point of this path is that 5-6 hours of pass 1 survives, so the spool
+ * (`workDir/spool`), `spool-manifest.json`, `checkpoint.json`, `rejected.jsonl`,
+ * the raw cache, the credentials and every OTHER dataset version are inputs and are
+ * left exactly as they are. Only paths this run's own pass 2 will rewrite are
+ * removed, every path is checked to be inside `outputDir` (a dataset version is
+ * operator-supplied, so `..` must not be able to point the delete elsewhere), and
+ * `manifests/active.json` is never in the list.
+ *
+ * INTERRUPTION IS SAFE
+ * --------------------
+ * Each removal is an idempotent whole-tree delete and a missing path is not an
+ * error, so a cleanup that is itself interrupted is simply finished by the next
+ * start: the same paths are removed again before the merge begins. The deletions
+ * also happen BEFORE any of this run's output is written, so an interrupted
+ * cleanup can never leave "new" files mixed with "old" ones.
+ */
+async function resetPass2Output(
+  config: IndexerConfig,
+  paths: { shardDir: string },
+  emit: Emit,
+): Promise<Pass2ResetReport> {
+  const report: Pass2ResetReport = { shardFiles: 0, outputFiles: 0, outputBytes: 0, cleared: [] };
+
+  // 1. Temporary shard postings: pure pass-2 scratch, rebuilt from the spool.
+  report.shardFiles = (await measureTree(paths.shardDir)).files;
+  await rm(paths.shardDir, { recursive: true, force: true });
+  await mkdir(paths.shardDir, { recursive: true });
+
+  // 2. Generated output for THIS version only.
+  const outputRoot = resolve(config.outputDir);
+  const targets = [
+    `companies/${config.datasetVersion}`,
+    `contacts/${config.datasetVersion}`,
+    `indexes/${config.datasetVersion}`,
+    `manifests/${config.datasetVersion}`,
+    "objects.jsonl",
+  ];
+  for (const relative of targets) {
+    const target = resolve(outputRoot, relative);
+    if (target === outputRoot || !target.startsWith(outputRoot + sep)) {
+      throw new Error(
+        `Refusing to reset ${target}: a dataset version may not point outside the output directory (${outputRoot}).\n` +
+          "  Nothing was deleted by this run.",
+      );
+    }
+    const measured = await measureTree(target);
+    report.outputFiles += measured.files;
+    report.outputBytes += measured.bytes;
+    if (measured.files) report.cleared.push(relative);
+    await rm(target, { recursive: true, force: true });
+  }
+
+  if (report.shardFiles || report.outputFiles) {
+    emit({
+      stage: "pass2-merge",
+      message:
+        `pass 2: reset ${report.shardFiles.toLocaleString()} temporary shard file(s) and ` +
+        `${report.outputFiles.toLocaleString()} generated output file(s) (${(report.outputBytes / 1e9).toFixed(2)} GB) ` +
+        `for version ${config.datasetVersion}; ${report.cleared.length ? report.cleared.join(", ") : "no generated objects"}`,
+    });
+  }
+  return report;
+}
+
+/* -------------------------------------------------------------------------- */
 /* Pipeline                                                                   */
 /* -------------------------------------------------------------------------- */
 
@@ -607,8 +932,15 @@ export interface RunResult {
    * re-read.
    */
   stages: { profilingMs: number; pass1Ms: number; pass2Ms: number; finalizeMs: number; validateMs: number };
-  /** True when this run skipped pass 1 because it resumed a checkpoint. */
+  /** True when this run skipped pass 1 because it resumed a completed spool. */
   resumed: boolean;
+  /**
+   * What the pass-2 restart deleted before replaying the merge. All zeroes on a
+   * run that started from an empty work directory.
+   */
+  pass2Reset: Pass2ResetReport;
+  /** Posting-writer counters (lines, shard appends, peak buffer), measured. */
+  shardWrite: ShardWriteStats;
 }
 
 /**
@@ -666,9 +998,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   const checkpointPath = join(workDir, "checkpoint.json");
   const diskFloorBytes = options.diskFloorBytes ?? DISK_FLOOR_BYTES;
   const resume = options.resume !== false;
-  const stored: CheckpointFile | null = resume && existsSync(checkpointPath)
-    ? (JSON.parse(await readFile(checkpointPath, "utf8")) as CheckpointFile)
-    : null;
+  const stored: CheckpointFile | null = resume && existsSync(checkpointPath) ? await readCheckpoint(checkpointPath) : null;
   const identity = identityFor(config, options.sampleLimit);
 
   /*
@@ -697,6 +1027,27 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   }
   const checkpoint = stored;
 
+  /*
+   * Is pass 1 being reused, or is it about to run?
+   *
+   * Only a checkpoint that records the `pass2-merge` stage means "this spool is
+   * complete" — that is the stage written after the spool manifest, which is the
+   * file that actually proves it. This single flag decides three things that used
+   * to be decided separately and inconsistently: whether the stale spool is
+   * cleared, whether pass 1 runs at all, and whether `rejected.jsonl` is appended
+   * to or rewritten. Getting them out of step is what could double every row in a
+   * new spool.
+   */
+  const reuseSpool = checkpoint?.stage === "pass2-merge";
+  if (reuseSpool) {
+    emit({
+      stage: "pass2-merge",
+      message:
+        `pass 2: reusing the Pass 1 spool in ${spoolDir} (checkpoint ${checkpointPath} records stage pass2-merge` +
+        `${identity.version ? `, version ${identity.version}` : ""}); the sources are NOT read again.`,
+    });
+  }
+
   await mkdir(spoolDir, { recursive: true });
   await mkdir(shardDir, { recursive: true });
   await mkdir(config.outputDir, { recursive: true });
@@ -709,7 +1060,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
    * accounting would all be wrong). Only the spool is cleared — `outputDir`,
    * generated objects and the raw cache are left alone.
    */
-  if (!checkpoint) {
+  if (!reuseSpool) {
     const stale = (await readdir(spoolDir).catch(() => [] as string[])).filter(
       (name) => name.startsWith("part-") && name.endsWith(".jsonl"),
     );
@@ -735,7 +1086,22 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   const profilingStart = Date.now();
   const profiles: FileProfile[] = [];
   const columnMaps: Record<string, number>[] = [];
-  for (const source of config.sources) {
+  /*
+   * A resumed run does not profile the sources, and that is not just a saving: the
+   * column map exists to build the spool, and the spool is already built. Profiling
+   * is a real read of every source (a bounded sample of a Mode B object is still a
+   * ranged GET), so skipping it is what makes "pass 2 reuses Pass 1 without reading
+   * the source data again" literally true — the merge then completes even if the
+   * source files or objects are unreachable, which is exactly when an operator wants
+   * to finish the index they already paid hours for.
+   */
+  if (reuseSpool) {
+    emit({
+      stage: "profiling",
+      message: `profiling skipped: pass 1 is reused from ${spoolDir}, and the column mapping it used is already recorded in the spool`,
+    });
+  }
+  for (const source of reuseSpool ? [] : config.sources) {
     // Mode A profiles the file; Mode B profiles a bounded sample of the object.
     const profile = await sourceProfile(
       source,
@@ -791,7 +1157,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   // perfectly good index ("csv1=0, csv2=0"). The checkpoint carries the
   // counters measured before the interruption; restore them so resume keeps the
   // real numbers instead of failing validation over its own bookkeeping.
-  const savedCounters = checkpoint?.stage === "preflight" ? undefined : checkpoint?.counters;
+  const savedCounters = reuseSpool ? checkpoint?.counters : undefined;
   if (savedCounters) {
     // Only pass-1-owned counters are restored; everything pass 2 derives
     // (unique companies/contacts, duplicates, ambiguity, per-source
@@ -811,12 +1177,14 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   }
 
   const rejectedPath = join(workDir, "rejected.jsonl");
-  const rejected = createWriteStream(rejectedPath, { flags: checkpoint ? "a" : "w" });
+  // Appended only when this run reuses the spool it belongs to (nothing is written
+  // to it in that case); a run that re-reads the sources starts the list over.
+  const rejected = createWriteStream(rejectedPath, { flags: reuseSpool ? "a" : "w" });
 
   /** Milliseconds pass 1 occupied, for the run's stage breakdown. */
-  let pass1Ms = checkpoint ? 0 : -1;
+  let pass1Ms = reuseSpool ? 0 : -1;
 
-  if (!checkpoint || checkpoint.stage === "preflight") {
+  if (!reuseSpool) {
     emit({ stage: "pass1-partition", message: "pass 1: streaming both files into hash partitions" });
     const pass1Start = Date.now();
 
@@ -949,10 +1317,70 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     });
 
     pass1Ms = Date.now() - pass1Start;
-    await writeFile(checkpointPath, JSON.stringify({ stage: "pass2-merge", identity, counters } satisfies CheckpointFile, null, 2));
+    // Written through a temporary file and renamed: a checkpoint that is half
+    // written (a crash, a full disk) is not a checkpoint, and the next start would
+    // have no way to tell "pass 1 completed" from "this file is damaged".
+    await writeJsonAtomic(checkpointPath, { stage: "pass2-merge", identity, counters } satisfies CheckpointFile);
   }
 
   /* --------------------------------- pass 2 ------------------------------- */
+
+  /*
+   * Pass 2 merges ONLY partitions the manifest proves complete.
+   *
+   * The checkpoint says "pass 1 is done"; the manifest says "these exact bytes
+   * were written". A partition that is missing, short, or checksum-mismatched is a
+   * hard, local failure — never silently merged as a partition that happened to
+   * contribute fewer rows, and never treated as a source-data rejection.
+   */
+  const spoolManifest = await readSpoolManifest(workDir);
+  if (!spoolManifest) {
+    throw new Error(
+      `Refusing to merge: ${workDir} has no ${SPOOL_MANIFEST_FILE}, so pass 1 cannot be shown to have completed every partition.\n` +
+        "  Run `bun run index:spool-doctor` to inspect what is on disk. If the partitions are intact it can record the\n" +
+        "  manifest for them (--repair-manifest), and pass 2 then resumes without re-reading the sources. Otherwise\n" +
+        "  re-run with --no-resume to rebuild the spool from the sources.",
+    );
+  }
+  const manifestDiff = identityDiff(spoolManifest.identity, identity);
+  if (manifestDiff.length) {
+    throw new Error(
+      `Refusing to merge: ${SPOOL_MANIFEST_FILE} describes a different run (${manifestDiff.join("; ")}).\n` +
+        "  The partition files belong to that run, so merging them into this version would mix two inputs.\n" +
+        "  Re-run with --no-resume to rebuild the spool from the sources.",
+    );
+  }
+
+  const spoolEntries = [...spoolManifest.partitions].sort((a, b) => a.partition - b.partition);
+  const totalPartitions = spoolEntries.length;
+  /** Mean rows per partition; a partition far above it is why one step is slower. */
+  const averageLines = spoolManifest.totals.lines / Math.max(1, totalPartitions);
+  const mergeStart = Date.now();
+  emit({
+    stage: "pass2-merge",
+    message: `pass 2: resolving ${totalPartitions} partitions (${spoolManifest.totals.lines.toLocaleString()} spooled rows, ${(spoolManifest.totals.bytes / 1e9).toFixed(2)} GB)`,
+  });
+  if (reuseSpool) {
+    emit({
+      stage: "pass2-merge",
+      message:
+        `pass 2: restarting at partition 1 of ${totalPartitions} on the preserved Pass 1 spool ` +
+        `(${SPOOL_MANIFEST_FILE} verified: ${spoolManifest.totals.lines.toLocaleString()} rows in ${totalPartitions} files). ` +
+        "This is a full replay, not a mid-partition resume, and the previous attempt's partial output is reset first, " +
+        "so no company, contact or posting can be counted twice.",
+    });
+  }
+
+  // Everything pass 2 is about to write is cleared BEFORE it writes anything, so
+  // an interrupted merge can never be appended to (see `resetPass2Output`).
+  //
+  // Every partition's recorded length is checked first: the reset below deletes the
+  // previous attempt's output, and discovering a truncated partition afterwards
+  // would cost the operator a working artifact for nothing. (Record counts and
+  // checksums still have to be verified while merging — those need a read.)
+  for (const entry of spoolEntries) await assertPartitionLength(entry, spoolDir);
+  emit({ stage: "pass2-merge", message: `pass 2: verified the recorded length of all ${totalPartitions} spool partitions` });
+  const pass2Reset = await resetPass2Output(config, { shardDir }, emit);
 
   const writer = new ObjectWriter(config.outputDir);
   const shardWriter = new ShardWriter(shardDir);
@@ -995,60 +1423,22 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   };
 
   /*
-   * Pass 2 merges ONLY partitions the manifest proves complete.
-   *
-   * The checkpoint says "pass 1 is done"; the manifest says "these exact bytes
-   * were written". A partition that is missing, short, or checksum-mismatched is a
-   * hard, local failure — never silently merged as a partition that happened to
-   * contribute fewer rows, and never treated as a source-data rejection.
+   * Pass 2 merges ONLY partitions the manifest proves complete — checked above,
+   * before the restart reset, so an unverifiable spool can never cost the output
+   * that is already on disk.
    */
-  const spoolManifest = await readSpoolManifest(workDir);
-  if (!spoolManifest) {
-    throw new Error(
-      `Refusing to merge: ${workDir} has no ${SPOOL_MANIFEST_FILE}, so pass 1 cannot be shown to have completed every partition.\n` +
-        "  Run `bun run index:spool-doctor` to inspect what is on disk. If the partitions are intact it can record the\n" +
-        "  manifest for them (--repair-manifest), and pass 2 then resumes without re-reading the sources. Otherwise\n" +
-        "  re-run with --no-resume to rebuild the spool from the sources.",
-    );
-  }
-  const manifestDiff = identityDiff(spoolManifest.identity, identity);
-  if (manifestDiff.length) {
-    throw new Error(
-      `Refusing to merge: ${SPOOL_MANIFEST_FILE} describes a different run (${manifestDiff.join("; ")}).\n` +
-        "  The partition files belong to that run, so merging them into this version would mix two inputs.\n" +
-        "  Re-run with --no-resume to rebuild the spool from the sources.",
-    );
-  }
 
-  const spoolEntries = [...spoolManifest.partitions].sort((a, b) => a.partition - b.partition);
-  const mergeStart = Date.now();
-  emit({
-    stage: "pass2-merge",
-    message: `pass 2: resolving ${spoolEntries.length} partitions (${spoolManifest.totals.lines.toLocaleString()} spooled rows, ${(spoolManifest.totals.bytes / 1e9).toFixed(2)} GB)`,
-  });
+  /** Timestamp of the last progress or heartbeat line, so heartbeats cannot spam. */
+  let lastEmitAt = mergeStart;
 
   for (let fileIndex = 0; fileIndex < spoolEntries.length; fileIndex += 1) {
     const entry = spoolEntries[fileIndex];
     const path = join(spoolDir, entry.file);
+    const partitionStart = Date.now();
 
-    // Completeness before content: a truncated file is a shorter but perfectly
-    // valid JSONL file, so its length has to be checked against what pass 1
-    // recorded, not against whether the records that survive happen to parse.
-    const info = await stat(path).catch(() => null);
-    if (!info) {
-      throw new Error(
-        `Spool partition ${entry.file} is recorded in ${SPOOL_MANIFEST_FILE} but is missing from ${spoolDir}. ` +
-          "Nothing was merged for it and nothing was deleted; re-run with --no-resume to rebuild the spool.",
-      );
-    }
-    if (info.size !== entry.bytes) {
-      throw new Error(
-        `Spool partition ${entry.file} is truncated: ${info.size.toLocaleString()} B on disk, ${entry.bytes.toLocaleString()} B recorded by pass 1.\n` +
-          "  Merging it would silently drop the rows that are missing, so the run stops here. Nothing was deleted.\n" +
-          "  Re-run with --no-resume to rebuild the spool from the sources (`bun run index:spool-doctor` reports every\n" +
-          "  partition first if you want to see the full picture).",
-      );
-    }
+    // Re-checked here as well as before the reset: the file could have changed
+    // while earlier partitions were merging.
+    await assertPartitionLength(entry, spoolDir);
 
     const partitionHash = createHash("sha256");
     let recordsSeen = 0;
@@ -1061,6 +1451,15 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
         keys: Set<string>;
         input: RawCompanyInput;
         sources: SourceRef[];
+        /**
+         * `source:row` of every source ref already in `sources`.
+         *
+         * A linear `sources.some(...)` scan per record is O(rows²) for one company
+         * (a company with 5,000 contact rows does 12.5 M comparisons), which is the
+         * kind of cost that only shows up on real data — the fixture has one or two
+         * refs per company. A Set makes the same decision in constant time.
+         */
+        sourceKeys: Set<string>;
         contacts: Map<string, Contact>;
         ambiguous: boolean;
         strong: boolean;
@@ -1093,6 +1492,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
             keys: new Set(row.keys),
             input: row.company,
             sources: [],
+            sourceKeys: new Set(),
             contacts: new Map(),
             ambiguous: decision.ambiguous,
             strong: row.strong,
@@ -1101,7 +1501,9 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
           groups.set(decision.ref, group);
         }
         for (const key of row.keys) group.keys.add(key);
-        if (!group.sources.some((ref) => ref.source === row.source.source && ref.row === row.source.row)) {
+        const sourceKey = `${row.source.source}\u0000${row.source.row}`;
+        if (!group.sourceKeys.has(sourceKey)) {
+          group.sourceKeys.add(sourceKey);
           group.sources.push(row.source);
         }
         if (row.contact) {
@@ -1117,6 +1519,27 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
           } else {
             group.contacts.set(fingerprint ?? `r:${row.source.source}:${row.source.row}`, provisional);
           }
+        }
+
+        // Heartbeat: a partition is read and merged in one go, so without this a
+        // very large partition looks exactly like a stall — no output, no update.
+        // It reports the position INSIDE the partition, so the percentage keeps
+        // moving (and is never "0% while work is progressing").
+        if (recordsSeen % PARTITION_HEARTBEAT_RECORDS === 0 && Date.now() - lastEmitAt >= PARTITION_HEARTBEAT_MS) {
+          lastEmitAt = Date.now();
+          const within = entry.lines ? Math.min(1, recordsSeen / entry.lines) : 1;
+          emit({
+            stage: "pass2-merge",
+            rowsRead: counters.rowsRead,
+            rowsRejected: counters.rowsRejected,
+            companies: counters.uniqueCompanies,
+            contacts: counters.uniqueContacts,
+            progress: (fileIndex + within) / totalPartitions,
+            message:
+              `pass 2: partition ${fileIndex + 1}/${totalPartitions} in progress — ${recordsSeen.toLocaleString()} rows read ` +
+              `(${(within * 100).toFixed(0)}% of this partition), ${counters.uniqueCompanies.toLocaleString()} companies, ` +
+              `${((Date.now() - partitionStart) / 1000).toFixed(0)}s in this partition`,
+          });
         }
       }
     } catch (error) {
@@ -1189,25 +1612,47 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       company.facets = finalizeFacets(facets);
       if (group.ambiguous) counters.ambiguousCompanies += 1;
 
-      // Index postings (bounded per shard file).
+      /*
+       * Index postings.
+       *
+       * The writer batches these by shard, so writing is one call per posting and
+       * no `await` is involved. Two of the five kinds can repeat a term for the SAME
+       * company: two aliases of one company share their first letters (so they emit
+       * the same prefix), and `trigrams("aaaa")` really does produce "aaa" twice. A
+       * repeated `(term, ref)` pair inflates the posting and makes one company
+       * appear twice in a result list, and the reader only collapses a repeat that
+       * happens to be adjacent — which after batching is no longer guaranteed — so
+       * the duplicates are removed here, where the term's owner is known.
+       * (`exact` uses the variant Set, `token` a Set of tokens, `ids` are unique by
+       * construction, so those three need no check.)
+       */
       const quality = qualityByte(company.contactCount, company.normalizedName.length);
       const variants = new Set<string>([company.normalizedName, ...(company.aliases ?? [])]);
+      const prefixSeen = new Set<string>();
+      const trigramSeen = new Set<string>();
       for (const variant of variants) {
-        await shardWriter.write("exact", shardOf(variant, config.shards.exact), variant, globalRef, quality);
-        const maxPrefix = Math.min(12, variant.length);
+        shardWriter.write("exact", shardOf(variant, config.shards.exact), variant, globalRef, quality);
+        // Indexed up to the reader's own prefix ceiling, so a query cannot be
+        // truncated to a prefix that was never indexed.
+        const maxPrefix = Math.min(SHARDING.maxPrefixLength, variant.length);
         for (let i = 1; i <= maxPrefix; i += 1) {
-          await shardWriter.write("prefix", shardOf(variant.slice(0, i), config.shards.prefix), variant.slice(0, i), globalRef, quality);
+          const prefix = variant.slice(0, i);
+          if (prefixSeen.has(prefix)) continue;
+          prefixSeen.add(prefix);
+          shardWriter.write("prefix", shardOf(prefix, config.shards.prefix), prefix, globalRef, quality);
         }
         for (const gram of trigrams(variant)) {
-          await shardWriter.write("trigram", shardOf(gram, config.shards.trigram), gram, globalRef, quality);
+          if (trigramSeen.has(gram)) continue;
+          trigramSeen.add(gram);
+          shardWriter.write("trigram", shardOf(gram, config.shards.trigram), gram, globalRef, quality);
         }
       }
       for (const token of new Set(company.normalizedName.split(" "))) {
-        await shardWriter.write("token", shardOf(token, config.shards.token), token, globalRef, quality);
+        shardWriter.write("token", shardOf(token, config.shards.token), token, globalRef, quality);
       }
-      await shardWriter.write("ids", shardOf(company.id, config.shards.ids), company.id, globalRef, 255);
+      shardWriter.write("ids", shardOf(company.id, config.shards.ids), company.id, globalRef, 255);
       for (const contact of contacts) {
-        await shardWriter.write("ids", shardOf(contact.id, config.shards.ids), contact.id, globalRef, 255);
+        shardWriter.write("ids", shardOf(contact.id, config.shards.ids), contact.id, globalRef, 255);
       }
 
       // Record where this object starts: the reader hydrates a candidate with
@@ -1237,36 +1682,67 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       if (counters.perSource[ownerSource]) counters.perSource[ownerSource].companies += 1;
     }
 
-    // Mid-run disk guard: checked every 16 partitions (cheap, and far more often
-    // than the volume can actually fill). A clean stop keeps everything already
-    // written; the checkpoint still says `pass2-merge`, so the next run resumes.
-    if (fileIndex % 16 === 0) {
-      const free = await freeDiskBytesFor(config.outputDir);
-      if (free !== null && free < diskFloorBytes) {
-        throw new Error(
-          `Stopping before the disk fills: ${(free / 1e9).toFixed(2)} GB free on ${config.outputDir} is below the ${(diskFloorBytes / 1e9).toFixed(2)} GB floor. ` +
-            "Nothing already written was lost and the checkpoint is at pass2-merge — free space (or lower `partitions`) and run the same command again to resume.",
-        );
-      }
+    /*
+     * Mid-run disk guard. Checked after every partition now that the progress line
+     * is emitted there too: one `statfs` per partition is nothing against a
+     * partition's work, and the alternative (every 16 partitions) can write fifteen
+     * partitions' output before noticing the volume is full. A clean stop keeps
+     * everything already written and the checkpoint still says `pass2-merge`, so the
+     * same command resumes — and now restarts pass 2 from a reset state.
+     */
+    const free = await freeDiskBytesFor(config.outputDir);
+    if (free !== null && free < diskFloorBytes) {
+      throw new Error(
+        `Stopping before the disk fills: ${(free / 1e9).toFixed(2)} GB free on ${config.outputDir} is below the ${(diskFloorBytes / 1e9).toFixed(2)} GB floor. ` +
+          "The Pass 1 spool is untouched and the checkpoint is still at pass2-merge, so re-running the same command " +
+          "resumes pass 2 (its partial output is reset and replayed, not appended to). Free space (or lower `partitions`) first.",
+      );
     }
 
-    if (fileIndex % 16 === 0) {
-      emit({
-        stage: "pass2-merge",
-        rowsRead: counters.rowsRead,
-        rowsRejected: counters.rowsRejected,
-        companies: counters.uniqueCompanies,
-        contacts: counters.uniqueContacts,
-        progress: fileIndex / spoolEntries.length,
-        message: `pass 2: ${counters.uniqueCompanies.toLocaleString()} companies from ${fileIndex + 1}/${spoolEntries.length} partitions`,
-      });
-    }
+    /*
+     * Progress after EVERY partition, with the real completion fraction.
+     *
+     * This used to be `fileIndex / spoolEntries.length`, emitted once per 16
+     * partitions: after finishing partition 1 it printed 0%, which read as "stuck"
+     * on a job that was in fact working. It now reports the number of partitions
+     * COMPLETED, the companies and contacts resolved so far, the elapsed time, the
+     * throughput in companies/s and an ETA once there is a measurement to base one
+     * on, plus how long this partition took.
+     */
+    const processedPartitions = fileIndex + 1;
+    const elapsedMs = Date.now() - mergeStart;
+    const partitionMs = Date.now() - partitionStart;
+    const etaSeconds =
+      processedPartitions > 0 && processedPartitions < totalPartitions && elapsedMs > 0
+        ? Math.round(((elapsedMs / processedPartitions) * (totalPartitions - processedPartitions)) / 1000)
+        : processedPartitions === totalPartitions
+          ? 0
+          : null;
+    const companiesPerSecond = elapsedMs > 0 ? Math.round(counters.uniqueCompanies / (elapsedMs / 1000)) : null;
+    const notes = pass2StepNotes({ partitionMs, rows: entry.lines, averageRows: averageLines });
+    lastEmitAt = Date.now();
+    emit({
+      stage: "pass2-merge",
+      rowsRead: counters.rowsRead,
+      rowsRejected: counters.rowsRejected,
+      companies: counters.uniqueCompanies,
+      contacts: counters.uniqueContacts,
+      progress: processedPartitions / totalPartitions,
+      etaSeconds,
+      message:
+        `pass 2: ${processedPartitions}/${totalPartitions} partitions · ${counters.uniqueCompanies.toLocaleString()} companies · ` +
+        `${counters.uniqueContacts.toLocaleString()} contacts · ${(elapsedMs / 1000).toFixed(1)}s elapsed · ` +
+        `${companiesPerSecond === null ? "-" : companiesPerSecond.toLocaleString()} companies/s · ` +
+        `ETA ${etaSeconds === null || etaSeconds === 0 ? "-" : `${Math.floor(etaSeconds / 60)}m${String(etaSeconds % 60).padStart(2, "0")}s`}` +
+        ` · this partition ${(partitionMs / 1000).toFixed(1)}s` +
+        (notes.length ? ` — ${notes.join("; ")}` : ""),
+    });
   }
   const mergeMs = Date.now() - mergeStart;
 
   await flushCompanies();
   await flushContacts();
-  await shardWriter.close();
+  shardWriter.close();
   await new Promise<void>((resolve) => rejected.end(resolve));
 
   /* -------------------------------- finalize ------------------------------ */
@@ -1461,7 +1937,9 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     profiles,
     elapsedMs,
     stages: { profilingMs, pass1Ms: Math.max(0, pass1Ms), pass2Ms: mergeMs, finalizeMs, validateMs },
-    resumed: Boolean(checkpoint),
+    resumed: reuseSpool,
+    pass2Reset,
+    shardWrite: shardWriter.stats,
     // Reported instead of estimated: the benchmark's Cloudflare cost line and its
     // "R2 request count" both come from here.
     sourceStats: sourceContext.stats,

@@ -37,8 +37,27 @@ export function leadId(kind: "company" | "contact", targetId: string): string {
   return `l_${stableHash(`${kind}:${targetId}`).slice(0, 16)}`;
 }
 
-/** Deterministic shard number for a key, used by the indexer and the Worker. */
+/**
+ * Deterministic shard number for a key, used by the indexer and the Worker.
+ *
+ * This is `stableHash(key)`'s FIRST 32-bit pass reduced modulo `shardCount` — with
+ * the other three passes and the hex round-trip removed. That round-trip was pure
+ * overhead on the indexer's hottest call: `stableHash` formats four 8-hex-character
+ * strings, and this function then took the first eight characters and parsed them
+ * back into the number they already were. Pass 2 calls it dozens of times per
+ * company (~1.2 M times for a 10,000-company corpus), so the allocations were worth
+ * removing.
+ *
+ * The value is bit-for-bit identical to `parseInt(stableHash(key).slice(0, 8), 16) %
+ * shardCount`; `tests/hash.test.ts` asserts that equivalence directly, because a
+ * change here would move every posting to a different shard file and mis-split the
+ * spool partitions of an existing Pass 1 run.
+ */
 export function shardOf(key: string, shardCount: number): number {
-  const hex = stableHash(key).slice(0, 8);
-  return parseInt(hex, 16) % shardCount;
+  let h = 0x811c9dc5 >>> 0;
+  for (let i = 0; i < key.length; i += 1) {
+    h ^= key.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h % shardCount;
 }

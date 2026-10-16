@@ -7,7 +7,7 @@ names the command or test that produced it.
 Run everything below yourself with (all commands are read-only unless marked otherwise):
 
 ```bash
-bun run check                          # 4 typechecks + the suite (337 tests, 1,451 assertions)
+bun run check                          # 4 typechecks + the suite (354 tests, 0 fail)
 bun run r2:doctor                      # credentials file, endpoint, one signed LIST of raw/
 bun run r2:schema                      # both REAL files: encoding, delimiter, columns, mapping
 bun run verify:r2                      # inventory, sizes, ETags, bounded body read, dataset state
@@ -15,6 +15,7 @@ bun run verify:r2:remote               # same ground truth through the Worker bi
 bun run index:profile                  # preflight over the real objects + per-file mapping
 bun scripts/benchmark-r2-path.mjs --output-dir .indexer-output --version v1-dry5-250
 bun scripts/benchmark-search.mjs       # engine + labelled relevance
+bun run index:bench-pass2 --fs-count   # pass-2 merge: seconds + every file open counted
 ```
 
 ## Fixes made in this phase (all found by executing, not reviewing)
@@ -529,6 +530,81 @@ locked in by `tests/indexer.test.ts` → "the pass-2 merge survives the separato
 - The recovered spool from the failed run is untouched, and `index:spool-doctor` is the supported way
   to decide whether to reuse it.
 
+## Pass-2 restart safety and merge performance (executed)
+
+The interrupted `index:benchmark-1m` left a verified Pass 1 checkpoint (`stage=pass2-merge`,
+1,986,239 rows, 67,157 rejected, 256 partitions, ≈1.02 GB spool, doctor-clean) **plus** the abandoned
+pass-2 output (153 company objects, 38 contact objects, temporary shard postings). Restarting against
+that state could append duplicate postings and re-publish objects the new run never wrote, and the
+merge was the slow half of the run.
+
+### Root causes (code inspection, then reproduced)
+
+| # | Defect | Impact before the fix | Now covered by |
+| --- | --- | --- | --- |
+| 6 | `ShardWriter` opened every shard `.lines` file with flag `a`, and pass 2 replays from partition 1 | A restart appended a second copy of every already-merged posting; finalization only drops a repeat of the *previous* line, so a duplicate separated by other postings survived into the published shard — one company returned twice, its quality byte counted twice | `tests/indexer-pass2-restart.test.ts` — no duplicate postings when a company's partitions are not adjacent |
+| 7 | An interrupted pass 2 left its generated objects and `objects.jsonl` in `outputDir` | Objects this run never wrote were picked up by `validate`, `upload` and the local manifest, and could be hydrated as if it had | Same file: the stale company/contact object is gone after a restart, another version's files are untouched |
+| 8 | Progress was `fileIndex / spoolEntries.length`, emitted every 16 partitions | A working run printed **0%** after completing partition 1, which reads as a stall | `tests/indexer-pass2-restart.test.ts` → "pass-2 progress reporting" (3): every partition reports counters, throughput and an ETA; the restart and what it reset are announced; working/slow/stalled are classified in plain language |
+| 9 | One asynchronous stream (with a `mkdir` in front of it) per posting, through a 64-handle LRU over 1,792 shard files, with `end()` never awaited | The Windows merge appeared stalled: **550,958 stream lifecycles for ≈1.15 M postings** at 10,000 companies (measured with the fs counter) | `tests/indexer-pass2-restart.test.ts` (bounded handles and buffer), benchmark counters below |
+| 10 | `group.sources.some(...)` per incoming record | O(rows²) for a company with thousands of contact rows | Same file: dedup by `source:row` key with first-seen order preserved |
+
+### Executed
+
+```
+bun run check                  PASS ×5 (4 typechecks + suite): 354 tests, 0 fail, 93,508 expect() calls
+bun run lint                   exit 0, 0 problems
+bun run build                  exit 0 (tsc -b + vite build, 8.6 s)
+bun run index:bench-pass2      merge timing + every fs call counted (table below)
+CLI interrupted/resumed run    pass 1 + pass 2, output corrupted on purpose, restart: identical payloads
+```
+
+The CLI-level restart was run against a synthetic two-source corpus (1,500 companies, 3,000 rows, 16
+partitions), because the real 1 M benchmark is not restarted here. After a clean run the state was
+corrupted deliberately — one company object deleted, a stale `999999.json` company object added, a
+junk posting appended to a shard scratch file, a foreign version directory created — and **both
+sources were truncated to their headers**. Re-running the same command:
+
+| Check | Result |
+| --- | --- |
+| Spool reused, sources not read | `pass 1  0.0 s  (skipped: resumed)`, `pass 2: reusing the Pass 1 spool in … the sources are NOT read again.`, and the output is identical with the sources emptied |
+| Reset scope | `restart reset 1 shard file(s), 125 generated object(s) (0.3 MB)` |
+| Data equality | All **120** company/contact/index payload objects byte-identical to the clean run (per-file `sha256`); only the bookkeeping timestamps (`createdAt`, `checkedAt`, `generatedAt`) differ |
+| No duplicate postings | The junk posting is gone (its shard file was deleted and not recreated), and no company appears twice |
+| No stale output | `999999.json` is absent from the final output **and** from `objects.jsonl` |
+| Pass 1 preserved | 16 partitions and `spool-manifest.json` byte-identical across two restarts; checkpoint still `pass2-merge` |
+| Other versions untouched | `companies/v1-other/keep.json` still present |
+| Validation | `validation passed` |
+
+### Measured merge performance
+
+`bun run index:bench-pass2` (20,000 synthetic companies, the real config's 256 partitions and 1,792
+shard files, **1,275,668 postings**, 1-vCPU Linux sandbox), with every `createWriteStream` /
+`openSync` / `writeSync` / `closeSync` call counted (`--fs-count`):
+
+| Write strategy | `pass 2 merge` | Shard file opens | `writeSync` calls | Peak open handles |
+| --- | --- | --- | --- | --- |
+| **Batched by shard (current)** | **2.1–2.5 s** (9,333 companies/s) | **5,376** in 3 flushes (237 postings per open) | 5,376 | **1** |
+| One append per shard per flush, one write per posting | 3.9 s | 5,376 | 1,275,668 | 64 |
+| One open + write + close per posting | 8.5 s (2,350 companies/s) | 1,275,668 | 1,275,668 | 1 |
+| Pre-fix writer (64-entry LRU of async streams over 1,792 shard files) | not re-timeable | 550,958 opens for ≈1.15 M postings (10,000 companies, same counter) | 1 per posting | 64 |
+
+Peak buffered posting bytes: **8.39 MB** (bounded by `SHARD_FLUSH_BYTES`, 8 MiB). Finalize+index
+(1.9–2.1 s) and validate (0.1 s) are unchanged, and the per-object payloads are unaffected —the batching changes *when* bytes are written, not what is written (asserted by the restart test's
+byte-for-byte output comparison and by `tests/indexer.test.ts` → "re-running the indexer is
+idempotent and does not duplicate records").
+
+These are seconds on this sandbox. Run the harness on the indexing machine before planning capacity:
+it prints the counters next to the times.
+
+### What was NOT run (this phase)
+
+- The real 1 M benchmark was **not restarted here**: its checkpoint and 1.02 GB spool live on the
+  Windows machine and a re-run needs several GB free (this sandbox has 0.63 GB). Every restart claim
+  above is from local, repeatable synthetic runs and the test suite.
+- No R2 write, upload, publish, deployment or Cloudflare change; no `--no-resume` anywhere.
+- No profiling of the real 1 M merge was possible, so the *absolute* Windows merge duration is still
+  unmeasured — only the mechanism (stream lifecycles per posting) and the local comparison are.
+
 ## Final delivery matrix
 
 | Requirement | Implemented | Test evidence | Remaining risk | Manual action required |
@@ -541,8 +617,8 @@ locked in by `tests/indexer.test.ts` → "the pass-2 merge survives the separato
 | B. Streaming, multiline, dual-schema parsing | Yes | `tests/e2e-index.test.ts`, `tests/csv.test.ts` | None known | — |
 | B. Disk-backed grouping, identity resolution, dedupe, cross-file association | Yes | `tests/e2e-index.test.ts` (multiline record = 1, dup contact once, Microsoft merged from both files, same-name/different-domain kept apart) | Real data may expose new ambiguity | Review ambiguous-count in the manifest after the sample runs |
 | B. Exact/prefix/token/trigram indexes, bounded gzip shards | Yes | `tests/e2e-index.test.ts` (magic bytes, size bound, object count), `tests/r2-client.test.ts` (gzip metadata) | Object sizes grow with corpus | Confirm bytes/company from the 1 M sample |
-| B. Checkpoint/resume, upload retries, checksums, atomic publish + rollback | Yes — the checkpoint records the **run identity** (version, sample limit, partitions, source paths/delimiters/overrides) and `workDir/spool-manifest.json` records **every partition pass 1 finished** (bytes, records, SHA-256). Resuming a spool from a different run, a spool with no manifest, or a truncated/checksum-mismatched partition is refused; `--no-resume` clears the stale spool and manifest and rebuilds | `tests/indexer.test.ts` (manifest contents, different-run refusal, missing-manifest refusal, truncated-partition refusal, `adoptSpool` recovery, stale-spool clearing, counters restored on resume), `tests/spool-doctor-script.test.ts`, `tests/indexer-r2-source.test.ts` (cache/resume), `tests/r2-client.test.ts` (retry counts), `tests/e2e-index.test.ts` | A real multi-hour run has still not been interrupted on purpose | Interrupt one sample run and resume it |
-| Quality gates (typecheck ×4, tests, lint, build, both bundles, indexer CLI) | **Yes — executed with exit codes recorded**: `bun run check` 0 (5/5 PASS), `bun run lint` 0 (0 problems), `bun run build` 0, `wrangler deploy --dry-run` 0 for the Worker and the probe, indexer `--help`/`--preflight-only` as documented, `bun run index:spool-doctor` exit 0/1/2 as documented | `bun run check` (**337 tests, 1,451 assertions**, up from 304/1,296), `tests/jsonl.test.ts`, `tests/spool-doctor-script.test.ts`, `tests/search-funnel.test.ts`, `tests/frontend-secrets.test.ts` | Bundle validation is `--dry-run` only; nothing was deployed | Deploy to the preview environment after the Access app exists |
+| B. Checkpoint/resume, upload retries, checksums, atomic publish + rollback | Yes — the run identity (version, sample limit, partitions, source paths/delimiters/overrides) and `workDir/spool-manifest.json` (bytes, records, SHA-256 per partition) are verified before merging, and a **pass-2 restart** reuses the Pass 1 spool, resets only its own generated output and temporary postings, then replays from partition 1 | `tests/indexer.test.ts`, `tests/indexer-pass2-restart.test.ts` (13: byte-identical resumed output, no duplicate postings, no stale objects, spool+manifest unchanged, twice-interrupted cleanup, other versions untouched, hydration across partition boundaries, progress counters, determinism, bounded handles/memory), `tests/spool-doctor-script.test.ts`, `tests/indexer-r2-source.test.ts` (cache/resume), `tests/r2-client.test.ts` (retry counts), `tests/e2e-index.test.ts` | Partition-level pass-2 resume does not exist (deliberately: a full replay is provably identical, and is what the tests assert) | Interrupt a real sample run and resume it |
+| Quality gates (typecheck ×4, tests, lint, build, both bundles, indexer CLI) | **Yes — executed with exit codes recorded**: `bun run check` 0 (5/5 PASS), `bun run lint` 0 (0 problems), `bun run build` 0, `wrangler deploy --dry-run` 0 for the Worker and the probe, indexer `--help`/`--preflight-only` as documented, `bun run index:spool-doctor` exit 0/1/2 as documented | `bun run check` (**354 tests, 0 fail, 93,508 `expect()` calls**, up from 337), `tests/indexer-pass2-restart.test.ts`, `tests/jsonl.test.ts`, `tests/spool-doctor-script.test.ts`, `tests/search-funnel.test.ts`, `tests/frontend-secrets.test.ts` | Bundle validation is `--dry-run` only; nothing was deployed | Deploy to the preview environment after the Access app exists |
 | C. Worker API routes on a real handler | Yes (Bun runtime) | `tests/api-e2e.test.ts` (19) | Not workerd; no browser | Run the 12-step browser checklist after deployment |
 | C. Browser rendering, all screens, loading/empty/error states | **BLOCKED here** | — | Real rendering unverified | Follow the Phase C checklist in this document |
 | D. Access protection of frontend + API | Yes | `tests/security-access.test.ts` (20) incl. fail-closed in production and no `Cf-Access-*` header spoofing | Exact production config unverified | Create the Access app, set the 3 secrets, confirm `curl` → 401 |

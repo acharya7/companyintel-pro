@@ -743,7 +743,22 @@ describe("preflight resource estimates match what a real run consumes", () => {
   test("a run reports where its time went, per stage", async () => {
     const dir = await mkdtemp(join(tmpdir(), "ci-stages-"));
     const source = join(dir, "one.csv");
-    await writeFile(source, csv(FIRST_HEADERS, [["Acme, Inc.", "acme.example", "Manufacturing", "United States", "Austin", "Ada Lovelace", "CTO", "ada@acme.example", ""]]), "utf8");
+    // Several hundred rows rather than one: the assertion below is that pass 1
+    // reports a duration > 0, and a single-row pass 1 can finish inside the
+    // millisecond resolution of `Date.now()` — a flaky failure about the clock, not
+    // about the stage timings. The corpus is only large enough to be measurable.
+    const rows = Array.from({ length: 400 }, (_, index) => [
+      `Company ${index} Ltd`,
+      `company-${index}.example`,
+      "Manufacturing",
+      "United States",
+      "Austin",
+      `Person ${index}`,
+      "CTO",
+      `person.${index}@company-${index}.example`,
+      "",
+    ]);
+    await writeFile(source, csv(FIRST_HEADERS, rows), "utf8");
     const config: IndexerConfig = { datasetVersion: "stages-v1", sources: [{ id: "csv1", path: source }], workDir: join(dir, "work"), outputDir: join(dir, "out"), partitions: 4, shards: { exact: 4, prefix: 4, token: 4, trigram: 4, ids: 4 } };
     try {
       const fresh = await runIndex(config, {});

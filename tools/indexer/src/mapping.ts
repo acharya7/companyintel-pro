@@ -18,7 +18,7 @@
  */
 
 import type { Company, CompanyFacets, Contact, FacetBucket, SourceRef } from "../../../src/shared/models";
-import { companyId, contactId, stableHash } from "../../../src/shared/hash";
+import { companyId, contactId, shardOf } from "../../../src/shared/hash";
 import {
   normalizeAttribute,
   normalizeDomain,
@@ -462,7 +462,13 @@ export function finalizeFacets(facets: CompanyFacets, topN = 40): CompanyFacets 
   };
 }
 
-/** Deterministic partition for a company key (disk-backed grouping). */
+/**
+ * Deterministic partition for a company key (disk-backed grouping).
+ *
+ * Deliberately the same function the index shards use, because a spool partition
+ * number is a fact recorded in `spool-manifest.json`: the mapping must not move, or
+ * an existing Pass 1 spool becomes unreadable by the build that wrote it.
+ */
 export function partitionFor(key: string, partitions: number): number {
-  return parseInt(stableHash(key).slice(0, 8), 16) % partitions;
+  return shardOf(key, partitions);
 }

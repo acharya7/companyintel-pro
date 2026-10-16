@@ -115,9 +115,11 @@ total ≈ (rows ÷ measured_rows_per_second) × pass_factor + upload_time
 - The preflight hint now uses exactly that rate, so for the full corpus (≈101.5 M rows at the
   measured 633 B/row) it prints **≈5.6 hours of pass 1** — not the ~54 minutes a 120,000 rows/s
   synthetic figure suggested.
-- **Pass 2 is not free and must be added:** a 20,200-row local stress run measured 18.6 s in
-  `pass2-merge` on this 1-vCPU sandbox (shard postings + gzip). Scale it from the 1 M benchmark's
-  own `pass 2 merge` figure rather than from this line.
+- **Pass 2 is not free and must be added:** after the shard-writer batching fix (`bun run
+  index:bench-pass2`), `pass 2 merge` measured **2.1–2.5 s for 20,000 companies / 1,275,668
+  postings** on this 1-vCPU sandbox — 9,333 companies/s, 5,376 shard appends instead of a stream
+  lifecycle per posting. Scale it from the 1 M benchmark's own `pass 2 merge` figure rather than from
+  this line.
 - Upload duration ≈ (object count ÷ practical PUT concurrency) + retries; object count is in the
   low thousands, so this is minutes, not hours, at normal bandwidth.
 - Upload duration ≈ (object count ÷ practical PUT concurrency) + retries; object count is in the

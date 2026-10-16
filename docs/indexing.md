@@ -312,10 +312,142 @@ The old hint promised **~17 s** for the benchmark (`2 M ÷ 120,000 rows/s`). The
 bound plus parse plus spool, measured end to end. The full 64.26 GB corpus is therefore of the order
 of **5–6 hours in pass 1 alone**, not minutes.
 
-Pass 2 is the other half and must not be ignored: a 20,200-row local stress run measured **18.6 s in
-`pass2-merge`** on this 1-vCPU sandbox (≈1,100 rows/s, dominated by shard postings and gzip), so on
-the full corpus the merge is hours too. The preflight hint is only a hint — **the run prints
-`stage timings` and those are the numbers to plan the full job with.**
+Pass 2 is the other half and must not be ignored. Before the batching fix a 20,200-row local stress
+run measured **18.6 s in `pass2-merge`** on this 1-vCPU sandbox (≈1,100 rows/s, dominated by shard
+postings and gzip); the same work now measures **2.1–2.5 s for 20,000 companies** — see
+[Measured merge cost](#measured-merge-cost). On the full corpus the merge is still hours, so the
+preflight hint is only a hint — **the run prints `stage timings` and those are the numbers to plan
+the full job with.**
+
+## The interrupted Pass 2: restart safety, duplicate postings and merge speed
+
+The 1 M benchmark's pass 1 finished — 1,986,239 rows, 67,157 rejected, 256 partitions, ≈1.02 GB of
+spool, `spool-manifest.json` clean — and the run was then interrupted inside `pass2-merge`. It left
+two kinds of state behind:
+
+```
+workDir/shards/<kind>/<NNNN>.lines        temporary postings of the abandoned merge
+outputDir/companies/v1-bench-1m/          153 generated objects
+outputDir/contacts/v1-bench-1m/            38 generated objects
+```
+
+The Pass 1 spool is 5-6 hours of network and parse work and is deliberately preserved: it is what
+the next run reuses, and it is never deleted by a pass-2 restart. The *pass-2 output* is not an
+input, and restarting on top of it was unsafe in three separate ways.
+
+### Root causes (confirmed by reading the code, then reproduced by a restart test)
+
+1. **Shard postings were appended to.** `ShardWriter` opened every `.lines` file with flag `a`, and a
+   restart replays pass 2 from partition 1, so every partition merged before the interruption had its
+   postings written a **second** time. Finalization only drops a posting that repeats the *previous*
+   line, so a duplicate separated by other postings survived into the published shard payload: one
+   company returned twice, its quality byte counted twice.
+2. **Generated output was left in place.** `ObjectWriter.writeJson` overwrites the objects it is asked
+   to write, but an object this run never reaches — a different partition boundary, fewer companies —
+   stayed on disk and was picked up by `validate`, by `upload` and by the local manifest, and would
+   have been hydrated as if this run had produced it.
+3. **The counters that must start at zero did.** `globalRef`, `companyPartitionIndex` and
+   `contactPartitionIndex` starting at 0 is what makes a replay deterministic and identically
+   numbered — but it is only correct if (1) and (2) are handled.
+
+The progress line made this look like a stall rather than a defect: it was emitted every 16
+partitions as `fileIndex / spoolEntries.length`, so the first line of a working run printed **0%**.
+
+### What a pass-2 restart does now
+
+| Step | Behaviour |
+| --- | --- |
+| Reuse detection | The checkpoint's `stage` decides it. `pass2-merge` means the spool is complete (that is the stage written after `spool-manifest.json` is renamed into place), so profiling, pass 1 and every R2 read are skipped and the run says so: `pass 2: reusing the Pass 1 spool in … the sources are NOT read again.` |
+| Restart announcement | `pass 2: restarting at partition 1 of 256 on the preserved Pass 1 spool (spool-manifest.json verified: N rows in 256 files). This is a full replay, not a mid-partition resume …` |
+| Pre-reset verification | Every partition's **recorded length** is checked before anything is deleted, so a spool that cannot be merged never costs the operator the output already on disk. Record counts and SHA-256 are still verified while merging. |
+| Reset scope | `workDir/shards/**` (pure pass-2 scratch) + `outputDir/{companies,contacts,indexes,manifests}/<version>/**` and `outputDir/objects.jsonl` for the **current version only**. |
+| Never touched | `workDir/spool/**`, `spool-manifest.json`, `checkpoint.json`, `rejected.jsonl`, the Mode B raw cache, credentials, every other dataset version, and `manifests/active.json`. |
+| Path safety | Every deleted path is resolved and checked to be strictly inside `outputDir`; a version containing `..` is refused with nothing deleted, so an operator-supplied version can never aim a delete somewhere else. |
+| Interrupted cleanup | Deletions are idempotent whole-tree removals, a missing path is not an error, and they all happen **before** the merge writes anything — so a cleanup that is itself interrupted is simply completed by the next start, and "new" files can never sit next to "old" ones. |
+| Manifest hygiene | Nothing outside this run's own output is written, and the reset happens before the first object, so an object from an earlier attempt cannot reach the final manifest, `validate`, `upload` or `publish`. |
+
+There is deliberately **no partition-level resume**: pass 2 is replayed from partition 1. Claiming
+mid-partition resume without validating it would be worse than the replay, which is asserted to be
+identical to a clean run — see `docs/verification.md` → "Pass-2 restart safety and merge performance"
+and `tests/indexer-pass2-restart.test.ts`.
+
+### Measured merge cost
+
+Same harness (`bun run index:bench-pass2`, 20,000 synthetic companies, the real config's 256
+partitions and 1,792 shard files, 1,275,668 postings), same 1-vCPU Linux sandbox. The harness counts
+every `createWriteStream` / `openSync` / `writeSync` / `closeSync` call the run makes (`--fs-count`):
+
+| Write strategy | `pass 2 merge` | Shard file opens | `writeSync` calls | Peak open handles |
+| --- | --- | --- | --- | --- |
+| **Batched by shard (current)** | **2.1–2.5 s** (9,333 companies/s) | **5,376** in 3 flushes (237 postings per open) | 5,376 | **1** |
+| One append per shard per flush, one write per posting | 3.9 s | 5,376 | 1,275,668 | 64 |
+| One open + write + close per posting | 8.5 s (2,350 companies/s) | 1,275,668 | 1,275,668 | 1 |
+| Pre-fix writer (64-entry LRU of async streams over 1,792 shard files) | not re-timeable | **550,958 opens for ≈1.15 M postings** at 10,000 companies (measured with the same counter) | 1 per posting | 64 |
+
+The pre-fix figure is the one that explains the Windows symptom: 1,792 shard files against a 64-slot
+handle cache means the cache can never hold the working set, so nearly every posting needed a fresh
+open. Every one of those was an asynchronous `createWriteStream` (with a `mkdir` in front of it) and
+an `end()` that was **never awaited**, so a `close()` could return while a shard file was still being
+flushed. Batching decides where each line goes first, then writes one file per shard per flush with
+synchronous, fully-checked writes, which is what turns ~550 K stream lifecycles into 5,376 appends.
+
+Bounded memory is part of the design, not a side effect: the only posting state held in memory is
+buffered **bytes** (`SHARD_FLUSH_BYTES`, 8 MiB — measured peak 8.39 MB here), so a company that emits
+40 short postings and one that emits 4 long ones cost the same, and the per-partition `groups` map
+pass 2 already holds is unaffected.
+
+`docs/indexing.md`'s own advice applies: these are seconds on this sandbox. Re-run the harness on the
+machine that runs the indexer — it prints the open/flush/buffer counters next to the times, so the
+claim can be checked there rather than trusted.
+
+### Progress output
+
+After every partition (and every `PARTITION_HEARTBEAT_RECORDS` rows inside a partition), pass 2 now
+reports the real completion fraction and a measurement-based ETA:
+
+```
+[pass2-merge]    -   pass 2: resolving 8 partitions (900 spooled rows, 0.00 GB)
+[pass2-merge]    -   pass 2: verified the recorded length of all 8 spool partitions
+[pass2-merge] 12.5% pass 2: 1/8 partitions · 113 companies · 113 contacts · 0.0s elapsed · 6,647 companies/s · ETA - · this partition 0.0s
+[pass2-merge] 50.0% pass 2: 4/8 partitions · 451 companies · 451 contacts · 0.0s elapsed · 9,204 companies/s · ETA - · this partition 0.0s
+[pass2-merge] 100.0% pass 2: 8/8 partitions · 900 companies · 900 contacts · 0.1s elapsed · 7,143 companies/s · ETA - · this partition 0.0s
+```
+
+Those lines are captured from a local 900-company run (8 partitions), not written by hand. `ETA -`
+means the remaining estimate rounds to zero on a 0.1 s merge; a real 256-partition merge prints
+minutes. The CLI throttle (one line per 1.5 s, never throttling the final event) means a small merge
+may print only some of these, while the 1 M benchmark prints one per partition.
+
+Inside a single very large partition the run also emits a heartbeat (after every 25,000 rows, and
+only if 15 s have passed since the last update) with the message shape
+`pass 2: partition <k>/<N> in progress — <rows> rows read (<p>% of this partition), <companies>
+companies, <s>s in this partition`. That is the message template, not a captured line: a local
+partition of that size finishes in under a second, so the heartbeat cannot be observed here — it
+exists so a genuinely huge partition cannot look like a stall.
+
+The counters are the run's own (`companies`, `contacts`, rows read, rows rejected), the throughput is
+computed from the merge clock, and `progress` drives the CLI's percentage — which is now
+`(partitions completed) / (partitions total)`, so it moves on the first partition instead of sitting
+at 0% while the job works. A partition that takes longer than the thresholds is described in plain
+language: an expected slow step (a partition far above the average row count — it is buffered whole
+before it is merged), a slow step with no size explanation (I/O contention or a cold cache), or a
+stall (nothing in the merge loop explains it).
+
+### Resuming the interrupted 1 M benchmark
+
+Nothing about the run identity, source mapping, partition scheme, spool format or dataset version
+changed, so the existing checkpoint is resumed as it is — same command, no `--no-resume`:
+
+```powershell
+cd C:\path\to\companyintel-pro
+git pull
+bun install
+bun run index:benchmark-1m
+```
+
+The run reuses the verified Pass 1 spool, resets the abandoned pass-2 output (it prints how many
+files), and merges from partition 1. `bun run index:spool-doctor` first, if you want the spool
+re-checked read-only before the merge starts.
 
 ## Recommended sequence (approval gates included)
 
@@ -441,7 +573,7 @@ volume fills, but it does not create space: an under-sized machine fails at hour
 | Columns mapped to the wrong canonical field | Add a `columns` override for that source (`{"companyname": "Org Name"}`). |
 | High rejected-row count | Check the encoding/delimiter for that file; inspect `workDir/rejected.jsonl` reasons. |
 | `Refusing to start: temporary space is insufficient` | Free space on the `workDir` volume, or lower `partitions`. |
-| `Stopping before the disk fills: … below the … floor` | The mid-run guard (512 MB free on `outputDir`). Nothing written was lost and the checkpoint is still at `pass2-merge`: free space and re-run the same command to resume. |
+| `Stopping before the disk fills: … below the … floor` | The mid-run guard (512 MB free on `outputDir`), checked after every partition. Nothing written was lost and the checkpoint is still at `pass2-merge`: free space and re-run the same command to resume — the partial output is reset and replayed, not appended to. |
 | `workDir already holds a checkpoint for a different run: …` | The spool belongs to another run (different version, sample size, partitions or source paths). Re-run with `--no-resume`, or point `workDir` somewhere empty. Nothing was read or written before the stop. |
 | `was written without a run identity; refusing to resume it` | A checkpoint from a build older than the run-identity change. Re-run with `--no-resume` once. |
 | A resumed run reports `source_missing_rows` (csv1=0, csv2=0) | Fixed: pass-1 counters are restored from the checkpoint, so a resumed run no longer fails validation over its own bookkeeping. If you see it on an older build, re-run with `--no-resume` once. |
@@ -449,5 +581,8 @@ volume fills, but it does not create space: an under-sized machine fails at hour
 | `Refusing to merge: … has no spool-manifest.json` | The spool cannot be shown to be complete (it was written by a build older than the manifest, or pass 1 never finished). Run `bun run index:spool-doctor`: if every partition reads `ok`, `--repair-manifest` records the manifest and pass 1 is reused; otherwise re-run with `--no-resume`. |
 | `Spool partition part-NNNN.jsonl is truncated: X B on disk, Y B recorded` | A partition was cut short (killed process, full disk, lost write). Its rows cannot be recovered from the spool, so nothing is merged. `index:spool-doctor` shows every partition; `--no-resume` rebuilds the spool. |
 | `Spool partition … lost or gained records` / `does not match the checksum pass 1 recorded` | The file changed after pass 1 wrote it. Same remedy: inspect, then `--no-resume`. |
+| A restart after an interrupted pass 2 appears to redo the merge | Expected: there is no partition-level resume. The Pass 1 spool is reused (no R2 read, no pass 1) and pass 2 is replayed from partition 1 after the previous attempt's partial output is reset. The run says so: `restarting at partition 1 of N on the preserved Pass 1 spool`. |
+| `Refusing to reset …: a dataset version may not point outside the output directory` | `datasetVersion` contains a path traversal (`..`). Nothing was deleted and the run stopped before writing; fix the version id. |
+| The same company appears twice in search results after a restart | A pre-fix restart appended a second copy of a posting to `workDir/shards` and it survived finalization. Re-run the same command: the shard directory and this version's generated output are reset before the merge, and each posting is then written exactly once. |
 | `R2 credentials are not set` on publish | Export `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` for the session. |
 | Version uploaded but the app still shows the old data | `publish` was not run (or failed) — `manifests/active.json` still points at the previous version. |

@@ -166,7 +166,11 @@ function progressLogger() {
     if (now - last < 1500 && event.stage !== "completed" && event.stage !== "failed") return;
     last = now;
     const rate = event.rowsPerSecond ? ` (${Math.round(event.rowsPerSecond).toLocaleString()} rows/s)` : "";
-    const progress = event.progress !== null ? ` [${(event.progress * 100).toFixed(0)}%]` : "";
+    // One decimal below 10%: pass 2 has 256 partitions, so the first completed one
+    // is 0.39% — rounding that to "0%" is exactly what made a working merge look
+    // stuck. Above 10% the whole number is what an operator wants.
+    const percent = event.progress === null ? null : event.progress * 100;
+    const progress = percent === null ? "" : ` [${percent > 0 && percent < 10 ? percent.toFixed(1) : percent.toFixed(0)}%]`;
     console.log(`[${event.stage}]${progress} ${event.message}${rate}`);
   };
 }
@@ -407,6 +411,18 @@ async function cmdRun(config: IndexerConfig, flags: Record<string, string | bool
       (pass1RowsPerSecond === null ? "  (skipped: resumed)" : `  (${pass1RowsPerSecond.toLocaleString()} rows/s: R2/file read + parse + spool)`),
   );
   console.log(`    pass 2 merge    ${(stages.pass2Ms / 1000).toFixed(1)} s`);
+  if (result.pass2Reset.shardFiles || result.pass2Reset.outputFiles) {
+    // Restart safety, in the summary an operator actually reads: pass 2 replayed
+    // from partition 1 after a previous attempt's output was reset.
+    console.log(
+      `      restart reset ${result.pass2Reset.shardFiles.toLocaleString()} shard file(s), ` +
+        `${result.pass2Reset.outputFiles.toLocaleString()} generated object(s) (${formatBytes(result.pass2Reset.outputBytes)})`,
+    );
+  }
+  console.log(
+    `      shard writer  ${result.shardWrite.appends.toLocaleString()} posting line(s), ${result.shardWrite.fileOpens.toLocaleString()} shard append(s) ` +
+      `(${(result.shardWrite.appends / Math.max(1, result.shardWrite.fileOpens)).toFixed(1)} lines per append), peak buffer ${formatBytes(result.shardWrite.peakBufferedBytes)}`,
+  );
   console.log(`    finalize+index  ${(stages.finalizeMs / 1000).toFixed(1)} s`);
   console.log(`    validate        ${(stages.validateMs / 1000).toFixed(1)} s`);
   console.log(`  peak memory       ${formatBytes(peaks.peakRssBytes)} RSS`);
