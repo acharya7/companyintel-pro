@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -17,13 +17,39 @@ import {
   accumulateFacets,
   pickCanonicalKey,
 } from "../tools/indexer/src/mapping";
-import { runIndex, preflight, type IndexerConfig } from "../tools/indexer/src/build";
+import {
+  ROWS_PER_SECOND_MEASURED,
+  STORAGE,
+  estimateWorkingSet,
+  preflight,
+  runIndex,
+  type IndexerConfig,
+} from "../tools/indexer/src/build";
+import { adoptSpool, inspectSpool, readSpoolManifest, spoolManifestPathFor, type SpoolIdentity } from "../tools/indexer/src/spool";
+import { readJsonlLines } from "../tools/indexer/src/jsonl";
 import { R2CandidateSource, type ShardReader } from "../worker/src/search-source";
 import { searchCompanies } from "../src/shared/search/engine";
 import { companyPartitionKey, indexShardKey, partitionOfRef, type ShardPayload } from "../src/shared/search/index-format";
 import type { Company, CompanyFacets, Contact } from "../src/shared/models";
 
 const FIRST_HEADERS = ["Company Name", "Company Domain", "Industry", "Country", "City", "Full Name", "Job Title", "Email", "LinkedIn URL"];
+
+/** Records in every `part-*.jsonl`, and the raw bytes of the spool. */
+async function spoolStats(workDir: string): Promise<{ files: number; records: number; bytes: number; hasLiteralSeparator: boolean }> {
+  const files = (await readdir(join(workDir, "spool")).catch(() => [] as string[])).filter((name) => name.endsWith(".jsonl"));
+  let records = 0;
+  let bytes = 0;
+  let hasLiteralSeparator = false;
+  for (const file of files) {
+    const path = join(workDir, "spool", file);
+    for await (const line of readJsonlLines(path)) {
+      records += line.byteLength > 0 ? 1 : 0;
+      bytes += line.byteLength + 1;
+      if (line.text.includes("\u2028") || line.text.includes("\u2029")) hasLiteralSeparator = true;
+    }
+  }
+  return { files: files.length, records, bytes, hasLiteralSeparator };
+}
 const SECOND_HEADERS = ["organization", "website", "company linkedin", "employees", "person name", "title", "work email", "region", "contact city", "department", "seniority"];
 
 function csv(headers: string[], rows: (string | number)[][]): string {
@@ -443,5 +469,293 @@ describe("end-to-end indexing pipeline", () => {
   test("search reads a bounded number of shards", () => {
     expect(shardReads.length).toBeGreaterThan(0);
     expect(shardReads.length).toBeLessThan(120);
+  });
+});
+
+describe("the pass-2 merge survives the separators real data contains", () => {
+  /*
+   * The 1,000,000-record benchmark died here:
+   *
+   *     JSON Parse error: Unterminated string
+   *
+   * U+2028 (LINE SEPARATOR) and U+2029 (PARAGRAPH SEPARATOR) are what scraped
+   * exports use as an in-cell line break. `JSON.stringify` leaves them literal in
+   * a spool row, and `readline` — which pass 2 used — treats them as terminators,
+   * so one record was read as two and the first half was truncated mid-string.
+   *
+   * The fixture below puts both characters in columns that reach the spool
+   * unchanged (industry and job title are not display-normalised), which is what
+   * the real files did. Every assertion is about the run completing without losing
+   * or splitting a single record.
+   */
+  const U2028 = "\u2028";
+  const U2029 = "\u2029";
+  let dir: string;
+  let config: IndexerConfig;
+
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), "ci-separators-"));
+    const source = join(dir, "separators.csv");
+    await writeFile(
+      source,
+      csv(FIRST_HEADERS, [
+        ["Globex" + U2028 + "Holdings", "globex.example", "Software" + U2029 + "Services", "United States", "Austin", "Ada" + U2028 + "Lovelace", "VP" + U2029 + "Engineering", "ada@globex.example", ""],
+        ["Acme, Inc.", "acme.example", "Manufacturing", "United States", "Detroit", "John O'Neil", "Plant Manager", "john@acme.example", ""],
+        ["Initech", "initech.example", "Hardware", "India", "Pune", "Pat Kim", "CTO", "pat@initech.example", ""],
+      ]),
+      "utf8",
+    );
+    config = {
+      datasetVersion: "separators-v1",
+      sources: [{ id: "csv1", path: source }],
+      workDir: join(dir, "work"),
+      outputDir: join(dir, "out"),
+      partitions: 4,
+      shards: { exact: 4, prefix: 4, token: 4, trigram: 4, ids: 4 },
+    };
+  });
+
+  afterAll(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  test("a run whose rows carry U+2028/U+2029 builds and validates", async () => {
+    const result = await runIndex(config, {});
+    expect(result.manifest.validationPassed).toBe(true);
+    expect(result.counters.rowsRead).toBe(3);
+    expect(result.counters.uniqueCompanies).toBe(3);
+    expect(result.counters.uniqueContacts).toBe(3);
+
+    // One spool record per source row: the separators are escaped on the way in,
+    // so a reader can never see half a record.
+    const stats = await spoolStats(config.workDir);
+    expect(stats.records).toBe(3);
+    expect(stats.hasLiteralSeparator).toBe(false);
+  });
+
+  test("re-reading the same spool resumes cleanly (the record is not split)", async () => {
+    const resumed = await runIndex({ ...config, outputDir: join(dir, "out-resumed") }, {});
+    expect(resumed.resumed).toBe(true);
+    expect(resumed.manifest.validationPassed).toBe(true);
+    expect(resumed.counters.rowsRead).toBe(3);
+    expect(resumed.counters.uniqueCompanies).toBe(3);
+  });
+});
+
+describe("spool completeness is recorded, verified and recoverable", () => {
+  let dir: string;
+  let config: IndexerConfig;
+
+  const spoolDirFor = () => join(config.workDir, "spool");
+
+  beforeAll(async () => {
+    dir = await mkdtemp(join(tmpdir(), "ci-spool-"));
+    const source = join(dir, "source.csv");
+    await writeFile(
+      source,
+      csv(FIRST_HEADERS, [
+        ["Tata Consultancy Services Limited", "tcs.com", "IT Services", "India", "Mumbai", "Asha Rao", "CTO", "asha@tcs.example", ""],
+        ["Meridian Logistics GmbH", "meridian.example", "Logistics", "Germany", "Hamburg", "Lukas Weber", "Director", "lukas@meridian.example", ""],
+        ["Acme Industries", "acme.example", "Manufacturing", "United States", "Austin", "Ada Lovelace", "CTO", "ada@acme.example", ""],
+      ]),
+      "utf8",
+    );
+    config = {
+      datasetVersion: "spool-v1",
+      sources: [{ id: "csv1", path: source }],
+      workDir: join(dir, "work"),
+      outputDir: join(dir, "out"),
+      partitions: 4,
+      shards: { exact: 4, prefix: 4, token: 4, trigram: 4, ids: 4 },
+    };
+  });
+
+  afterAll(async () => {
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  test("pass 1 records every partition with its size, record count and checksum", async () => {
+    await runIndex(config, {});
+    const manifest = await readSpoolManifest(config.workDir);
+    expect(manifest).not.toBeNull();
+    expect(manifest!.complete).toBe(true);
+    expect(manifest!.totals.lines).toBe(3);
+    for (const entry of manifest!.partitions) {
+      const size = (await stat(join(spoolDirFor(), entry.file))).size;
+      expect(entry.bytes).toBe(size);
+      expect(entry.sha256).toMatch(/^[0-9a-f]{64}$/);
+      expect(entry.lines).toBeGreaterThan(0);
+    }
+    expect(manifest!.totals.bytes).toBe(manifest!.partitions.reduce((total, entry) => total + entry.bytes, 0));
+  });
+
+  test("a spool with no manifest is refused instead of merged blind", async () => {
+    await rm(spoolManifestPathFor(config.workDir), { force: true });
+    await expect(runIndex({ ...config, outputDir: join(dir, "out-nomanifest") }, {})).rejects.toThrow(/no spool-manifest\.json/);
+
+    // The documented recovery path: inspect, then adopt only if every partition
+    // verifies. This is what lets an existing Pass 1 result be reused.
+    const inspection = await inspectSpool(config.workDir);
+    expect(inspection.verdict).toBe("incomplete");
+    expect(inspection.totals.records).toBe(3);
+    const identity = inspection.checkpoint.identity as SpoolIdentity;
+    expect(identity).not.toBeNull();
+    await adoptSpool(config.workDir, identity, inspection);
+
+    const resumed = await runIndex({ ...config, outputDir: join(dir, "out-adopted") }, {});
+    expect(resumed.resumed).toBe(true);
+    expect(resumed.counters.rowsRead).toBe(3);
+    expect(resumed.counters.uniqueCompanies).toBe(3);
+    expect(resumed.manifest.validationPassed).toBe(true);
+  });
+
+  test("a truncated partition is detected by position and never merged", async () => {
+    const manifest = await readSpoolManifest(config.workDir);
+    const target = manifest!.partitions[0];
+    const path = join(spoolDirFor(), target.file);
+    const before = await readFile(path, "utf8");
+    // Simulate an interrupted write: a partial record with no terminator.
+    await writeFile(path, `${before}{ "keys": ["n:globex"`, "utf8");
+
+    await expect(runIndex({ ...config, outputDir: join(dir, "out-truncated") }, {})).rejects.toThrow(/truncated/);
+
+    const inspection = await inspectSpool(config.workDir);
+    expect(inspection.verdict).toBe("damaged");
+    const damaged = inspection.partitions.find((entry) => entry.problems.length > 0)!;
+    expect(damaged.file).toBe(target.file);
+    expect(damaged.problems[0].kind).toBe("truncated");
+    expect(damaged.problems[0].line).toBe(target.lines + 1);
+    expect(damaged.problems[0].byteOffset).toBe(target.bytes);
+    expect(JSON.stringify(inspection)).not.toContain("globex");
+
+    // Adopting it is refused as well: recording a manifest over a damaged spool
+    // would be exactly the silent data loss the manifest exists to prevent.
+    await expect(adoptSpool(config.workDir, manifest!.identity, inspection)).rejects.toThrow(/not provably complete/);
+
+    // --no-resume is the documented answer, and it rebuilds a clean spool.
+    const rebuilt = await runIndex({ ...config, outputDir: join(dir, "out-rebuilt") }, { resume: false });
+    expect(rebuilt.manifest.validationPassed).toBe(true);
+    expect(rebuilt.counters.rowsRead).toBe(3);
+    expect((await inspectSpool(config.workDir)).verdict).toBe("clean");
+  });
+
+  test("a manifest that describes a different run is refused", async () => {
+    const manifest = (await readSpoolManifest(config.workDir))!;
+    await writeFile(
+      spoolManifestPathFor(config.workDir),
+      JSON.stringify({ ...manifest, identity: { ...manifest.identity, version: "some-other-version" } }),
+      "utf8",
+    );
+    await expect(runIndex({ ...config, outputDir: join(dir, "out-mismatch") }, {})).rejects.toThrow(/describes a different run/);
+  });
+
+  test("a fresh run clears the previous manifest before it spools anything", async () => {
+    // Restore a valid manifest, then start over: the old manifest must not survive
+    // into the new pass 1, or a crash mid-way would leave a claim that pass 1
+    // finished over a spool that was just emptied.
+    await rm(spoolManifestPathFor(config.workDir), { force: true });
+    const rebuilt = await runIndex({ ...config, outputDir: join(dir, "out-fresh") }, { resume: false });
+    expect(rebuilt.manifest.validationPassed).toBe(true);
+    const manifest = await readSpoolManifest(config.workDir);
+    expect(manifest!.totals.lines).toBe(3);
+  });
+});
+
+describe("preflight resource estimates match what a real run consumes", () => {
+  const modeB: IndexerConfig = {
+    datasetVersion: "bench",
+    sources: [
+      { id: "csv1", path: "r2://company-intel-data/raw/file1.csv" },
+      { id: "csv2", path: "r2://company-intel-data/raw/file2.csv" },
+    ],
+    workDir: ".indexer-work",
+    outputDir: ".indexer-output",
+    partitions: 256,
+    shards: { exact: 512, prefix: 256, token: 256, trigram: 512, ids: 256 },
+    rawCacheDir: ".indexer-raw-cache",
+  };
+  /** The real object sizes, measured from the bucket. */
+  const MEASURED = [
+    { id: "csv1", bytes: 10_223_471_749 },
+    { id: "csv2", bytes: 54_038_527_871 },
+  ];
+
+  test("the 1 M benchmark estimate includes the Mode B staging file it used to omit", () => {
+    const estimate = estimateWorkingSet(modeB, MEASURED, { sampleLimit: 1_000_000 });
+    // Before the fix this term did not exist in the arithmetic at all, and the
+    // benchmark's own peak (2.49 GB) was above the 1.87 GB the preflight promised.
+    expect(estimate.rawCachePeakBytes).toBeGreaterThan(1e9);
+    expect(estimate.totalBytes).toBeGreaterThan(2_490_000_000);
+    // The total is the sum of the named terms (times the margin), not a rounded
+    // fraction of the input size.
+    const terms = estimate.spoolBytes + estimate.rawCachePeakBytes + estimate.outputBytes + estimate.overheadBytes;
+    expect(estimate.totalBytes).toBe(Math.ceil(terms * estimate.safetyMargin));
+    expect(estimate.spoolBytes).toBe(2_000_000 * STORAGE.spoolBytesPerRow);
+    expect(estimate.perSource.every((source) => source.mode === "r2" && source.rows === 1_000_000)).toBe(true);
+  });
+
+  test("the full-corpus requirement covers spool, raw cache and output", () => {
+    const estimate = estimateWorkingSet(modeB, MEASURED, {});
+    // Previously the preflight reported 70.96 GB, which is the SPOOL alone: the
+    // 54 GB csv2 cache and the generated index were never in the total, even
+    // though the repository's own docs budgeted ~145-155 GB for exactly this run.
+    expect(estimate.spoolBytes).toBeGreaterThan(60e9);
+    expect(estimate.rawCachePeakBytes).toBeGreaterThan(50e9);
+    expect(estimate.totalBytes).toBeGreaterThan(140e9);
+    expect(estimate.totalBytes).toBeGreaterThan(70_960_000_000);
+  });
+
+  test("a local-file run has no staging term, and the sample bounds the spool", () => {
+    const local: IndexerConfig = { ...modeB, sources: [{ id: "csv1", path: "/tmp/does-not-exist.csv" }], rawCacheDir: null };
+    const estimate = estimateWorkingSet(local, [{ id: "csv1", bytes: 10_223_471_749 }], { sampleLimit: 1_000_000 });
+    expect(estimate.rawCachePeakBytes).toBe(0);
+    expect(estimate.spoolBytes).toBe(1_000_000 * STORAGE.spoolBytesPerRow);
+  });
+
+  test("preflight labels its duration as the measured end-to-end rate, not a synthetic one", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ci-preflight-"));
+    const source = join(dir, "one.csv");
+    await writeFile(source, csv(FIRST_HEADERS, [["Acme, Inc.", "acme.example", "Manufacturing", "United States", "Austin", "Ada Lovelace", "CTO", "ada@acme.example", ""]]), "utf8");
+    try {
+      const report = await preflight(
+        { datasetVersion: "preflight-v1", sources: [{ id: "csv1", path: source }], workDir: dir, outputDir: join(dir, "out"), partitions: 4, shards: { exact: 4, prefix: 4, token: 4, trigram: 4, ids: 4 } },
+        undefined,
+        { sampleLimit: 1_000_000 },
+      );
+      // One source × 1,000,000 records at the measured end-to-end rate. The old
+      // 120,000 rows/s constant promised 8 s for this job.
+      expect(report.estimatedDurationSeconds).toBe(1_000_000 / ROWS_PER_SECOND_MEASURED);
+      expect(report.estimatedDurationSeconds).toBeGreaterThan(120);
+      expect(ROWS_PER_SECOND_MEASURED).toBeLessThanOrEqual(10_000);
+      expect(report.estimate.rawCachePeakBytes).toBe(0);
+      // The reported figure IS the itemised total, so the number an operator reads
+      // is the one the terms add up to (this sandbox has ~0.6 GB free, so whether a
+      // warning appears depends on the machine — the arithmetic must not).
+      expect(report.estimatedWorkBytes).toBe(report.estimate.totalBytes);
+      expect(report.estimatedOutputBytes).toBe(report.estimate.outputBytes);
+      const terms = STORAGE.spoolBytesPerRow * 1_000_000 + STORAGE.outputBytesPerRow * 1_000_000 + STORAGE.fixedOverheadBytes;
+      expect(report.estimatedWorkBytes).toBe(Math.ceil(terms * STORAGE.safetyMargin));
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a run reports where its time went, per stage", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "ci-stages-"));
+    const source = join(dir, "one.csv");
+    await writeFile(source, csv(FIRST_HEADERS, [["Acme, Inc.", "acme.example", "Manufacturing", "United States", "Austin", "Ada Lovelace", "CTO", "ada@acme.example", ""]]), "utf8");
+    const config: IndexerConfig = { datasetVersion: "stages-v1", sources: [{ id: "csv1", path: source }], workDir: join(dir, "work"), outputDir: join(dir, "out"), partitions: 4, shards: { exact: 4, prefix: 4, token: 4, trigram: 4, ids: 4 } };
+    try {
+      const fresh = await runIndex(config, {});
+      expect(fresh.resumed).toBe(false);
+      expect(fresh.stages.pass1Ms).toBeGreaterThan(0);
+      for (const value of Object.values(fresh.stages)) expect(value).toBeGreaterThanOrEqual(0);
+
+      const resumed = await runIndex({ ...config, outputDir: join(dir, "out-2") }, {});
+      expect(resumed.resumed).toBe(true);
+      expect(resumed.stages.pass1Ms).toBe(0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

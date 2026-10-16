@@ -22,7 +22,7 @@ No Convex, no SQL database, no KV/D1/Durable Objects, no Redis, no search server
 - Fixed server-side credentials: one private, git-ignored `.r2-credentials.json` (mode 600) read
   automatically by the indexer and the verification scripts — never by the browser bundle or the
   deployed Worker, which uses the `COMPANY_DATA` binding
-- Tests: `bun test` (304 tests, 1296 assertions) — normalization, relevance, prototype-chain safety,
+- Tests: `bun test` (337 tests, 1451 assertions) — normalization, relevance, prototype-chain safety,
   CSV/indexer, R2 store, end-to-end index + Worker API over a generated index, the bounded
   hydration funnel, lead recovery, security, the R2 probe and its runner, and the S3 verification
   scripts over a stub transport
@@ -71,6 +71,8 @@ bun run index:profile                 # preflight over the real objects + mappin
 bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json --sample 20000   --version v1-dry5-250
 # The 1 M-record readiness benchmark: prepared, NOT run automatically (see docs/indexing.md)
 bun run index:benchmark-1m
+# After ANY failure: read-only spool diagnosis — partition/line/byte offsets, never records
+bun run index:spool-doctor
 # Full run + upload, then activate (each step is documented in docs/indexing.md)
 bun run index:upload
 bun run index:validate
@@ -84,8 +86,13 @@ hydration budget costs in rows lost vs. bytes read against the real-data sample 
 
 The 1 M-record benchmark checks its prerequisites first and writes nothing until they hold:
 `bun run index:benchmark-1m:preflight` verifies R2 credentials, both object keys, the TSV mapping
-and free disk/memory, then stops. `workDir/checkpoint.json` records the run it belongs to, so
-running the benchmark in a workDir that holds another run's spool stops with an explanation
+and free disk/memory, then stops; its estimate itemises the spool, the Mode B staging file, the
+index and bookkeeping (1.87 GB → 5.31 GB for the 1 M sample after the first real run showed the old
+figure was too low). `workDir/checkpoint.json` records the run it belongs to and
+`workDir/spool-manifest.json` records which partitions pass 1 actually finished, so a resumed run
+never merges a spool from another run or a partition that was never completed —
+`bun run index:spool-doctor` reports exactly what a failed run left behind (positions only, never
+records). See `docs/indexing.md` → "The 1 M real-data failure"
 instead of merging two inputs (`--no-resume` rebuilds from the sources).
 
 Before any of that, Phase A verifies what is really in R2 — read-only, bounded, both source files
@@ -110,7 +117,7 @@ The equivalent S3-key path remains available: `bun scripts/verify-raw.mjs[--json
 | Area | Status |
 | --- | --- |
 | Frontend, Worker, indexer, probe typechecks | **IMPLEMENTED AND TESTED** — `bun run check` → 5/5 PASS |
-| Test suite (304 tests, 1296 assertions) | **IMPLEMENTED AND TESTED** — normalization, prototype-chain safety, relevance, CSV parsing, indexer pipeline + R2 streaming sources, R2 store, Access security, end-to-end index build + Worker route handlers, the bounded hydration funnel (including checkpoint provenance), the read-only probe |
+| Test suite (337 tests, 1451 assertions) | **IMPLEMENTED AND TESTED** — normalization, prototype-chain safety, relevance, CSV parsing, indexer pipeline + R2 streaming sources, R2 store, Access security, end-to-end index build + Worker route handlers, the bounded hydration funnel (including checkpoint provenance), the read-only probe, the newline-safe JSONL codec (U+2028/U+2029, truncation, chunk boundaries, CRLF), spool-manifest integrity and the read-only spool doctor |
 | Build and bundles | **IMPLEMENTED AND TESTED** — `bun run build` exits 0 and the `dist/` scan finds no server identifier; `wrangler deploy --dry-run` bundles the Worker (737 KiB) and the probe (39 KiB) with the expected bindings and `workers_dev = false` |
 | Worker → R2 access path | **IMPLEMENTED AND TESTED** — `tests/worker-r2-binding.test.ts` proves the Worker reaches R2 only through the `COMPANY_DATA` binding, never with S3 secrets, and that the bucket is not published |
 | Read-only R2 probe (native binding, no keys) | **IMPLEMENTED AND TESTED locally** — `tests/r2-probe.test.ts`, `tests/r2-probe-schema.test.ts`, `tests/verify-r2-remote-script.test.ts` cover routing, bound clamping, the production refusal, 405 on writes, no write/delete call existing anywhere in the probe, 1 KB/6 MB read budgets, missing-object handling, the schema report and the runner's 0/1/2 exit codes. **Not run against your account** |
@@ -119,7 +126,7 @@ The equivalent S3-key path remains available: `bun scripts/verify-raw.mjs[--json
 | Search engine + ranking | **IMPLEMENTED AND TESTED** — recall@1 0.939 / recall@5 0.97 on the labelled fixture set |
 | R2 object layout, manifests, rollback | **IMPLEMENTED, PARTIALLY TESTED** — layout and pointer logic tested; the real R2 path needs a deployed bucket |
 | Worker API + R2 reads | **IMPLEMENTED, PARTIALLY TESTED** — routing, validation and Access verified by tests; end-to-end reads require a published dataset |
-| Streaming indexer | **IMPLEMENTED, TESTED on synthetic CSVs and RUN once on real data** — both schemas, multiline records, cross-file association, shard bounds, checkpoint, upload retries, checksums, atomic publish/rollback; the real 64.26 GB run is pending your approval gate |
+| Streaming indexer | **IMPLEMENTED, TESTED on synthetic CSVs and RUN against real data** — both schemas, multiline records, cross-file association, shard bounds, checkpoint + spool manifest, upload retries, checksums, atomic publish/rollback. The first 1 M real-data benchmark exposed a genuine pass-2 failure (`JSON Parse error: Unterminated string`, caused by U+2028/U+2029 being line terminators to the old reader); it is fixed and regression-tested, and the 1 M re-run plus the real 64.26 GB run are pending your approval gate |
 | Real data in R2 (`raw/`) | **VERIFIED** — `raw/file1.csv` 10,223,471,749 B and `raw/file2.csv` 54,038,527,871 B listed, HEADed and read with signed ranged GETs; schemas profiled per file; no published dataset. Results: `docs/verification.md` → Phase A |
 | Browser-rendered UI | **BLOCKED here** — no browser in this sandbox; manual checklist in `docs/verification.md` → Phase C |
 | Cloudflare deployment + Access policy | **NOT STARTED** — manual steps are in `docs/deployment.md`, awaiting your go-ahead. `workers_dev = false` is already set in `wrangler.toml`, so add your custom-domain route before deploying |

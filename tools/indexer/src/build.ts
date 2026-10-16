@@ -21,11 +21,9 @@
  * of raw rows, or one shard of postings, held in memory.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, type Hash } from "node:crypto";
 import { createWriteStream, existsSync, type WriteStream } from "node:fs";
 import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { createReadStream } from "node:fs";
-import { createInterface } from "node:readline";
 import { cpus, freemem, totalmem } from "node:os";
 import { dirname, join } from "node:path";
 import { gzipSync } from "node:zlib";
@@ -63,7 +61,29 @@ import {
   type RawCompanyInput,
 } from "./mapping";
 import { credentialsFromEnv, R2Client } from "./r2";
-import { createSourceContext, sourceBytes, sourceProfile, sourceRecords, type SourceContext, type SourceStats } from "./source";
+import { encodeJsonlLine, escapeTerminators, isJsonlError, readJsonlFile, readJsonlLines } from "./jsonl";
+// `encodeJsonlLine` is used for every JSONL file this pipeline writes — the spool
+// partitions, `rejected.jsonl` and `objects.jsonl` — so there is one place where the
+// record encoding is defined and one place to fix it.
+import {
+  SPOOL_MANIFEST_FILE,
+  clearSpoolManifest,
+  readSpoolManifest,
+  spoolManifestPathFor,
+  writeJsonAtomic,
+  type SpoolManifest,
+  type SpoolManifestEntry,
+} from "./spool";
+import {
+  DEFAULT_CHUNK_BYTES,
+  createSourceContext,
+  parseR2Source,
+  sourceBytes,
+  sourceProfile,
+  sourceRecords,
+  type SourceContext,
+  type SourceStats,
+} from "./source";
 
 export interface SourceConfig {
   id: string;
@@ -113,12 +133,97 @@ export interface ProgressEvent {
   etaSeconds: number | null;
 }
 
+/**
+ * Every storage term a run needs at once, in bytes, with the measurements each
+ * number comes from.
+ *
+ * The 1,000,000-record benchmark exposed two independent defects here, and the
+ * breakdown exists so that neither can come back silently:
+ *
+ *   1. the Mode B **raw-cache staging file** was not in the estimate at all. A
+ *      cached source is streamed into `<rawCacheDir>/<bucket>/<key>.part`, so at
+ *      its peak the volume holds the spool PLUS the bytes of the object read so
+ *      far. For the 1 M benchmark that is ~2.2 GB that the old estimate omitted;
+ *   2. `BYTES_PER_SPOOL_ROW = 900` was a guess. A real spool row measures 525 B
+ *      (3,778 rows of the real-data sample occupy 1.98 MB), while the benchmark's
+ *      own peak (2.49 GB for 2.0 M rows) shows the whole working set is larger
+ *      than either term alone suggests.
+ *
+ * The peak is therefore estimated as
+ * `((spool + peak raw cache + output + fixed overhead) × safety margin)` — every
+ * term named, summed and printed, so an operator can see which one of them makes
+ * their machine too small instead of being told "free some space".
+ */
+export interface WorkEstimate {
+  /** Canonical spool rows written by pass 1 (`part-*.jsonl`). */
+  spoolBytes: number;
+  /**
+   * Largest raw-cache staging file alive at one time. Sources are read one after
+   * another and each `.part` is dropped when a sample stops, so the peak is the
+   * largest single source, not their sum.
+   */
+  rawCachePeakBytes: number;
+  /** Generated index objects (`outputDir`), written during pass 2. */
+  outputBytes: number;
+  /** Checkpoint, spool manifest, rejected.jsonl, objects.jsonl, shard `.lines`. */
+  overheadBytes: number;
+  safetyMargin: number;
+  /** The number compared against free disk: the sum above × `safetyMargin`. */
+  totalBytes: number;
+  /** Per-source ingestion the estimate assumes, for the report. */
+  perSource: { id: string; mode: "file" | "r2"; bytes: number; rows: number | null }[];
+}
+
+/**
+ * Measured storage constants. Each one is a measurement from this repository's own
+ * runs against the real bucket, not a guess — see `docs/indexing.md`.
+ */
+export const STORAGE = {
+  /** Real-data sample: 3,778 spool rows occupy 1,981,398 B → 524.5 B/row. */
+  measuredSpoolBytesPerRow: 525,
+  /**
+   * What the estimate uses: the measurement plus a third. Pass 1 derives extra
+   * fields (aliases, keys, normalized name) for wide organization rows, and the
+   * 1 M benchmark's own peak implies more than the sample average.
+   */
+  spoolBytesPerRow: 700,
+  /** Measured worst case: `raw/file1.csv` is 10.22 GB for ~4.7 M rows → 2,176 B/row. */
+  maxSourceBytesPerRow: 2_176,
+  /** Measured corpus average: 64.26 GB for ~101.5 M rows → 633 B/row. */
+  averageSourceBytesPerRow: 633,
+  /**
+   * Generated index per ingested row: the measured range for the full corpus is
+   * 9–20 GB (99 B/company + 96 B/contact + 324 B/company of index shards), so the
+   * estimate uses the TOP of that range rather than its middle.
+   */
+  outputBytesPerRow: 200,
+  /** Fixed cost of a run's bookkeeping: checkpoint, spool manifest, rejected rows. */
+  fixedOverheadBytes: 256 * 1024 * 1024,
+  /** Applied to the sum before comparing with free space. */
+  safetyMargin: 1.25,
+} as const;
+
+/**
+ * End-to-end rows per second MEASURED on the real 1 M benchmark: pass 1 reported
+ * ~5,015 rows/s while streaming two R2 objects and spooling 1.99 M rows.
+ *
+ * The previous value (120,000 rows/s) came from a synthetic parse loop with the
+ * bytes already in memory; it made the preflight promise ~17 seconds for a job
+ * that needs tens of minutes, i.e. it was wrong by more than an order of
+ * magnitude in the optimistic direction. Anything printed from this constant is
+ * labelled as a measured end-to-end rate, and the run prints its own per-stage
+ * timings so the guess can be replaced by observation.
+ */
+export const ROWS_PER_SECOND_MEASURED = 5_000;
+
 export interface PreflightReport {
   sources: { id: string; path: string; bytes: number | null; exists: boolean }[];
   totalInputBytes: number;
   freeDiskBytes: number | null;
   estimatedWorkBytes: number;
   estimatedOutputBytes: number;
+  /** The same estimate, term by term, so the operator can see what dominates. */
+  estimate: WorkEstimate;
   memoryBytes: { free: number; total: number };
   cpuCount: number;
   estimatedRows: number | null;
@@ -127,9 +232,6 @@ export interface PreflightReport {
   sampleLimit: number | null;
   warnings: string[];
 }
-
-const BYTES_PER_SPOOL_ROW = 900;
-const ROWS_PER_SECOND_BASELINE = 120_000;
 
 /**
  * Free space the run refuses to go below on the output volume.
@@ -225,6 +327,66 @@ export interface PreflightOptions {
   sampleLimit?: number;
 }
 
+/**
+ * Estimate every storage term a run will hold at once.
+ *
+ * Kept separate from `preflight` so it can be asserted directly in tests: the
+ * benchmark that failed did so because this arithmetic was wrong, and a test that
+ * never exercises the arithmetic would not have caught it.
+ */
+export function estimateWorkingSet(
+  config: IndexerConfig,
+  measured: { id: string; bytes: number | null }[],
+  options: { sampleLimit?: number; chunkBytes?: number } = {},
+): WorkEstimate {
+  const chunkBytes = options.chunkBytes ?? DEFAULT_CHUNK_BYTES;
+  const perSource: WorkEstimate["perSource"] = [];
+  let spoolBytes = 0;
+  let outputBytes = 0;
+  let rawCachePeakBytes = 0;
+
+  for (const source of measured) {
+    const bytes = source.bytes ?? 0;
+    const mode = parseR2Source(config.sources.find((entry) => entry.id === source.id)?.path ?? "") ? "r2" : "file";
+    // A sample run knows its row count; a full run derives one from the measured
+    // corpus average bytes/row. `null` (unknown object size) falls back to a
+    // bytes-based estimate below rather than pretending the source is empty.
+    const rows = options.sampleLimit ?? (source.bytes === null ? null : Math.round(bytes / STORAGE.averageSourceBytesPerRow));
+    perSource.push({ id: source.id, mode, bytes, rows });
+
+    if (rows === null) {
+      // Unknown size: fall back to the input bytes with the same headroom the
+      // per-row constant carries (measured spool ≈ 0.83 × source bytes here).
+      spoolBytes += Math.round(bytes * 1.1);
+      outputBytes += Math.round(bytes * 0.12);
+    } else {
+      spoolBytes += rows * STORAGE.spoolBytesPerRow;
+      outputBytes += rows * STORAGE.outputBytesPerRow;
+    }
+
+    if (mode === "r2") {
+      // The staging file holds the object bytes read so far, rounded UP to whole
+      // ranged chunk requests (an 8 MiB request transfers 8 MiB). A sample stops
+      // before the end of a large object, so the sample bounds the staging file.
+      const staged = rows === null
+        ? bytes
+        : Math.min(bytes, Math.ceil((rows * STORAGE.maxSourceBytesPerRow) / chunkBytes) * chunkBytes);
+      rawCachePeakBytes = Math.max(rawCachePeakBytes, staged);
+    }
+  }
+
+  const sum = spoolBytes + rawCachePeakBytes + outputBytes + STORAGE.fixedOverheadBytes;
+  return {
+    spoolBytes,
+    rawCachePeakBytes,
+    outputBytes,
+    overheadBytes: STORAGE.fixedOverheadBytes,
+    safetyMargin: STORAGE.safetyMargin,
+    totalBytes: Math.ceil(sum * STORAGE.safetyMargin),
+    perSource,
+  };
+}
+
 export async function preflight(
   config: IndexerConfig,
   context: SourceContext = sourceContextFor(config),
@@ -245,22 +407,26 @@ export async function preflight(
   }
 
   const freeDiskBytes = await freeDiskBytesFor(config.workDir);
-  // Spool rows are the dominant temporary cost; output is compressed JSON.
-  // A sample run spools only `sampleLimit` rows per source, so it is estimated
-  // from the row count instead of from the (much larger) input size.
+  const estimate = estimateWorkingSet(config, sources, { sampleLimit: options.sampleLimit, chunkBytes: context.chunkBytes });
+  const estimatedWorkBytes = estimate.totalBytes;
+  const estimatedOutputBytes = estimate.outputBytes;
   const sampleRows = options.sampleLimit === undefined ? null : options.sampleLimit * config.sources.length;
-  const spoolBytes = sampleRows === null ? Math.round(totalInputBytes * 1.1) : Math.round(sampleRows * BYTES_PER_SPOOL_ROW);
-  const estimatedWorkBytes = spoolBytes + (sampleRows === null ? 256 * 1024 * 1024 : 64 * 1024 * 1024);
-  const estimatedOutputBytes = sampleRows === null ? Math.round(totalInputBytes * 0.12) : Math.round(spoolBytes * 0.3);
   const estimatedRows = sampleRows;
-  const estimatedDurationSeconds = sampleRows === null ? null : sampleRows / ROWS_PER_SECOND_BASELINE;
+  const estimatedDurationSeconds = sampleRows === null ? null : sampleRows / ROWS_PER_SECOND_MEASURED;
   const cpuCount = cpus().length || 1;
 
   if (freeDiskBytes !== null && freeDiskBytes < estimatedWorkBytes) {
     warnings.push(
-      `Temporary space looks insufficient: about ${(freeDiskBytes / 1e9).toFixed(1)} GB free vs ${(estimatedWorkBytes / 1e9).toFixed(1)} GB estimated for spooling${
+      `Temporary space looks insufficient: about ${(freeDiskBytes / 1e9).toFixed(1)} GB free vs ${(estimatedWorkBytes / 1e9).toFixed(1)} GB estimated for spool + raw cache + output${
         sampleRows === null ? "" : ` in a ${options.sampleLimit?.toLocaleString()}-record sample per source`
       }.`,
+    );
+  }
+  if (estimate.rawCachePeakBytes > 0 && estimatedWorkBytes > 0) {
+    // Called out separately because it is the term that used to be missing, and
+    // because it is the one the operator can remove (see `rawCacheDir`).
+    warnings.push(
+      `Budget ${(estimate.rawCachePeakBytes / 1e9).toFixed(1)} GB for the Mode B raw-cache staging file as well as ${(estimate.spoolBytes / 1e9).toFixed(1)} GB for the spool: they are alive at the same time. Setting \`rawCacheDir\` to null removes that term and costs a re-download on resume.`,
     );
   }
   if (freemem() < 1024 * 1024 * 1024) {
@@ -273,6 +439,7 @@ export async function preflight(
     freeDiskBytes,
     estimatedWorkBytes,
     estimatedOutputBytes,
+    estimate,
     memoryBytes: { free: freemem(), total: totalmem() },
     cpuCount,
     estimatedRows,
@@ -337,7 +504,10 @@ class ShardWriter {
 
   async write(kind: ShardKind, shard: number, term: string, ref: number, quality: number): Promise<void> {
     const stream = await this.handle(kind, shard);
-    const line = `${term}\u0001${ref}\u0001${quality}\n`;
+    // `escapeTerminators` keeps U+2028/U+2029 out of the record for the same
+    // reason `encodeJsonlLine` does for the spool: a term containing one used to
+    // split the posting across two "lines" and lose it.
+    const line = `${escapeTerminators(term)}\u0001${ref}\u0001${quality}\n`;
     if (!stream.write(line)) {
       await new Promise<void>((resolve) => stream.once("drain", () => resolve()));
     }
@@ -425,6 +595,33 @@ export interface RunResult {
   sourceStats: SourceStats;
   /** Bytes this run wrote into `outputDir` (the generated index, on disk). */
   outputBytes: number;
+  /**
+   * Where the wall-clock time actually went, measured per stage.
+   *
+   * The preflight's duration hint used to be derived from a synthetic 120,000
+   * rows/s figure and promised ~17 s for a job that takes tens of minutes. These
+   * numbers come from the run itself, so the next estimate can be built from
+   * observation: `pass1Ms` is network read + CSV parse + JSONL serialization +
+   * partition writes together (they are one streaming loop), `pass2Ms` is the
+   * merge, `finalizeMs` is shard grouping + compression, `validateMs` is the
+   * re-read.
+   */
+  stages: { profilingMs: number; pass1Ms: number; pass2Ms: number; finalizeMs: number; validateMs: number };
+  /** True when this run skipped pass 1 because it resumed a checkpoint. */
+  resumed: boolean;
+}
+
+/**
+ * One partition's append handle plus the integrity numbers recorded for it.
+ *
+ * The bytes/record count/checksum are accumulated as the rows are written, so the
+ * manifest costs no extra I/O: it is the same bytes the writer already has.
+ */
+interface PartitionSink {
+  stream: WriteStream;
+  bytes: number;
+  lines: number;
+  hash: Hash;
 }
 
 interface SpoolRow {
@@ -520,10 +717,22 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     if (stale.length) {
       emit({ stage: "pass1-partition", message: `cleared ${stale.length} stale spool partition file(s) from a previous run` });
     }
+    /*
+     * The manifest and the checkpoint are removed too, before a single row is
+     * spooled. Both of them assert "pass 1 finished": leaving a previous run's
+     * checkpoint in place while the spool is being rewritten would mean that a
+     * crash in the middle of pass 1 left a checkpoint claiming pass 1 was done
+     * over a half-written spool. Removing them first makes that state impossible
+     * — after a crash there is simply no manifest, and no manifest means the
+     * spool may not be merged.
+     */
+    await rm(checkpointPath, { force: true });
+    await clearSpoolManifest(workDir);
   }
 
   /* ------------------------------- profiling ------------------------------ */
 
+  const profilingStart = Date.now();
   const profiles: FileProfile[] = [];
   const columnMaps: Record<string, number>[] = [];
   for (const source of config.sources) {
@@ -557,6 +766,8 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       emit({ stage: "profiling", message: `  unmapped in ${source.id}: ${unmappedHeaders.slice(0, 12).join(", ")}` });
     }
   }
+
+  const profilingMs = Date.now() - profilingStart;
 
   /* --------------------------------- pass 1 ------------------------------- */
 
@@ -602,14 +813,22 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   const rejectedPath = join(workDir, "rejected.jsonl");
   const rejected = createWriteStream(rejectedPath, { flags: checkpoint ? "a" : "w" });
 
+  /** Milliseconds pass 1 occupied, for the run's stage breakdown. */
+  let pass1Ms = checkpoint ? 0 : -1;
+
   if (!checkpoint || checkpoint.stage === "preflight") {
     emit({ stage: "pass1-partition", message: "pass 1: streaming both files into hash partitions" });
     const pass1Start = Date.now();
 
+    // One sink map for the whole pass: a partition that both sources write to
+    // keeps a single append handle and a single running checksum, instead of
+    // being closed after source 1 and reopened (with a fresh checksum) for
+    // source 2.
+    const sinks = new Map<number, PartitionSink>();
+
     for (let sourceIndex = 0; sourceIndex < config.sources.length; sourceIndex += 1) {
       const source = config.sources[sourceIndex];
       const map = columnMaps[sourceIndex];
-      const sinks = new Map<number, WriteStream>();
       let rows = 0;
       // The first record of each file is its header row, which was already read
       // by the profiler and must never be indexed as data.
@@ -633,7 +852,10 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
         if (!companyInput) {
           counters.rowsRejected += 1;
           counters.perSource[source.id].rowsRejected += 1;
-          rejected.write(`${JSON.stringify({ source: source.id, line: record.line, reason: "missing_company_name", fields: record.fields.slice(0, 8) })}\n`);
+          // `encodeJsonlLine` (not bare `JSON.stringify`): a rejected row carries
+          // the raw source fields, and a U+2028 inside one of them used to split
+          // this file the same way it split the spool (see jsonl.ts).
+          rejected.write(encodeJsonlLine({ source: source.id, line: record.line, reason: "missing_company_name", fields: record.fields.slice(0, 8) }));
           continue;
         }
         if (!companyInput.domain && !companyInput.linkedinUrl && !companyInput.sourceId) {
@@ -659,11 +881,18 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
         let sink = sinks.get(partition);
         if (!sink) {
           const path = join(spoolDir, `part-${String(partition).padStart(4, "0")}.jsonl`);
-          sink = createWriteStream(path, { flags: "a" });
+          sink = { stream: createWriteStream(path, { flags: "a" }), bytes: 0, lines: 0, hash: createHash("sha256") };
           sinks.set(partition, sink);
         }
-        if (!sink.write(`${JSON.stringify(row)}\n`)) {
-          await new Promise<void>((resolve) => sink!.once("drain", () => resolve()));
+        // `encodeJsonlLine` escapes U+2028/U+2029, which `JSON.stringify` leaves
+        // literal and a line-oriented reader splits on. That mismatch is what
+        // failed the 1 M benchmark in pass 2 with "Unterminated string".
+        const line = encodeJsonlLine(row);
+        sink.hash.update(line, "utf8");
+        sink.bytes += Buffer.byteLength(line, "utf8");
+        sink.lines += 1;
+        if (!sink.stream.write(line)) {
+          await new Promise<void>((resolve) => sink!.stream.once("drain", () => resolve()));
         }
 
         if (rows % 200_000 === 0) {
@@ -680,10 +909,46 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
         }
       }
 
-      await Promise.all([...sinks.values()].map((sink) => new Promise<void>((resolve) => sink.end(resolve))));
       emit({ stage: "pass1-partition", rowsRead: counters.rowsRead, message: `pass 1: finished ${source.id} (${rows.toLocaleString()} rows)` });
     }
 
+    /*
+     * Close every partition, THEN record what was written.
+     *
+     * Order matters twice over: the manifest must only appear once the writes are
+     * flushed (its presence is the proof pass 1 finished), and it is written by
+     * rename so a reader sees either no manifest or a complete one. A checkpoint
+     * alone is not proof — it did not say which partitions were finished, which is
+     * how a truncated partition could be merged as "these rows never existed".
+     */
+    await Promise.all([...sinks.values()].map((sink) => new Promise<void>((resolve) => sink.stream.end(resolve))));
+    const entries: SpoolManifestEntry[] = [...sinks.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([partition, sink]) => ({
+        file: `part-${String(partition).padStart(4, "0")}.jsonl`,
+        partition,
+        bytes: sink.bytes,
+        lines: sink.lines,
+        sha256: sink.hash.digest("hex"),
+      }));
+    const manifest: SpoolManifest = {
+      identity,
+      complete: true,
+      createdAt: new Date().toISOString(),
+      partitions: entries,
+      totals: {
+        files: entries.length,
+        lines: entries.reduce((total, entry) => total + entry.lines, 0),
+        bytes: entries.reduce((total, entry) => total + entry.bytes, 0),
+      },
+    };
+    await writeJsonAtomic(spoolManifestPathFor(workDir), manifest);
+    emit({
+      stage: "pass1-partition",
+      message: `pass 1: spooled ${manifest.totals.lines.toLocaleString()} rows into ${manifest.totals.files} partition file(s) (${(manifest.totals.bytes / 1e9).toFixed(2)} GB); recorded in ${SPOOL_MANIFEST_FILE}`,
+    });
+
+    pass1Ms = Date.now() - pass1Start;
     await writeFile(checkpointPath, JSON.stringify({ stage: "pass2-merge", identity, counters } satisfies CheckpointFile, null, 2));
   }
 
@@ -729,11 +994,64 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     contactBuffer = new Map();
   };
 
-  const spoolFiles = (await readdir(spoolDir)).filter((name) => name.endsWith(".jsonl")).sort();
-  emit({ stage: "pass2-merge", message: `pass 2: resolving ${spoolFiles.length} partitions` });
+  /*
+   * Pass 2 merges ONLY partitions the manifest proves complete.
+   *
+   * The checkpoint says "pass 1 is done"; the manifest says "these exact bytes
+   * were written". A partition that is missing, short, or checksum-mismatched is a
+   * hard, local failure — never silently merged as a partition that happened to
+   * contribute fewer rows, and never treated as a source-data rejection.
+   */
+  const spoolManifest = await readSpoolManifest(workDir);
+  if (!spoolManifest) {
+    throw new Error(
+      `Refusing to merge: ${workDir} has no ${SPOOL_MANIFEST_FILE}, so pass 1 cannot be shown to have completed every partition.\n` +
+        "  Run `bun run index:spool-doctor` to inspect what is on disk. If the partitions are intact it can record the\n" +
+        "  manifest for them (--repair-manifest), and pass 2 then resumes without re-reading the sources. Otherwise\n" +
+        "  re-run with --no-resume to rebuild the spool from the sources.",
+    );
+  }
+  const manifestDiff = identityDiff(spoolManifest.identity, identity);
+  if (manifestDiff.length) {
+    throw new Error(
+      `Refusing to merge: ${SPOOL_MANIFEST_FILE} describes a different run (${manifestDiff.join("; ")}).\n` +
+        "  The partition files belong to that run, so merging them into this version would mix two inputs.\n" +
+        "  Re-run with --no-resume to rebuild the spool from the sources.",
+    );
+  }
 
-  for (let fileIndex = 0; fileIndex < spoolFiles.length; fileIndex += 1) {
-    const path = join(spoolDir, spoolFiles[fileIndex]);
+  const spoolEntries = [...spoolManifest.partitions].sort((a, b) => a.partition - b.partition);
+  const mergeStart = Date.now();
+  emit({
+    stage: "pass2-merge",
+    message: `pass 2: resolving ${spoolEntries.length} partitions (${spoolManifest.totals.lines.toLocaleString()} spooled rows, ${(spoolManifest.totals.bytes / 1e9).toFixed(2)} GB)`,
+  });
+
+  for (let fileIndex = 0; fileIndex < spoolEntries.length; fileIndex += 1) {
+    const entry = spoolEntries[fileIndex];
+    const path = join(spoolDir, entry.file);
+
+    // Completeness before content: a truncated file is a shorter but perfectly
+    // valid JSONL file, so its length has to be checked against what pass 1
+    // recorded, not against whether the records that survive happen to parse.
+    const info = await stat(path).catch(() => null);
+    if (!info) {
+      throw new Error(
+        `Spool partition ${entry.file} is recorded in ${SPOOL_MANIFEST_FILE} but is missing from ${spoolDir}. ` +
+          "Nothing was merged for it and nothing was deleted; re-run with --no-resume to rebuild the spool.",
+      );
+    }
+    if (info.size !== entry.bytes) {
+      throw new Error(
+        `Spool partition ${entry.file} is truncated: ${info.size.toLocaleString()} B on disk, ${entry.bytes.toLocaleString()} B recorded by pass 1.\n` +
+          "  Merging it would silently drop the rows that are missing, so the run stops here. Nothing was deleted.\n" +
+          "  Re-run with --no-resume to rebuild the spool from the sources (`bun run index:spool-doctor` reports every\n" +
+          "  partition first if you want to see the full picture).",
+      );
+    }
+
+    const partitionHash = createHash("sha256");
+    let recordsSeen = 0;
     const resolver = new CompanyResolver();
     const groups = new Map<
       number,
@@ -750,44 +1068,73 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       }
     >();
 
-    const lines = createInterface({ input: createReadStream(path), crlfDelay: Infinity });
-    for await (const line of lines) {
-      if (!line.trim()) continue;
-      const row = JSON.parse(line) as SpoolRow;
-      const decision = resolver.resolve({
-        all: row.keys,
-        bucket: row.bucket,
-        partitionKey: row.partitionKey ?? `n:${row.normalizedName}`,
-        strong: row.strong,
-        normalizedName: row.normalizedName,
-      });
-      let group = groups.get(decision.ref);
-      if (!group) {
-        group = {
-          ref: decision.ref,
-          keys: new Set(row.keys),
-          input: row.company,
-          sources: [],
-          contacts: new Map(),
-          ambiguous: decision.ambiguous,
+    /*
+     * Records are delimited by `\n` ONLY and parsed strictly (see jsonl.ts):
+     * `readline` treated U+2028/U+2029 as terminators, which split a record in
+     * half and produced `JSON Parse error: Unterminated string`. A record that
+     * still cannot be parsed now fails with its partition, line number and byte
+     * offset instead of being skipped.
+     */
+    try {
+      for await (const record of readJsonlFile<SpoolRow>(path, { onChunk: (chunk) => partitionHash.update(chunk) })) {
+        recordsSeen += 1;
+        const row = record.value;
+        const decision = resolver.resolve({
+          all: row.keys,
+          bucket: row.bucket,
+          partitionKey: row.partitionKey ?? `n:${row.normalizedName}`,
           strong: row.strong,
           normalizedName: row.normalizedName,
-        };
-        groups.set(decision.ref, group);
-      }
-      for (const key of row.keys) group.keys.add(key);
-      if (!group.sources.some((ref) => ref.source === row.source.source && ref.row === row.source.row)) {
-        group.sources.push(row.source);
-      }
-      if (row.contact) {
-        const provisional = buildContact({ input: row.contact, company: placeholderCompany(row.bucket, row.company), source: row.source, rowFingerprint: `${row.source.source}:${row.source.row}` });
-        const fingerprint = contactFingerprint(provisional);
-        if (fingerprint && group.contacts.has(fingerprint)) {
-          counters.duplicateRowsResolved += 1;
-        } else {
-          group.contacts.set(fingerprint ?? `r:${row.source.source}:${row.source.row}`, provisional);
+        });
+        let group = groups.get(decision.ref);
+        if (!group) {
+          group = {
+            ref: decision.ref,
+            keys: new Set(row.keys),
+            input: row.company,
+            sources: [],
+            contacts: new Map(),
+            ambiguous: decision.ambiguous,
+            strong: row.strong,
+            normalizedName: row.normalizedName,
+          };
+          groups.set(decision.ref, group);
+        }
+        for (const key of row.keys) group.keys.add(key);
+        if (!group.sources.some((ref) => ref.source === row.source.source && ref.row === row.source.row)) {
+          group.sources.push(row.source);
+        }
+        if (row.contact) {
+          const provisional = buildContact({
+            input: row.contact,
+            company: placeholderCompany(row.bucket, row.company),
+            source: row.source,
+            rowFingerprint: `${row.source.source}:${row.source.row}`,
+          });
+          const fingerprint = contactFingerprint(provisional);
+          if (fingerprint && group.contacts.has(fingerprint)) {
+            counters.duplicateRowsResolved += 1;
+          } else {
+            group.contacts.set(fingerprint ?? `r:${row.source.source}:${row.source.row}`, provisional);
+          }
         }
       }
+    } catch (error) {
+      if (!isJsonlError(error)) throw error;
+      throw new Error(`pass 2 could not merge partition ${entry.partition} (${entry.file}): ${error.message}`);
+    }
+
+    if (recordsSeen !== entry.lines) {
+      throw new Error(
+        `Spool partition ${entry.file} lost or gained records: ${recordsSeen.toLocaleString()} read, ${entry.lines.toLocaleString()} recorded by pass 1.\n` +
+          "  Nothing was deleted; re-run with --no-resume to rebuild the spool from the sources.",
+      );
+    }
+    if (partitionHash.digest("hex") !== entry.sha256) {
+      throw new Error(
+        `Spool partition ${entry.file} does not match the checksum pass 1 recorded. Its contents changed after it was\n` +
+          "  written, so it will not be merged. Nothing was deleted; re-run with --no-resume to rebuild the spool.",
+      );
     }
 
     // Several keys can share one normalized name (e.g. two subsidiaries with
@@ -910,11 +1257,12 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
         rowsRejected: counters.rowsRejected,
         companies: counters.uniqueCompanies,
         contacts: counters.uniqueContacts,
-        progress: fileIndex / spoolFiles.length,
-        message: `pass 2: ${counters.uniqueCompanies.toLocaleString()} companies from ${fileIndex + 1}/${spoolFiles.length} partitions`,
+        progress: fileIndex / spoolEntries.length,
+        message: `pass 2: ${counters.uniqueCompanies.toLocaleString()} companies from ${fileIndex + 1}/${spoolEntries.length} partitions`,
       });
     }
   }
+  const mergeMs = Date.now() - mergeStart;
 
   await flushCompanies();
   await flushContacts();
@@ -923,6 +1271,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
 
   /* -------------------------------- finalize ------------------------------ */
 
+  const finalizeStart = Date.now();
   emit({ stage: "indexing", message: "finalizing index shards" });
   const indexPathIndex = async (kind: ShardKind, shards: number) => {
     for (let shard = 0; shard < shards; shard += 1) {
@@ -935,14 +1284,26 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       // `src/shared/normalize.ts`.
       const terms = Object.create(null) as Record<string, Postings>;
       const lastRef = new Map<string, number>();
-      const lines = createInterface({ input: createReadStream(linesPath), crlfDelay: Infinity });
-      for await (const line of lines) {
-        const first = line.indexOf("\u0001");
-        if (first === -1) continue;
-        const second = line.indexOf("\u0001", first + 1);
-        const term = line.slice(0, first);
-        const ref = Number(line.slice(first + 1, second));
-        const quality = Number(line.slice(second + 1)) || 0;
+      // Read with the same `\n`-only splitter as the spool (see jsonl.ts).
+      // `readline` split on U+2028/U+2029, so a term that contained one produced a
+      // fragment with no `\u0001` in it — and the old `continue` below threw that
+      // posting away silently. It is now a hard error: a shard file that cannot be
+      // parsed means the postings for this shard are incomplete.
+      for await (const line of readJsonlLines(linesPath)) {
+        const first = line.text.indexOf("\u0001");
+        const second = first === -1 ? -1 : line.text.indexOf("\u0001", first + 1);
+        if (first === -1 || second === -1) {
+          throw new Error(
+            `Index shard ${kind}/${String(shard).padStart(4, "0")} has a malformed posting record at line ${line.line} ` +
+              `(byte offset ${line.byteOffset}, file ${line.byteLength === 0 ? "unknown" : "present"}). The shard is incomplete; re-run to rebuild it.`,
+          );
+        }
+        const term = line.text.slice(0, first);
+        const ref = Number(line.text.slice(first + 1, second));
+        const quality = Number(line.text.slice(second + 1)) || 0;
+        if (!Number.isFinite(ref)) {
+          throw new Error(`Index shard ${kind}/${String(shard).padStart(4, "0")} has a non-numeric ref at line ${line.line}; re-run to rebuild it.`);
+        }
         if (lastRef.get(term) === ref) continue; // same company already recorded
         lastRef.set(term, ref);
         const postings = terms[term] ?? { refs: [], q: [] };
@@ -1007,6 +1368,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     fields: { company: ["name", "domain", "industry", "country", "city", "companySize", "revenue"], contact: ["fullName", "title", "email", "phone", "linkedinUrl", "country", "city"] },
   };
   await writer.writeJson(`indexes/${config.datasetVersion}/directory.json`, directory, false);
+  const finalizeMs = Date.now() - finalizeStart;
 
   const elapsedMs = Date.now() - startedAt;
   const manifest: DatasetVersionSummary = {
@@ -1025,6 +1387,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
 
   /* ------------------------------- validation ----------------------------- */
 
+  const validateStart = Date.now();
   emit({ stage: "validating", message: "validating generated objects" });
   const missing: string[] = [];
   for (const object of writer.objects) {
@@ -1039,6 +1402,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     if (sha256 !== object.sha256) missing.push(object.key);
   }
 
+  const validateMs = Date.now() - validateStart;
   const enoughShards = writer.objects.filter((object) => object.key.startsWith("indexes/")).length > 0;
   const bothSources = config.sources.every((source) => (counters.perSource[source.id]?.rowsRead ?? 0) > 0);
   const validation = {
@@ -1068,9 +1432,12 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
 
   manifest.validationPassed = validation.passed;
   await writer.writeJson(`manifests/${config.datasetVersion}/manifest.json`, manifest, false);
+  // Every intermediate JSONL record in this pipeline is written by the same
+  // encoder, including this one: the spool carried the separator bug, and a second
+  // hand-rolled `JSON.stringify` + join is exactly how it would come back.
   await writeFile(
     join(config.outputDir, "objects.jsonl"),
-    writer.objects.map((object) => JSON.stringify(object)).join("\n"),
+    writer.objects.map((object) => encodeJsonlLine(object)).join(""),
     "utf8",
   );
 
@@ -1093,6 +1460,8 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     manifest,
     profiles,
     elapsedMs,
+    stages: { profilingMs, pass1Ms: Math.max(0, pass1Ms), pass2Ms: mergeMs, finalizeMs, validateMs },
+    resumed: Boolean(checkpoint),
     // Reported instead of estimated: the benchmark's Cloudflare cost line and its
     // "R2 request count" both come from here.
     sourceStats: sourceContext.stats,

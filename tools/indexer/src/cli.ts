@@ -21,8 +21,18 @@ import { join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 
 import { ALL_CANONICAL_FIELDS, buildColumnMap } from "./mapping";
-import { preflight, publishVersion, runIndex, uploadOutput, type IndexerConfig, type ProgressEvent } from "./build";
+import {
+  ROWS_PER_SECOND_MEASURED,
+  STORAGE,
+  preflight,
+  publishVersion,
+  runIndex,
+  uploadOutput,
+  type IndexerConfig,
+  type ProgressEvent,
+} from "./build";
 import { credentialsFromEnv } from "./r2";
+import { adoptSpool, inspectSpool, spoolManifestPathFor, type SpoolInspection } from "./spool";
 import { createSourceContext, credentialsHelp, missingCredentialBuckets, parseR2Source, sourceProfile, type SourceContext } from "./source";
 
 function parseArgs(argv: string[]): { command: string; flags: Record<string, string | boolean> } {
@@ -68,6 +78,14 @@ function printPreflight(report: Awaited<ReturnType<typeof preflight>>): void {
   console.log(`  input total          ${gb(report.totalInputBytes)}`);
   console.log(`  free disk            ${gb(report.freeDiskBytes)}`);
   console.log(`  temporary space need ${gb(report.estimatedWorkBytes)}`);
+  // Every term, because "free some space" is useless advice when one term (the
+  // Mode B staging file) dominates and can be removed by a config change.
+  const estimate = report.estimate;
+  console.log(`    spool               ${gb(estimate.spoolBytes)}  (canonical rows written by pass 1)`);
+  console.log(`    raw cache staging   ${gb(estimate.rawCachePeakBytes)}  (largest Mode B .part alive at once)`);
+  console.log(`    index output        ${gb(estimate.outputBytes)}  (written during pass 2, same volume by default)`);
+  console.log(`    run bookkeeping     ${gb(estimate.overheadBytes)}  (checkpoint, spool manifest, rejected/objects lists)`);
+  console.log(`    safety margin       x${estimate.safetyMargin} applied to the four terms above`);
   console.log(`  estimated output     ${gb(report.estimatedOutputBytes)}`);
   console.log(`  memory free / total  ${gb(report.memoryBytes.free)} / ${gb(report.memoryBytes.total)}`);
   console.log(`  cpu cores            ${report.cpuCount}`);
@@ -77,13 +95,17 @@ function printPreflight(report: Awaited<ReturnType<typeof preflight>>): void {
   }
   // A sample run knows its row count; a full run only knows bytes, so the row
   // count is approximated from the average spool row size.
-  const estimatedRows = report.estimatedRows ?? (report.totalInputBytes > 0 ? report.totalInputBytes / 900 : null);
+  const estimatedRows = report.estimatedRows ?? (report.totalInputBytes > 0 ? report.totalInputBytes / STORAGE.averageSourceBytesPerRow : null);
   if (estimatedRows !== null) {
-    const seconds = estimatedRows / ROWS_PER_SECOND_HINT;
+    const seconds = estimatedRows / ROWS_PER_SECOND_MEASURED;
     // Seconds below a minute and a half: `~0 min` reads as "no idea" and hides
     // exactly the sample runs whose whole point is a measurable duration.
     const duration = seconds < 90 ? `~${Math.round(seconds)} s` : `~${(seconds / 60).toFixed(0)} min`;
-    console.log(`  rough duration hint  ${duration} at ${ROWS_PER_SECOND_HINT.toLocaleString()} rows/s (measure with a sample run)`);
+    console.log(
+      `  duration estimate    ${duration} at ${ROWS_PER_SECOND_MEASURED.toLocaleString()} rows/s — the MEASURED end-to-end rate\n` +
+        "                       of the 1 M benchmark (R2 read + parse + spool). The run prints its own per-stage\n" +
+        "                       timings afterwards; use those, not this hint.",
+    );
   }
   console.log("");
 }
@@ -136,8 +158,6 @@ function startResourceSampler(dirs: string[]) {
     },
   };
 }
-
-const ROWS_PER_SECOND_HINT = 120_000;
 
 function progressLogger() {
   let last = 0;
@@ -373,7 +393,22 @@ async function cmdRun(config: IndexerConfig, flags: Record<string, string | bool
   console.log(`  ambiguous kept apart ${result.counters.ambiguousCompanies.toLocaleString()}  (name collisions with conflicting strong evidence)`);
   console.log(`  missing company id   ${result.counters.recordsMissingCompanyId.toLocaleString()}`);
   console.log(`  objects written   ${result.objects.length.toLocaleString()}`);
-  console.log(`  elapsed           ${(result.elapsedMs / 1000).toFixed(1)} s`);
+  console.log(`  elapsed           ${(result.elapsedMs / 1000).toFixed(1)} s${result.resumed ? " (resumed: pass 1 skipped, spool reused)" : ""}`);
+  // Measured, per stage. Pass 1 is one streaming loop (network read + CSV parse +
+  // JSONL serialize + partition write) so its cost is reported as a whole; the
+  // point of the breakdown is that the next duration estimate uses these numbers
+  // instead of a synthetic rows/s figure.
+  const stages = result.stages;
+  const pass1RowsPerSecond = stages.pass1Ms > 0 ? Math.round(result.counters.rowsRead / (stages.pass1Ms / 1000)) : null;
+  console.log(`  stage timings`);
+  console.log(`    profiling       ${(stages.profilingMs / 1000).toFixed(1)} s`);
+  console.log(
+    `    pass 1          ${(stages.pass1Ms / 1000).toFixed(1)} s` +
+      (pass1RowsPerSecond === null ? "  (skipped: resumed)" : `  (${pass1RowsPerSecond.toLocaleString()} rows/s: R2/file read + parse + spool)`),
+  );
+  console.log(`    pass 2 merge    ${(stages.pass2Ms / 1000).toFixed(1)} s`);
+  console.log(`    finalize+index  ${(stages.finalizeMs / 1000).toFixed(1)} s`);
+  console.log(`    validate        ${(stages.validateMs / 1000).toFixed(1)} s`);
   console.log(`  peak memory       ${formatBytes(peaks.peakRssBytes)} RSS`);
   console.log(`  peak temp disk    ${formatBytes(peaks.peakDiskBytes)} (${config.workDir}${config.rawCacheDir ? " + raw cache" : ""})`);
   console.log(`  index output      ${formatBytes(result.outputBytes)} in ${config.outputDir}`);
@@ -404,6 +439,74 @@ async function cmdRun(config: IndexerConfig, flags: Record<string, string | bool
   } else {
     console.log(`\nUpload with:\n  bun tools/indexer/src/cli.ts run --config <cfg> --version ${version} --upload`);
   }
+}
+
+/**
+ * `spool` — read-only inspection of an existing work directory.
+ *
+ * Added in response to a real failure: the benchmark died in pass 2 and the only
+ * way to find out what the spool actually contained was to eyeball multi-gigabyte
+ * partition files by hand. This command answers "is this spool usable, and if not,
+ * exactly where is the damage" while printing positions instead of records, so its
+ * output can be pasted into a report without leaking company or contact data.
+ *
+ * It modifies nothing unless `--repair-manifest` is passed explicitly, and that
+ * only ever writes `spool-manifest.json`, and only when every partition verifies.
+ */
+async function cmdSpool(workDir: string, flags: Record<string, string | boolean>): Promise<void> {
+  const inspection = await inspectSpool(workDir, { checkHashes: Boolean(flags.hashes) });
+  printSpoolInspection(inspection);
+
+  if (flags["repair-manifest"]) {
+    const identity = inspection.checkpoint.identity;
+    if (!inspection.checkpoint.present) throw new Error(`No checkpoint in ${workDir}, so the spool has no provenance to record.`);
+    if (!identity) {
+      throw new Error(
+        `The checkpoint in ${workDir} carries no run identity (it was written by an older build), so the spool cannot\n` +
+          "  be adopted. Re-run the indexer with --no-resume to rebuild it.",
+      );
+    }
+    const manifest = await adoptSpool(workDir, identity, inspection);
+    console.log(`\nRecorded ${spoolManifestPathFor(workDir)}: ${manifest.totals.files} partition(s), ${manifest.totals.lines.toLocaleString()} rows.`);
+    console.log("Nothing else was modified. Re-run the same command to merge it (pass 1 will be skipped).");
+    process.exitCode = 0;
+    return;
+  }
+
+  process.exitCode = inspection.verdict === "clean" ? 0 : 1;
+}
+
+function printSpoolInspection(inspection: SpoolInspection): void {
+  const gb = (bytes: number) => `${(bytes / 1e9).toFixed(2)} GB`;
+  console.log(`\nSpool inspection (read-only) — ${inspection.workDir}`);
+  console.log(`  verdict              ${inspection.verdict}`);
+  console.log(`  partition files      ${inspection.totals.files}`);
+  console.log(`  spool size           ${gb(inspection.totals.bytes)}`);
+  console.log(`  records              ${inspection.totals.records.toLocaleString()} (${inspection.totals.parsed.toLocaleString()} parsed)`);
+  console.log(`  checkpoint           ${inspection.checkpoint.present ? `${inspection.checkpoint.stage}${inspection.checkpoint.hasIdentity ? "" : " (no run identity)"}` : "absent"}`);
+  console.log(`  spool manifest       ${inspection.manifest ? (inspection.manifest.complete && inspection.manifest.matches ? `complete (${inspection.manifest.files} files)` : "present but not matching") : "absent"}`);
+  console.log("  per-partition detail (file, records, bytes, checksum, first problem):");
+  const shown = inspection.partitions.slice(0, 40);
+  for (const entry of shown) {
+    const problem = entry.problems[0];
+    const detail = problem
+      ? `problem at line ${problem.line}, byte offset ${problem.byteOffset.toLocaleString()} (${problem.kind}${problem.reason ? `: ${problem.reason}` : ""})`
+      : entry.terminated
+        ? "ok"
+        : "last record not terminated";
+    console.log(
+      `    ${entry.file}  n=${entry.partition ?? "?"}  records=${entry.records}  bytes=${entry.bytes}  sha256=${entry.sha256?.slice(0, 12) ?? "-"}  ${detail}`,
+    );
+  }
+  if (inspection.partitions.length > shown.length) console.log(`    … ${inspection.partitions.length - shown.length} more partition file(s)`);
+  if (inspection.findings.length) {
+    console.log("  findings");
+    for (const finding of inspection.findings.slice(0, 40)) console.log(`    - ${finding}`);
+    if (inspection.findings.length > 40) console.log(`    … ${inspection.findings.length - 40} more finding(s)`);
+  } else {
+    console.log("  findings             none — the spool is complete and matches its manifest");
+  }
+  console.log("\nNo record content is included in this report, and nothing was modified.");
 }
 
 async function cmdValidate(config: IndexerConfig, flags: Record<string, string | boolean>): Promise<void> {
@@ -476,6 +579,8 @@ function usage(): void {
 
   profile    Inspect both CSV files: headers, fill rates, mapping suggestions
   run        Stream, resolve, index, validate and optionally upload
+  spool      Read-only: inspect an existing spool/checkpoint after a failed run
+             (positions only — never record content; modifies nothing)
   validate   Re-check the generated objects against their checksums
   publish    Flip the active-version pointer to a validated version
 
@@ -493,6 +598,11 @@ Flags
                       (nothing is read in bulk, built or uploaded)
   --no-resume         ignore the checkpoint and rebuild from the sources; clears
                       the stale spool in workDir
+  --repair-manifest   spool: record spool-manifest.json for an EXISTING spool whose
+                      partitions all verify (the recovery path for a failed run
+                      from a build that did not write a manifest)
+  --work-dir <path>   spool: inspect this directory instead of the config's workDir
+  --hashes            spool: also re-verify every partition checksum (re-reads it)
   --upload            upload generated objects to R2
   --yes               confirm a publish operation
 
@@ -504,6 +614,26 @@ Example (Windows PowerShell)
 
 async function main(): Promise<void> {
   const { command, flags } = parseArgs(process.argv.slice(2));
+  /*
+   * `spool` is the one command that must work on a machine where the sources are
+   * unreachable or the config has been edited since the failure — it inspects what
+   * is on local disk. It therefore needs no config (the workDir from the config is
+   * used when one is given) and never touches R2.
+   */
+  if (command === "spool") {
+    // `spool --help` must not fall through to inspecting the default workDir.
+    if (flags.help && !flags["work-dir"] && !flags.config) {
+      usage();
+      return;
+    }
+    const workDir = flags["work-dir"]
+      ? resolve(String(flags["work-dir"]))
+      : flags.config
+        ? (await loadConfig(String(flags.config))).workDir
+        : resolve(".indexer-work");
+    await cmdSpool(workDir, flags);
+    return;
+  }
   if (command === "help" || !flags.config) {
     usage();
     return;

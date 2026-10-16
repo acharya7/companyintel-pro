@@ -95,7 +95,7 @@ bun tools/indexer/src/cli.ts publish   --config tools/indexer/indexer.config.jso
 | Resource | Requirement | Basis |
 | --- | --- | --- |
 | RAM | 16 GB comfortable, 8 GB workable | Bounded one-partition-at-a-time design; measured 1.25 s / 102 MB heap to build a 50,000-company index in-process. Less RAM costs speed, not correctness |
-| Free disk | **≥ 120 GB** recommended (≈ 180 GB if you also keep the Mode B cache) | Spool ≈ 1.1× input plus 256 MB (≈ 66 GB at 60 GB input) + output ≈ 12 GB (estimate) + Mode B `rawCacheDir` ≈ 60 GB. `workDir` must be on the fastest disk; set `"rawCacheDir": null` to drop the cache (a re-run then re-downloads) |
+| Free disk | **182 GB** (spool 71.06 + Mode B staging 54.04 + index 20.30 + bookkeeping 0.27, ×1.25) — **93.6 GB** with `"rawCacheDir": null` | `bun run index:profile` preflight against the real bucket. The staging file and the generated index are alive at the same time as the spool. `workDir` must be on the fastest disk; `"rawCacheDir": null` removes the largest single term and costs a re-download on resume |
 | Cores | 4+ | One run saturates ~1 core for CSV parsing plus I/O; never run two full jobs at once |
 | Network | Steady upload | Upload is per-object with retry and skips objects already in R2, so a dropped connection costs time, not a restart |
 
@@ -109,10 +109,17 @@ Formula (replace with your measurements):
 total ≈ (rows ÷ measured_rows_per_second) × pass_factor + upload_time
 ```
 
-- Rough hint from preflight: ~120,000 rows/s → ~54 min for a 60 GB parse, assuming ~110 M rows.
-- _Awaiting Phase A:_ real row counts, real bytes, real rows/s from the 1 M sample run.
-- Realistic planning range for the full job including pass 2, hashing, and upload:
-  **2–6 hours**, dominated by JSON spooling and R2 PUTs.
+- **Measured, first real benchmark (1 M sample per source):** pass 1 processed 1,986,239 rows at
+  **≈5,015 rows/s** end to end (R2 ranged GET + TSV parse + JSON serialization + partition writes),
+  and the run's own `stage timings` block is where that number comes from.
+- The preflight hint now uses exactly that rate, so for the full corpus (≈101.5 M rows at the
+  measured 633 B/row) it prints **≈5.6 hours of pass 1** — not the ~54 minutes a 120,000 rows/s
+  synthetic figure suggested.
+- **Pass 2 is not free and must be added:** a 20,200-row local stress run measured 18.6 s in
+  `pass2-merge` on this 1-vCPU sandbox (shard postings + gzip). Scale it from the 1 M benchmark's
+  own `pass 2 merge` figure rather than from this line.
+- Upload duration ≈ (object count ÷ practical PUT concurrency) + retries; object count is in the
+  low thousands, so this is minutes, not hours, at normal bandwidth.
 - Upload duration ≈ (object count ÷ practical PUT concurrency) + retries; object count is in the
   low thousands, so this is minutes, not hours, at normal bandwidth.
 
@@ -137,10 +144,15 @@ Full detail and the pricing sources: `docs/cost.md`.
 
 - `partitions: 256` (keep it — it sets the working set and the number of spool files).
 - `workDir: .indexer-work` on the fastest local disk; `checkpoint.json` records the completed
-  stage *and the run identity* (version, sample limit, partitions, sources), so an interrupted run
-  resumes instead of restarting. `--no-resume` forces a clean start (and clears the stale spool).
-  Give the 1 M benchmark its own `workDir` if you want to keep the full run's spool around — a
-  checkpoint for a different run is refused rather than merged.
+  stage *and the run identity* (version, sample limit, partitions, sources) and
+  `spool-manifest.json` records every partition pass 1 finished (bytes, records, SHA-256), so an
+  interrupted run resumes instead of restarting **and** a partition that was never completed cannot
+  be merged as if it had been. `--no-resume` forces a clean start (clearing the stale spool and its
+  manifest). Give the 1 M benchmark its own `workDir` if you want to keep the full run's spool
+  around — a checkpoint for a different run is refused rather than merged.
+- After any failed run, `bun run index:spool-doctor` reports the state of the spool (read-only,
+  positions only) and `--repair-manifest` adopts an intact spool so pass 1 does not have to run
+  again; see `docs/recovery.md`.
 - Rejected rows are never dropped: inspect `workDir/rejected.jsonl` (`{source, line, reason}`).
 - Upload is idempotent (existing objects are skipped), so `run --upload` can be repeated safely.
 - Publish is a single pointer write. **Keep one previous version** in R2 — the pointer now records

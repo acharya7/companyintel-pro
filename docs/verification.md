@@ -7,7 +7,7 @@ names the command or test that produced it.
 Run everything below yourself with (all commands are read-only unless marked otherwise):
 
 ```bash
-bun run check                          # 4 typechecks + the suite (299 tests, 1,271 assertions)
+bun run check                          # 4 typechecks + the suite (337 tests, 1,451 assertions)
 bun run r2:doctor                      # credentials file, endpoint, one signed LIST of raw/
 bun run r2:schema                      # both REAL files: encoding, delimiter, columns, mapping
 bun run verify:r2                      # inventory, sizes, ETags, bounded body read, dataset state
@@ -480,6 +480,55 @@ Recovery snapshots (`backups/app-data/<date>/…`) preserve the pre-mutation sta
 shard is documented in `docs/recovery.md`. No second database was introduced: lead shards remain
 authoritative objects in R2, and the directory is explicitly derived data.
 
+## Real-data benchmark failure and fix (executed)
+
+This is the first defect in this project that was found by **running against the real corpus**
+rather than by executing a test, and it is recorded here in full because a typecheck could never
+have found it.
+
+### What was executed
+
+```
+bun run index:benchmark-1m        # --sample 1000000 --version v1-bench-1m, real R2 objects
+  preflight        PASSED
+  pass 1           1,986,239 records (csv1 986,239 + csv2 1,000,000), ~5,015 rows/s,
+                   checkpoint written (stage=pass2-merge)
+  peak temp disk   2.49 GB (measured before the failure)
+  pass 2           FAILED after 3,869 companies from 1/256 partitions:
+                   JSON Parse error: Unterminated string      (exit 1)
+```
+
+### Root cause (reproduced, not inferred)
+
+A spool row whose value contains **U+2028 (LINE SEPARATOR)** or **U+2029 (PARAGRAPH SEPARATOR)** was
+written by `JSON.stringify`, which leaves both characters literal, and read back by
+`node:readline`, which treats both as line terminators. One record became two "lines" and
+`JSON.parse` threw `Unterminated string`. Both characters are common in scraped company exports
+(they are the in-cell line break) and neither had ever appeared in a fixture.
+
+Reproduced end to end with the real indexer on a two-row CSV before the fix (same error string), and
+locked in by `tests/indexer.test.ts` → "the pass-2 merge survives the separators real data contains".
+
+### Fix and verification
+
+| Item | Result |
+| --- | --- |
+| `encodeJsonlLine` / `readJsonlFile` (new `tools/indexer/src/jsonl.ts`) | records carrying U+2028/U+2029 round-trip; a legacy spool written by the old build still reads as one record; `\n` is the only delimiter |
+| Damaged intermediate files | truncated final record, malformed record and oversized record each fail with file, line number, byte offset, record length and file size — and with **no record content** in the message (`tests/jsonl.test.ts`, 17 tests) |
+| Spool completeness | `workDir/spool-manifest.json` (bytes + record count + SHA-256 per partition, renamed into place after every stream flushed); pass 2 verifies and refuses truncation, record-count mismatch or checksum mismatch (`tests/indexer.test.ts`) |
+| Read-only diagnosis | `bun run index:spool-doctor` reports every partition with positions only; verified read-only (file names, sizes and mtimes unchanged) and name/email-free by `tests/spool-doctor-script.test.ts` (4 tests) |
+| Disks estimate | 1.87 GB → **5.31 GB** for the 1 M sample (measured peak was 2.49 GB) and 70.96 GB → **182.09 GB** for the full corpus; every term is printed. `bun run index:benchmark-1m:preflight` re-executed against the real bucket to produce the figures in `docs/indexing.md` |
+| Duration | 120,000 rows/s (synthetic) → **5,000 rows/s measured end to end**; the run now prints per-stage timings |
+| Synthetic stress run (executed) | 20,200 rows, CRLF input, a comma- and newline-containing quoted field, U+2028/U+2029 in names/industries/titles, one 200 KB field, and 200 duplicated rows: **20,200/20,200 spool records, 0 unparseable, 0 literal separators, longest record 200,463 B, 20,000 companies, 20,000 contacts, validation passed**; resume reproduced identical counts |
+
+### What was NOT run
+
+- The 1 M benchmark itself was **not re-run** (it needs ~5.3 GB free; this sandbox has 0.63 GB). The
+  preflight over the real bucket was re-run and is the evidence for the estimates above.
+- Full indexing, any upload, any publish, and any Cloudflare change: none attempted.
+- The recovered spool from the failed run is untouched, and `index:spool-doctor` is the supported way
+  to decide whether to reuse it.
+
 ## Final delivery matrix
 
 | Requirement | Implemented | Test evidence | Remaining risk | Manual action required |
@@ -492,8 +541,8 @@ authoritative objects in R2, and the directory is explicitly derived data.
 | B. Streaming, multiline, dual-schema parsing | Yes | `tests/e2e-index.test.ts`, `tests/csv.test.ts` | None known | — |
 | B. Disk-backed grouping, identity resolution, dedupe, cross-file association | Yes | `tests/e2e-index.test.ts` (multiline record = 1, dup contact once, Microsoft merged from both files, same-name/different-domain kept apart) | Real data may expose new ambiguity | Review ambiguous-count in the manifest after the sample runs |
 | B. Exact/prefix/token/trigram indexes, bounded gzip shards | Yes | `tests/e2e-index.test.ts` (magic bytes, size bound, object count), `tests/r2-client.test.ts` (gzip metadata) | Object sizes grow with corpus | Confirm bytes/company from the 1 M sample |
-| B. Checkpoint/resume, upload retries, checksums, atomic publish + rollback | Yes — the checkpoint now records the **run identity** (version, sample limit, partitions, source paths/delimiters/overrides) and refuses to resume a spool from a different run; `--no-resume` clears the stale spool and rebuilds | `tests/indexer.test.ts` (different-run refusal, stale-spool clearing, counters restored on resume), `tests/r2-client.test.ts` (retry counts), `tests/e2e-index.test.ts` | Very long runs still need a real interruption drill | Optionally kill and resume one sample run to see it work |
-| Quality gates (typecheck ×4, tests, lint, build, both bundles, indexer CLI) | **Yes — executed with exit codes recorded**: `bun run check` 0 (5/5 PASS), `bun run lint` 0 (0 problems), `bun run build` 0, `wrangler deploy --dry-run` 0 for the Worker (737 KiB) and the probe (39 KiB), indexer `--help`/`--preflight-only` as documented | `bun run check` (304 tests, 1296 assertions), `tests/search-funnel.test.ts`, `tests/frontend-secrets.test.ts` | Bundle validation is `--dry-run` only; nothing was deployed | Deploy to the preview environment after the Access app exists |
+| B. Checkpoint/resume, upload retries, checksums, atomic publish + rollback | Yes — the checkpoint records the **run identity** (version, sample limit, partitions, source paths/delimiters/overrides) and `workDir/spool-manifest.json` records **every partition pass 1 finished** (bytes, records, SHA-256). Resuming a spool from a different run, a spool with no manifest, or a truncated/checksum-mismatched partition is refused; `--no-resume` clears the stale spool and manifest and rebuilds | `tests/indexer.test.ts` (manifest contents, different-run refusal, missing-manifest refusal, truncated-partition refusal, `adoptSpool` recovery, stale-spool clearing, counters restored on resume), `tests/spool-doctor-script.test.ts`, `tests/indexer-r2-source.test.ts` (cache/resume), `tests/r2-client.test.ts` (retry counts), `tests/e2e-index.test.ts` | A real multi-hour run has still not been interrupted on purpose | Interrupt one sample run and resume it |
+| Quality gates (typecheck ×4, tests, lint, build, both bundles, indexer CLI) | **Yes — executed with exit codes recorded**: `bun run check` 0 (5/5 PASS), `bun run lint` 0 (0 problems), `bun run build` 0, `wrangler deploy --dry-run` 0 for the Worker and the probe, indexer `--help`/`--preflight-only` as documented, `bun run index:spool-doctor` exit 0/1/2 as documented | `bun run check` (**337 tests, 1,451 assertions**, up from 304/1,296), `tests/jsonl.test.ts`, `tests/spool-doctor-script.test.ts`, `tests/search-funnel.test.ts`, `tests/frontend-secrets.test.ts` | Bundle validation is `--dry-run` only; nothing was deployed | Deploy to the preview environment after the Access app exists |
 | C. Worker API routes on a real handler | Yes (Bun runtime) | `tests/api-e2e.test.ts` (19) | Not workerd; no browser | Run the 12-step browser checklist after deployment |
 | C. Browser rendering, all screens, loading/empty/error states | **BLOCKED here** | — | Real rendering unverified | Follow the Phase C checklist in this document |
 | D. Access protection of frontend + API | Yes | `tests/security-access.test.ts` (20) incl. fail-closed in production and no `Cf-Access-*` header spoofing | Exact production config unverified | Create the Access app, set the 3 secrets, confirm `curl` → 401 |
@@ -514,6 +563,7 @@ authoritative objects in R2, and the directory is explicitly derived data.
 | --- | --- | --- |
 | Real CSV schemas differ from the fixture | Resolved: both real files are TAB-separated, and their headers/columns are now measured and mapped | `bun run r2:schema` + per-source `columns` overrides; the mapping is committed in `indexer.config.json` |
 | Two files do not share a strong identifier | Confirmed by measurement: the id namespaces differ, so the cross-file link is the normalized company name | Name-only rows merge only with name-only records; a strong-identity conflict keeps records apart **and** flags them; on the sample this affected 1.17% of contacts, all flagged |
-| Full-run resource exhaustion | Only a real sample run can measure it | Preflight refuses to start on insufficient temporary space; checkpoint/resume |
+| Full-run resource exhaustion | Only a real sample run can measure it | Preflight now counts the spool, the Mode B staging file, the generated index and bookkeeping (71.06 + 54.04 + 20.30 + 0.27 GB, ×1.25 = **182.09 GB**; ~93.6 GB with `rawCacheDir: null`) and refuses to start below it; a mid-run floor stops a filling volume; checkpoint/resume + spool manifest |
+| Real data contains characters that are line terminators to a reader | Found once already (U+2028/U+2029), which is why the intermediate format now escapes them **and** the reader splits on `\n` only | Both halves of the fix are independently tested, including reading a legacy file written by the buggy build |
 | Workers Free CPU ceiling | Needs production measurement | Documented; decision deferred to you |
 | R2 eventually consistent writes | Two tabs, different objects | ETag preconditions + repair path |
