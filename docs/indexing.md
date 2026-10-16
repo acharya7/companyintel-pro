@@ -121,7 +121,16 @@ bun tools/indexer/src/cli.ts profile --config tools/indexer/indexer.config.json
 # 3. Sample runs (mandatory before the full job)
 bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json --sample 10000    --version v1-sample-10k
 bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json --sample 100000   --version v1-sample-100k
-bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json --sample 1000000  --version v1-sample-1m
+
+# 3b. The one-million-record readiness benchmark — PREPARED, NOT RUN AUTOMATICALLY.
+#     Nothing in this repository runs it for you: it downloads up to ~2 M records
+#     from R2 (bounded ranged GETs), spools ~1.8 GB in workDir and writes ~0.5 GB
+#     of index, so run it only where that space and time are available (~20 min at
+#     the measured parse rates, one core busy). Preflight refuses to start if the
+#     volume cannot hold it.
+bun run index:benchmark-1m
+# same thing, explicit:
+# bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json --sample 1000000 --version v1-bench-1m
 
 # 4. Full job, upload only after it validates (needs R2_* env vars)
 bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json --version v1 --upload
@@ -182,12 +191,36 @@ and transfer rates in the cost table above are the numbers to plan with).
 4. **STOP — approval gate.** Send me the measured numbers and ask for approval before the
    full 60 GB job (this is the "sample-first" requirement of the specification).
 5. Full run with `--version v1 --upload`, then `validate`, then `publish`.
+
+`index:benchmark-1m` exists so step 3 can be done with a real number instead of
+an extrapolation. Record from its output: elapsed seconds, peak RSS, `objects
+written`, the total size of `outputDir`, and rows/s per source; then re-check the
+cost table above and this workspace's estimates. It is deliberately a manual
+command — a benchmark that runs itself on a developer machine (or in CI) would
+download gigabytes without being asked to.
 6. Verify in the app: `/dataset` shows the new active version, `/companies` returns results.
 
 No paid service is enabled by any of these steps. Nothing is published until a version passes
 validation.
 
 ## Resource guidance
+
+### Disk budget, added up
+
+Do the arithmetic before starting a 60 GB job — the two caches are separate:
+
+| Component | Size | Notes |
+| --- | --- | --- |
+| spool (`workDir`) | ~71 GB (measured preflight) | mandatory: pass 2 cannot run without it |
+| raw cache (`rawCacheDir`) | ~64 GB if enabled | only needed for resume without re-downloading |
+| generated index (`outputDir`) | ~10–20 GB (scaled from the measured sample; smaller objects add a little overhead) | written during pass 2 |
+| **both caches enabled** | **~145–155 GB** | 64 + 71 + output, on one volume by default |
+| **`rawCacheDir: null`** | **~81–91 GB** | streams straight through; a re-run downloads again |
+
+So a machine with a single 128 GB volume should either put `rawCacheDir` on a second disk or set
+it to `null` and accept re-downloading on resume. `outputDir` is written *during* pass 2, so its
+size must be free at the same time as the spool. The mid-run floor (512 MB) stops a run before the
+volume fills, but it does not create space: an under-sized machine fails at hour two either way.
 
 - Keep `workDir` on the fastest disk with room for ~1.5× the input size in spool files.
 - 16 GB RAM is comfortable; the design is disk-partitioned so less RAM only costs speed.
@@ -208,5 +241,7 @@ validation.
 | Columns mapped to the wrong canonical field | Add a `columns` override for that source (`{"companyname": "Org Name"}`). |
 | High rejected-row count | Check the encoding/delimiter for that file; inspect `workDir/rejected.jsonl` reasons. |
 | `Refusing to start: temporary space is insufficient` | Free space on the `workDir` volume, or lower `partitions`. |
+| `Stopping before the disk fills: … below the … floor` | The mid-run guard (512 MB free on `outputDir`). Nothing written was lost and the checkpoint is still at `pass2-merge`: free space and re-run the same command to resume. |
+| A resumed run reports `source_missing_rows` (csv1=0, csv2=0) | Fixed: pass-1 counters are restored from the checkpoint, so a resumed run no longer fails validation over its own bookkeeping. If you see it on an older build, re-run with `--no-resume` once. |
 | `R2 credentials are not set` on publish | Export `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` for the session. |
 | Version uploaded but the app still shows the old data | `publish` was not run (or failed) — `manifests/active.json` still points at the previous version. |

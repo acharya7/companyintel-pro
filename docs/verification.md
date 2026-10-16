@@ -7,13 +7,13 @@ names the command or test that produced it.
 Run everything below yourself with (all commands are read-only unless marked otherwise):
 
 ```bash
-bun run check                          # 4 typechecks + the suite (255 tests, 1,141 assertions)
+bun run check                          # 4 typechecks + the suite (299 tests, 1,271 assertions)
 bun run r2:doctor                      # credentials file, endpoint, one signed LIST of raw/
 bun run r2:schema                      # both REAL files: encoding, delimiter, columns, mapping
 bun run verify:r2                      # inventory, sizes, ETags, bounded body read, dataset state
 bun run verify:r2:remote               # same ground truth through the Worker binding (no keys)
 bun run index:profile                  # preflight over the real objects + per-file mapping
-bun scripts/benchmark-r2-path.mjs --output-dir .indexer-output --version v1-dry4-20k
+bun scripts/benchmark-r2-path.mjs --output-dir .indexer-output --version v1-dry5-250
 bun scripts/benchmark-search.mjs       # engine + labelled relevance
 ```
 
@@ -219,7 +219,7 @@ given invented domains.
 
 ```
 bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json \
-    --sample 20000 --version v1-dry4-20k
+    --sample 20000 --version v1-dry5-250
 ```
 
 | Counter | Value |
@@ -230,8 +230,11 @@ bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json \
 | contacts contributed per file | csv1 0 (organizations carry no people) · csv2 19,414 |
 | duplicate rows resolved | 2 |
 | validation | passed (`validation.json`, `state: validated`) |
-| wall clock | 118 s for 1,826 gzipped objects (10.4 MB) |
+| wall clock | 102 s for 1,899 gzipped objects |
 | published / uploaded | **no** — local `.indexer-output` only |
+
+The last run above was also a **resume** (pass 1 skipped from `workDir/checkpoint.json`), which is
+what verified the counter-restore fix described below.
 
 The run also proved two crash-level defects that only appear on real data — both fixed and covered
 by `tests/prototype-safety.test.ts`: a company whose name contains the token `constructor` made the
@@ -356,10 +359,11 @@ Measured here through the real Worker read path (`R2Store` + `R2CandidateSource`
 engine, gzipped objects loaded exactly as the bucket stores them). Figures are from one run on a
 1-vCPU sandbox and vary by roughly 2× between runs; treat them as an order of magnitude.
 
-**Against the real-data sample index** (`.indexer-output`, `v1-dry4-20k`: 1,828 objects, 10.0 MB,
-20,265 companies, 19,414 contacts):
+**Pre-optimization baseline against the real-data sample index** (`.indexer-output`,
+`v1-dry4-20k`: 1,828 objects, 10.0 MB, 20,265 companies, 19,414 contacts):
 
-```
+```bash
+# this version predates INDEX_FORMAT_VERSION 2 and is no longer readable by the current reader
 bun scripts/benchmark-r2-path.mjs --output-dir .indexer-output --version v1-dry4-20k
 ```
 
@@ -373,13 +377,42 @@ bun scripts/benchmark-r2-path.mjs --output-dir .indexer-output --version v1-dry4
 | multi-token "international business machines" | 121.7 ms | 182.2 ms | 30 | 2.07 MB | 400 |
 | no result "zzzzzzqqqqq" | 19.6 ms | 26.3 ms | 11 | 0.41 MB | 2 |
 
-Read that honestly: on **real** data the object count per query stays bounded (11–30 objects,
-independent of corpus size, because the shard skeleton is fixed), but per-query CPU is ~0.1–0.24 s
-in Bun and each query pulls ~1–2 MB of decompressed index. That is well outside a Workers Free
-10 ms CPU budget: the Free plan is not viable for this workload without a further reduction in
-candidates/hydration size, and a Paid plan (or an in-Worker LRU + the browser-side IndexedDB cache
-doing most of the work) is the realistic target. Candidate limit and bytes-per-query are the two
-levers, and both are configuration-level changes that need your decision, not a silent tweak.
+That table is the **pre-optimization baseline** (indices with 2,000 companies per object and
+unbounded hydration of up to 400 candidates) and it is kept here on purpose: it is what justified
+the change. It reads honestly: the object count per query stayed bounded (11–30), but each query
+pulled ~1–2 MB and spent ~0.1–0.24 s of Bun CPU, which is outside any 10 ms budget.
+
+**After the hydration bound** (250 companies per object, a 16-partition per-search ceiling and the
+confident-page early stop — see `docs/architecture.md`), same machine, same 20 K sample, one fresh
+source per query:
+
+| Query | median | p95 | R2 GETs | bytes read | candidates scored |
+| --- | --- | --- | --- | --- | --- |
+| exact "Microsoft Corporation" | 25.3 ms | 28.3 ms | 32 | 478 KB | 23 |
+| alias/legal suffix "Infosys Ltd" | 23.2 ms | 25.5 ms | 32 | 478 KB | 24 |
+| short prefix "micro" | 16.1 ms | 16.7 ms | 24 | 431 KB | 20 |
+| typo "Microsft" | 23.5 ms | 24.4 ms | 27 | 442 KB | 24 |
+| transposition "Mircosoft" | 18.8 ms | 19.0 ms | 28 | 457 KB | 20 |
+| multi-token "international business machines" | 21.4 ms | 22.1 ms | 35 | 512 KB | 21 |
+| no result "zzzzzzqqqqq" | 2.9 ms | 3.6 ms | 11 | 77 KB | 2 |
+
+Bytes per query dropped ~4.5×, scored candidates ~400 → ~20, and worst-case latency ~6×, with the
+read count rising slightly (smaller objects are what buy the byte reduction; Class B reads are the
+cheap side of that trade at $0.36/million). The byte cost is now bounded by constants —
+`SEARCH_MAX_HYDRATE × partition size` ≈ 400 KB — instead of growing with the collection, because
+the partition size is fixed while the number of partitions is not.
+
+What is still **not** proven: workerd CPU. ~20 ms here is Bun on one sandbox vCPU including
+decompression and scoring; V8 on Cloudflare with a warm isolate can be several times faster, but a
+Free-plan 10 ms budget cannot be claimed either way without measuring on a deployment. The recall
+trade-off of the ceiling is documented with numbers in `docs/architecture.md`; `SEARCH_MAX_HYDRATE`
+and the browser-side IndexedDB cache are the dials if a deployment measures too high — and both
+are configuration-level changes that need your decision, not a silent tweak.
+
+> **Index format note.** The partition-size change is a format change (`INDEX_FORMAT_VERSION 2`).
+> Any index built before it (including the earlier `v1-dry4-20k` sample) cannot be read by the
+> current Worker path and must be rebuilt before it is uploaded or published; the old objects can
+> stay in the bucket until the new version is validated.
 
 The smaller fixture run (41 objects, 7 companies) is kept for comparison; it is unrepresentative of
 real object sizes and shows sub-millisecond timings.
@@ -461,8 +494,8 @@ authoritative objects in R2, and the directory is explicitly derived data.
 | D. JWT signature/iss/aud/exp validation | Yes | `tests/security-access.test.ts` (real RS256 keys, tampered/expired/nbf/alg-none rejected) | JWKS rotation handled by cache TTL | — |
 | D. No workers.dev bypass, no preview exposure, private bucket, no cached private data | Yes — `workers_dev = false` is now set in `wrangler.toml` (only `env.development` keeps it true), and the Worker fails closed on any hostname because it verifies the Access JWT itself | `tests/api-e2e.test.ts` (CORS 403, `no-store` on private responses, security headers), `tests/security-access.test.ts` (20), `tests/frontend-secrets.test.ts` | Removing the alias hostname means the Worker needs your custom-domain `[routes]` entry to be reachable | Add the route, confirm Access covers it, then deploy (steps 1–10 of the Phase D list) |
 | D. No credentials in the frontend bundle | Source-level yes; bundle scan skipped (no `dist` built here) | `tests/frontend-secrets.test.ts` (4 of 5 assertions real; bundle scan reports skipped) | Bundle scan runs only after a build | Build once locally and re-run that test file |
-| E. Median/p95 latency, R2 requests, bytes | Yes — measured against the **real-data** sample index (0.02–0.24 s, 11–30 GETs, ≤ 2.07 MB per query) | `scripts/benchmark-r2-path.mjs --output-dir .indexer-output --version v1-dry4-20k`, `scripts/benchmark-search.mjs` | Sandbox variance ~2×; corpus is a sample | Re-run both on your machine, optionally `--companies 200000` |
-| E. CPU time, memory, cache hit rates, real index size | **Partly** — local CPU/bytes measured; workerd CPU and browser cache hits are not measurable without a deployment | Phase E tables | The real numbers are ~2 MB and 0.1–0.24 s per query here, i.e. a Free-plan 10 ms CPU budget is not realistic | Decide Free vs Paid and/or a caching/candidate-budget change before deploying |
+| E. Median/p95 latency, R2 requests, bytes | Yes — re-measured against the **real-data** sample index after the hydration bound: 16–25 ms, 24–35 GETs, 0.43–0.51 MB per cold query (was 0.10–0.24 s, 19–30 GETs, ≤ 2.07 MB) | `scripts/benchmark-r2-path.mjs --output-dir .indexer-output --version v1-dry5-250`, `scripts/benchmark-search.mjs` | Sandbox variance ~2×; corpus is a 20 K sample; reads are local, not networked | Re-run both on your machine, then re-measure with the 1 M sample |
+| E. CPU time, memory, cache hit rates, real index size | **Partly** — local CPU/bytes measured; workerd CPU and browser cache hits are not measurable without a deployment | Phase E tables | After the hydration bound a cold query reads ~0.45 MB and scores ~20 docs (was ~2 MB and 400), but the local figure is still ~20 ms on one sandbox vCPU — a Free-plan 10 ms CPU budget is **not proven** either way without workerd measurement | Decide Free vs Paid from `wrangler tail` CPU on a real deployment; `SEARCH_MAX_HYDRATE` tunes the trade-off |
 | F. Lead-loss scenarios identified and recovered | Yes | `tests/leads-recovery.test.ts` (7), `tests/worker-store.test.ts` (6), `tests/api-e2e.test.ts` (repair route) | R2 has no cross-object transaction | Use `POST /api/leads/repair` if the app ever reports a mismatch |
 | F. No new database introduced | Yes — R2 objects only, directory is derived data | `tests/leads-recovery.test.ts` | — | — |
 | G. Full execution plan with sources, mappings, resources, costs, validation | Drafted with explicit placeholders | `docs/execution-plan.md` | Real numbers unknown until sample runs | Approve after sending the Phase A outputs + sample timings |

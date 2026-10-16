@@ -42,8 +42,38 @@ export interface CandidateSource {
   tokens(tokens: string[], budget: number): Promise<DocRef[]>;
   /** Docs sharing trigrams — the fuzzy workhorse. */
   trigrams(grams: string[], budget: number): Promise<DocRef[]>;
-  /** Hydrate candidate metadata. Called once, for the budgeted set only. */
-  docs(refs: DocRef[]): Promise<SearchDoc[]>;
+  /**
+   * Hydrate candidate metadata. Called once per hydration batch (see
+   * `HYDRATE_BATCH`), in candidate order.
+   *
+   * `maxPartitions` is the byte bound for the whole search (see
+   * `SearchOptions.maxHydrate`); a source that reads whole profile partitions
+   * spends it across every batch it is called with, and one that reads records
+   * individually can ignore it.
+   */
+  docs(refs: DocRef[], options?: { maxPartitions?: number }): Promise<SearchDoc[]>;
+  /**
+   * Retrieval strength of one candidate, when the source can tell.
+   *
+   * "strong" — the candidate matched a whole-name signal (exact index, alias or
+   *            prefix), so it can score up to 1.0;
+   * "weak"   — it matched token/trigram evidence only, so it can never exceed
+   *            `WEAK_CEILING` (see score.ts). That bound is what lets the engine
+   *            skip the fuzzy tail of a query that already has confident hits.
+   *
+   * A source that cannot tell leaves this undefined; the engine then hydrates
+   * the whole candidate budget, exactly as it always did.
+   */
+  tierOf?(ref: DocRef): "strong" | "weak";
+  /**
+   * Optional notification that a new search is starting on this source.
+   *
+   * A source may be reused for several searches (tests do, and an isolate could);
+   * retrieval evidence and hydration memos belong to one search, so a source
+   * that keeps them must reset them here. Called once per `searchCompanies`,
+   * before the first retrieval stage.
+   */
+  beginSearch?(): void;
   /** Optional df stats so rare trigrams/tokens are queried first. */
   stats?(): Promise<{ docCount: number; df: Record<string, number> }>;
 }
@@ -59,10 +89,43 @@ export interface SearchOptions {
   resultBudget?: number;
   /** Max candidates retrieved per retrieval stage. */
   retrievalBudget?: number;
+  /**
+   * Byte bound on hydration, in profile partitions read per search.
+   *
+   * Whole partitions are what an R2 read fetches, so this is the single number
+   * that caps a query's transfer and decompression cost regardless of how many
+   * candidates retrieval produced. Raising it buys deeper pages for broad fuzzy
+   * queries and costs bytes; lowering it is safe for name lookups, whose
+   * candidates cluster tightly. Operators can tune it with the
+   * `SEARCH_MAX_HYDRATE` Worker variable; the engine clamps it either way.
+   */
+  maxHydrate?: number;
 }
 
 /** Relevance values inside the same band are treated as equal for ordering. */
 export const RELEVANCE_BAND = 0.05;
+
+/**
+ * Candidate docs hydrated per call to `CandidateSource.docs`.
+ *
+ * Batches (rather than one 400-candidate hydration) are what make the early
+ * stop below possible: a query whose page is already full of confident hits
+ * never pays for the fuzzy tail of its candidate list.
+ */
+export const HYDRATE_BATCH = 32;
+
+/**
+ * Highest relevance a token/trigram-only ("weak") candidate can reach.
+ *
+ * `fuzzyScore` tops out at 0.95 (full token coverage) and `wholeScore` at 0.9
+ * (perfect trigram/edit similarity); the generic-word penalty only lowers them
+ * (see score.ts). Alias equality (0.95) and exact equality (1.0) are whole-name
+ * signals, so those candidates are retrieved from the exact index and are
+ * "strong" — which makes this a valid ceiling, not an estimate. The barrier
+ * compares strictly above it, so a weak candidate can never tie a displayed hit
+ * inside the same relevance band and reorder the page.
+ */
+export const WEAK_CEILING = 0.95;
 
 /** Hard ceilings — also enforced server-side in the Worker. */
 export const SEARCH_LIMITS = {
@@ -73,6 +136,9 @@ export const SEARCH_LIMITS = {
   defaultRetrievalBudget: 3000,
   maxTrigrams: 14,
   maxPrefixQueries: 6,
+  /** Ceiling for `SearchOptions.maxHydrate` (partitions read per search). */
+  maxHydrate: 64,
+  defaultHydrate: 16,
 } as const;
 
 function clamp(value: number, min: number, max: number): number {
@@ -147,6 +213,7 @@ export async function searchCompanies(
   const fuzzy = options.fuzzy ?? true;
   const resultBudget = clamp(Math.floor(options.resultBudget ?? SEARCH_LIMITS.defaultResultBudget), 1, SEARCH_LIMITS.maxResultBudget);
   const retrievalBudget = clamp(Math.floor(options.retrievalBudget ?? SEARCH_LIMITS.defaultRetrievalBudget), 1, resultBudget * 4);
+  const maxHydrate = clamp(Math.floor(options.maxHydrate ?? SEARCH_LIMITS.defaultHydrate), 1, SEARCH_LIMITS.maxHydrate);
 
   const { query, normalizedQuery, variants, queryTokens, grams } = prepareQuery(rawQuery);
   const retrieval = { exact: 0, prefix: 0, token: 0, trigram: 0, scored: 0, cached: false };
@@ -181,6 +248,8 @@ export async function searchCompanies(
     }
   };
 
+  source.beginSearch?.();
+
   const exactRefs = await source.exact(variants, retrievalBudget);
   retrieval.exact = exactRefs.length;
   add(exactRefs);
@@ -213,23 +282,25 @@ export async function searchCompanies(
 
   /* ---------------------------- Stage 2: ranking --------------------------- */
 
-  const docs = await source.docs(budgetedRefs);
-  retrieval.scored = docs.length;
-
   const minScore = minScoreFor(normalizedQuery.length);
   // Computed once and reused for every candidate (see score.ts).
   const queryTrigrams = trigramSet(normalizedQuery);
   const scored: { doc: SearchDoc; hit: Omit<CompanySearchHit, "id" | "name"> & { id: string; name: string } }[] = [];
+  /** Lowest relevance accepted so far — drives the early-stop barrier. */
+  let worstRelevance = Infinity;
+  let hydrated = 0;
+  let stoppedEarly = false;
 
-  for (const doc of docs) {
-    if (!matchesFilters(doc, options.filters)) continue;
+  const accept = (doc: SearchDoc) => {
+    if (!matchesFilters(doc, options.filters)) return;
     const result = scoreDoc(doc, { query, normalizedQuery, queryTokens, variants, fuzzy, queryTrigrams });
-    if (!result) continue;
+    if (!result) return;
     // Short queries must not be answered with loose fuzzy noise.
     if (normalizedQuery.length < 3 && !(result.category === "exact" || result.category === "alias" || result.category === "prefix")) {
-      continue;
+      return;
     }
-    if (result.score < minScore) continue;
+    if (result.score < minScore) return;
+    if (result.score < worstRelevance) worstRelevance = result.score;
     scored.push({
       doc,
       hit: {
@@ -244,7 +315,45 @@ export async function searchCompanies(
         multiSource: doc.multiSource ?? false,
       },
     });
+  };
+
+  // Candidates arrive best-first, grouped by retrieval strength. Hydrate one
+  // run of candidates per tier so the barrier below can be tested on a whole
+  // tier instead of a mixed batch.
+  // `start` (below) is the first row of the requested page; one extra row is
+  // needed to know whether another page exists.
+  const rowsToFillPage = (page - 1) * pageSize + pageSize + 1;
+  const pageFull = () => scored.length >= rowsToFillPage;
+  let cursor = 0;
+  while (cursor < budgetedRefs.length) {
+    const tier = source.tierOf ? source.tierOf(budgetedRefs[cursor]) : "strong";
+    let end = cursor + 1;
+    if (source.tierOf) {
+      while (end < budgetedRefs.length && source.tierOf(budgetedRefs[end]) === tier) end += 1;
+      // A source without tier knowledge keeps the original single-pass contract.
+    } else {
+      end = budgetedRefs.length;
+    }
+
+    // Early stop: every hit found so far scores strictly above what a
+    // token/trigram-only candidate can reach, and the page is already full — so
+    // the rest of the candidate list can neither reorder this page nor add a
+    // row to it. The result count then becomes a lower bound (`totalIsLowerBound`),
+    // which the API and the UI already report as "N+".
+    if (tier === "weak" && pageFull() && worstRelevance > WEAK_CEILING) {
+      stoppedEarly = true;
+      break;
+    }
+
+    for (let from = cursor; from < end; from += HYDRATE_BATCH) {
+      const batch = budgetedRefs.slice(from, Math.min(end, from + HYDRATE_BATCH));
+      const docs = await source.docs(batch, { maxPartitions: maxHydrate });
+      hydrated += docs.length;
+      for (const doc of docs) accept(doc);
+    }
+    cursor = end;
   }
+  retrieval.scored = hydrated;
 
   scored.sort((a, b) => {
     if (sort === "relevance") {
@@ -302,7 +411,10 @@ export async function searchCompanies(
     page,
     pageSize,
     total,
-    totalIsLowerBound: candidates.size >= retrievalBudget,
+    // Two reasons the count is a floor rather than an exact number: retrieval
+    // itself was budget-bounded, or the early-stop barrier skipped candidates
+    // that provably cannot enter this page.
+    totalIsLowerBound: candidates.size >= retrievalBudget || stoppedEarly,
     hasMore: start + pageSize < total,
   };
 

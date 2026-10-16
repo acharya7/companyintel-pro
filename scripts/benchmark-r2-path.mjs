@@ -95,7 +95,13 @@ if (!directory) {
   process.exit();
 }
 
-const source = new R2CandidateSource(store, directory);
+/**
+ * A fresh candidate source per query — exactly what the Worker does, because
+ * `requireDataset` builds one per request. The source memoises hydrated profile
+ * objects *for its own search*; reusing one instance across iterations would
+ * report warm numbers and hide the cold-query cost this script exists to measure.
+ */
+const source = () => new R2CandidateSource(store, directory);
 const options = { pageSize: 25, resultBudget: 400, retrievalBudget: 3000 };
 
 /* -------------------------------- queries -------------------------------- */
@@ -117,7 +123,7 @@ function percentile(sorted, p) {
 
 // Warm-up: the directory and first shards are read on the first call, exactly as
 // an isolate warms up in production.
-for (const [, query] of QUERIES) await searchCompanies(source, query, options);
+for (const [, query] of QUERIES) await searchCompanies(source(), query, options);
 
 const rows = [];
 for (const [label, query] of QUERIES) {
@@ -129,7 +135,7 @@ for (const [label, query] of QUERIES) {
   for (let i = 0; i < repeat; i += 1) {
     bucket.resetCounters();
     const started = performance.now();
-    const response = await searchCompanies(source, query, options);
+    const response = await searchCompanies(source(), query, options);
     times.push(performance.now() - started);
     gets = Math.max(gets, bucket.counters.gets);
     // Reads are cached by the isolate, so report the *cold* byte volume too.

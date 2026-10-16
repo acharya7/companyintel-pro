@@ -78,15 +78,68 @@ Two stages, both bounded (`src/shared/search/engine.ts`):
 **Stage 1 — candidate retrieval.** Normalize the query → exact index (all variants: primary,
 legal-suffix-stripped, abbreviation-expanded, compact) → prefix index → token inverted index
 → character trigram index (rare grams first when df stats are available) → dedupe → strict
-candidate budget (`defaultResultBudget = 800`, `defaultRetrievalBudget = 3000`). Queries under
+candidate budget (`defaultResultBudget = 400`, `defaultRetrievalBudget = 3000`). Queries under
 3 characters use the prefix index instead of trigrams.
 
 **Stage 2 — ranking** (`score.ts`): exact equality, alias equivalence, prefix similarity,
 token overlap (with idf weighting), trigram Jaccard, bounded edit distance, word-order
 tolerance and abbreviation compatibility, with penalties for generic-only matches
 ("international", "solutions", "services") and a query-length-aware minimum score.
-Candidates are then filtered, sorted, and paginated. Only the budgeted candidate set is
-hydrated from R2 (≤ `SHARDING.maxHydrate = 24` partition objects).
+Candidates are then filtered, sorted, and paginated.
+
+Hydration is the expensive half, because a profile object is read **whole**: its cost is
+`partitions read × partition bytes`, not "one candidate". Three bounds keep a cold query
+inside a fixed budget regardless of how many candidates retrieval produced:
+
+1. **Partition size.** `SHARDING.companiesPerPartition = 250`, so one profile object is
+   ~25 KB (26.8 KB measured on the 20 K real-data sample: 2.2 MB / 82 objects). The same number
+   must hold for a 20 K-company sample and for a 4.7 M-company production index, and only the
+   partition size controls that.
+2. **Per-search partition ceiling.** `SHARDING.maxHydrate` (default 16, ceiling 64,
+   operator-tunable with the `SEARCH_MAX_HYDRATE` Worker variable, per-request override in
+   `SearchOptions.maxHydrate`). Partitions are taken in candidate order, never re-read, and
+the budget is spent across the engine's hydration batches — so a search reads at most
+   `16 × ~25 KB ≈ 400 KB` of profile data however dispersed its candidates are.
+3. **Early-stop barrier.** Once the requested page is full of hits that score strictly above
+   `WEAK_CEILING = 0.95` — the highest relevance a token/trigram-only candidate can reach —
+   the rest of the candidate list can neither reorder nor extend that page, so its tiers are
+   never fetched. The count then becomes a floor, which the API already reports as `N+`
+   (`page.totalIsLowerBound`).
+
+`retrieval.scored` reports the documents actually hydrated, so the number in the search
+sidebar is the real work done, not the candidate budget.
+
+### Measured query cost
+
+On the sample index built from the real `raw/file1.csv` + `raw/file2.csv` (20,265 companies,
+19,414 contacts), with one fresh candidate source per query — exactly what the Worker does —
+`bun scripts/benchmark-r2-path.mjs --output-dir .indexer-output --version <version>`:
+
+| query class | before: 2000 companies/object, unbounded hydration | after: 250 companies/object, 16-partition ceiling |
+| --- | --- | --- |
+| exact ("Microsoft Corporation") | 27 reads · 2.04 MB · 152 ms | 32 reads · 478 KB · 25 ms |
+| alias ("Infosys Ltd") | 27 reads · 2.04 MB · 150 ms | 32 reads · 478 KB · 21 ms |
+| prefix ("micro") | 19 reads · 1.99 MB · 102 ms | 24 reads · 431 KB · 16 ms |
+| typo ("Microsft") | 22 reads · 2.01 MB · 110 ms | 27 reads · 442 KB · 23 ms |
+| transposition ("Mircosoft") | 21 reads · 2.0 MB · 108 ms | 28 reads · 457 KB · 19 ms |
+| multi-token | 30 reads · 2.1 MB · 130 ms | 35 reads · 512 KB · 21 ms |
+| no result | 9 reads · 0.03 MB · 3 ms | 11 reads · 77 KB · 3 ms |
+
+All figures are **local** (Bun, one vCPU): latency is CPU + decompression, not network to
+Cloudflare, and the byte column is the cold-query volume the fake bucket served. Latency is
+dominated by `JSON.parse` + gzip inflate + scoring, so the ~4× byte reduction is the number
+that matters for the Worker CPU budget; the read count rises slightly because small objects
+are what buy the byte reduction.
+
+**The trade-off, stated plainly:** the 16-partition ceiling can return fewer rows than
+hydrating all 400 candidates, for broad low-precision queries whose matches are spread over
+more partitions than the budget covers (measured: 68 rows across 14 query classes at 16
+partitions, 19 at 32, 4 at 64; the rows that *are* returned keep their order and score).
+Under-filled pages are reported as `N+`, never as a fake total. Raising `SEARCH_MAX_HYDRATE`
+buys those rows back at proportionally more bytes; the recall-correct fix is a layout whose
+candidates cluster (refs ordered by normalized name), which was measured and **did not** pay
+off on this data — the 400-candidate sets still spanned 20–50 of 82 partitions — so the
+partition ceiling stays the honest knob until a 1 M-record run can be measured.
 
 Match categories returned to the UI: `exact`, `alias`, `prefix`, `fuzzy`, `possible`. The UI
 shows *"Showing similar results for …"* for corrected queries and *"Possible match"* for
@@ -110,9 +163,16 @@ Every search object is immutable and version-addressed, so browser and edge cach
 it as immutable for a year. Rollback = re-point `manifests/active.json`.
 
 Shard counts (512 exact / 256 prefix / 256 token / 512 trigram / 256 ids) are recorded in
-`directory.json`, so the reader never guesses and the object count stays in the low
-thousands for ~10M companies — no million-object buckets, no single giant object, no listing
-per query.
+`directory.json`, so the reader never guesses and no query ever lists the bucket.
+
+Object counts are a deliberate trade-off, not an accident: at 250 companies and 1000
+companies-with-contacts per object, the measured full-input estimate (4.7 M organizations,
+96.8 M people) lands at roughly 19 K company objects plus ~97 K contact objects — about
+116 K objects, ~11–20 GB gzipped (scaled from the measured sample; see docs/cost.md). Small
+profile objects are what bound the byte cost of a
+search and of a company detail page (~25 KB); the price is more objects to upload and a
+slightly larger per-query read count (R2 charges ~$0.36 per million Class B reads, so reads
+are the cheap side of that trade).
 
 The only LIST operation in the whole application is the bounded `raw/` listing on the Dataset
 Management page (`GET /api/dataset/sources`, at most 25 objects, requested only when that page

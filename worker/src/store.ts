@@ -196,8 +196,15 @@ export class R2Store {
    * Profile objects are grouped by `companiesPerPartition`, so refs that fall in
    * the same partition cost one read. `maxParts` bounds the worst case for a
    * dispersed fuzzy result set.
+   *
+   * Partitions are taken in **first-seen order**, i.e. in the order the caller
+   * ranked the refs, so a bounded hydration always spends its budget on the
+   * best candidates instead of on whichever partition happens to hold the most
+   * of them. Refs whose partition falls outside `maxParts` are simply absent
+   * from the result map — the caller treats that as "not hydrated", never as an
+   * error.
    */
-  async getCompaniesByRefs(version: string, refs: number[], maxParts = SHARDING.maxHydrate): Promise<Map<number, Company>> {
+  async getCompaniesByRefs(version: string, refs: number[], maxParts: number = SHARDING.maxHydrate): Promise<Map<number, Company>> {
     const grouped = new Map<number, number[]>();
     for (const ref of refs) {
       const partition = partitionOfRef(ref);
@@ -205,7 +212,11 @@ export class R2Store {
       if (list) list.push(ref);
       else grouped.set(partition, [ref]);
     }
-    const ordered = [...grouped.entries()].sort((a, b) => b[1].length - a[1].length).slice(0, maxParts);
+    const ordered: [number, number[]][] = [];
+    for (const entry of grouped) {
+      if (ordered.length >= maxParts) break;
+      ordered.push(entry);
+    }
     const out = new Map<number, Company>();
     await mapLimit(ordered, 8, async ([partition, partitionRefs]) => {
       const payload = await this.getJson<CompanyPartitionPayload>(companyPartitionKey(version, partition));

@@ -19,6 +19,7 @@
     "verify:r2:remote": "bun scripts/verify-r2-remote.mjs",
     "index:profile": "bun tools/indexer/src/cli.ts profile --config tools/indexer/indexer.config.json",
     "index:sample": "bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json --sample 100000 --version v1-sample-100k",
+    "index:benchmark-1m": "bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json --sample 1000000 --version v1-bench-1m",
     "index:run": "bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json --version v1",
     "index:upload": "bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json --version v1 --upload",
     "index:sample-report": "bun scripts/sample-report.mjs",

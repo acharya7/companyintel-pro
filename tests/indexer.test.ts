@@ -372,6 +372,32 @@ describe("end-to-end indexing pipeline", () => {
     expect(again.manifest.validationPassed).toBe(true);
   });
 
+  test("a resumed run keeps the pass-1 counters and still validates", async () => {
+    const workDir = join(dir, "work-resume");
+    const first = await runIndex({ ...config, workDir, outputDir: join(dir, "out-resume") }, {});
+    expect(first.manifest.validationPassed).toBe(true);
+
+    // Same workDir ⇒ the checkpoint says pass 1 is done, so pass 1 is skipped and
+    // the row counters must be restored from the checkpoint. They used to restart
+    // at zero, which made every resumed run report `source_missing_rows`
+    // ("csv1=0, csv2=0") and fail validation over its own bookkeeping.
+    const resumed = await runIndex({ ...config, workDir, outputDir: join(dir, "out-resume-2") }, {});
+    expect(resumed.manifest.validationPassed).toBe(true);
+    expect(resumed.counters.rowsRead).toBe(first.counters.rowsRead);
+    expect(resumed.counters.perSource.csv1.rowsRead).toBe(3);
+    expect(resumed.counters.perSource.csv2.rowsRead).toBe(2);
+    expect(resumed.counters.uniqueCompanies).toBe(first.counters.uniqueCompanies);
+    expect(resumed.counters.uniqueContacts).toBe(first.counters.uniqueContacts);
+  });
+
+  test("a run stops cleanly when free space drops below its floor", async () => {
+    // An impossible floor (more than any machine has) proves the guard runs and the
+    // error is the actionable one, rather than a crash after the disk filled.
+    await expect(
+      runIndex({ ...config, workDir: join(dir, "work-floor"), outputDir: join(dir, "out-floor") }, { diskFloorBytes: Number.MAX_SAFE_INTEGER }),
+    ).rejects.toThrow(/Stopping before the disk fills/);
+  });
+
   test("search reads a bounded number of shards", () => {
     expect(shardReads.length).toBeGreaterThan(0);
     expect(shardReads.length).toBeLessThan(120);

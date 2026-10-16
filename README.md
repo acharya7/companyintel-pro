@@ -66,8 +66,9 @@ decisions (both files are **TAB separated**: `raw/file1.csv` = 10.22 GB of organ
 ```bash
 bun run index:profile                 # preflight over the real objects + mapping + estimates
 # Sample runs first (the limit applies per source, so both schemas are represented)
-bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json --sample 20000   --version v1-dry4-20k
-bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json --sample 1000000 --version v1-sample-1m
+bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json --sample 20000   --version v1-dry5-250
+# The 1 M-record readiness benchmark: prepared, NOT run automatically (see docs/indexing.md)
+bun run index:benchmark-1m
 # Full run + upload, then activate (each step is documented in docs/indexing.md)
 bun run index:upload
 bun run index:validate

@@ -44,7 +44,7 @@ import {
   type ShardPayload,
 } from "../../../src/shared/search/index-format";
 import { contactId as contactIdFor, shardOf } from "../../../src/shared/hash";
-import { readCsvFile, profileCsvFile, type FileProfile } from "./csv";
+import type { FileProfile } from "./csv";
 import {
   ALL_CANONICAL_FIELDS,
   CompanyResolver,
@@ -62,7 +62,7 @@ import {
   type RawContactInput,
   type RawCompanyInput,
 } from "./mapping";
-import { credentialsFromEnv, fileSize, R2Client } from "./r2";
+import { credentialsFromEnv, R2Client } from "./r2";
 import { createSourceContext, sourceBytes, sourceProfile, sourceRecords, type SourceContext } from "./source";
 
 export interface SourceConfig {
@@ -130,6 +130,17 @@ export interface PreflightReport {
 
 const BYTES_PER_SPOOL_ROW = 900;
 const ROWS_PER_SECOND_BASELINE = 120_000;
+
+/**
+ * Free space the run refuses to go below on the output volume.
+ *
+ * The preflight check catches "this machine cannot hold the job at all"; this is
+ * the guard for the case that actually bites on a multi-hour run — the volume
+ * filling up *while* it runs (a second process, a snapshot, a smaller disk than
+ * the estimate assumed). Stopping cleanly leaves the checkpoint at
+ * `pass2-merge`, so re-running the same command resumes instead of starting over.
+ */
+const DISK_FLOOR_BYTES = 512 * 1024 * 1024;
 
 /** Source context (Mode A local files / Mode B R2 objects) for one config. */
 function sourceContextFor(config: IndexerConfig): SourceContext {
@@ -333,6 +344,8 @@ export interface RunOptions {
   onProgress?: (event: ProgressEvent) => void;
   /** Resume from the checkpoint when present (default true). */
   resume?: boolean;
+  /** Free-space floor on the output volume; the run stops cleanly below it. */
+  diskFloorBytes?: number;
 }
 
 export interface RunResult {
@@ -385,6 +398,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   const spoolDir = join(workDir, "spool");
   const shardDir = join(workDir, "shards");
   const checkpointPath = join(workDir, "checkpoint.json");
+  const diskFloorBytes = options.diskFloorBytes ?? DISK_FLOOR_BYTES;
   const resume = options.resume !== false;
   const checkpoint = resume && existsSync(checkpointPath) ? JSON.parse(await readFile(checkpointPath, "utf8")) : null;
 
@@ -443,6 +457,30 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   };
   for (const source of config.sources) {
     counters.perSource[source.id] = { rowsRead: 0, rowsRejected: 0, companies: 0, contacts: 0 };
+  }
+
+  // A resumed run skips pass 1, so its row/rejection counters would restart at
+  // zero and the final validation would report `source_missing_rows` for a
+  // perfectly good index ("csv1=0, csv2=0"). The checkpoint carries the
+  // counters measured before the interruption; restore them so resume keeps the
+  // real numbers instead of failing validation over its own bookkeeping.
+  const resumed = Boolean(checkpoint && checkpoint.stage !== "preflight" && checkpoint.counters);
+  if (resumed) {
+    // Only pass-1-owned counters are restored; everything pass 2 derives
+    // (unique companies/contacts, duplicates, ambiguity, per-source
+    // contribution) is recomputed by the resumed merge and would otherwise be
+    // counted twice.
+    const saved = checkpoint.counters as Partial<IndexingCounters>;
+    for (const key of ["rowsRead", "rowsRejected", "recordsMissingCompanyId"] as const) {
+      if (typeof saved[key] === "number") counters[key] = saved[key] as number;
+    }
+    for (const [id, value] of Object.entries(saved.perSource ?? {})) {
+      if (!value) continue;
+      const target = counters.perSource[id] ?? { rowsRead: 0, rowsRejected: 0, companies: 0, contacts: 0 };
+      target.rowsRead = value.rowsRead ?? 0;
+      target.rowsRejected = value.rowsRejected ?? 0;
+      counters.perSource[id] = target;
+    }
   }
 
   const rejectedPath = join(workDir, "rejected.jsonl");
@@ -734,6 +772,19 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       counters.uniqueCompanies += 1;
       const ownerSource = company.sources[0]?.source ?? config.sources[0].id;
       if (counters.perSource[ownerSource]) counters.perSource[ownerSource].companies += 1;
+    }
+
+    // Mid-run disk guard: checked every 16 partitions (cheap, and far more often
+    // than the volume can actually fill). A clean stop keeps everything already
+    // written; the checkpoint still says `pass2-merge`, so the next run resumes.
+    if (fileIndex % 16 === 0) {
+      const free = await freeDiskBytesFor(config.outputDir);
+      if (free !== null && free < diskFloorBytes) {
+        throw new Error(
+          `Stopping before the disk fills: ${(free / 1e9).toFixed(2)} GB free on ${config.outputDir} is below the ${(diskFloorBytes / 1e9).toFixed(2)} GB floor. ` +
+            "Nothing already written was lost and the checkpoint is at pass2-merge — free space (or lower `partitions`) and run the same command again to resume.",
+        );
+      }
     }
 
     if (fileIndex % 16 === 0) {

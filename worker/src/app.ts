@@ -442,6 +442,10 @@ app.get("/api/companies/search", async (c) => {
     filters: companyFiltersSchema.optional().parse(extractFilters(query)),
   });
   const dataset = await datasetFor(c);
+  // `SEARCH_MAX_HYDRATE` is the operator's recall/CPU dial: profile partitions
+  // read per search. Unset or unparseable falls through to the engine default
+  // (16), which the engine clamps to its own ceiling.
+  const configuredHydrate = Number(c.env.SEARCH_MAX_HYDRATE);
   const response = await searchCompanies(dataset.source, parsed.q, {
     page: parsed.page,
     pageSize: parsed.pageSize,
@@ -450,6 +454,7 @@ app.get("/api/companies/search", async (c) => {
     fuzzy: parsed.fuzzy,
     resultBudget: parsed.resultBudget,
     filters: parsed.filters,
+    maxHydrate: Number.isFinite(configuredHydrate) && configuredHydrate > 0 ? configuredHydrate : undefined,
   });
   return c.json({ ...response, hits: enrichHits(response.hits, dataset.source) });
 });

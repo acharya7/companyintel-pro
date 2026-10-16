@@ -22,7 +22,7 @@ sample indexing run. No paid service is enabled by this document.
 | Object class | Estimate | Monthly |
 | --- | --- | --- |
 | `raw/` originals (given) | 60 GB | $0.90 |
-| `indexes/` + `companies/` + `contacts/` | 8–20 GB for ~10M companies (measure it: `tools/indexer` prints output size) | $0.12–$0.30 |
+| `indexes/` + `companies/` + `contacts/` | 9–20 GB for ~10M companies (measure it: `tools/indexer` prints output size) | $0.12–$0.30 |
 | `app-data/` + `backups/` | < 0.1 GB | ≈ $0 |
 | **Total** | | **≈ $1.00–$1.20** |
 
@@ -37,21 +37,23 @@ Per search the Worker reads a bounded set of small objects:
 + up to 6 prefix shards
 + up to 10 token shards
 + up to 14 trigram shards
-+ up to 24 company/contact partitions to hydrate the budgeted candidates
-= worst case ≈ 30 shard objects + hydrated partitions per fuzzy query
++ up to SEARCH_MAX_HYDRATE (default 16) company profile partitions
+= measured 24–35 objects, ≈ 0.4–0.5 MB per cold fuzzy query
 ```
 
-Exact and short queries typically read 2–4 objects (the branch on `directory.json` is cached in
-the isolate), and the four cache layers absorb repeats, so realistic figures are far below the
-worst case.
+The hydration line is the one that used to dominate: it is now a ceiling rather than a
+consequence of how many candidates retrieval produced (see docs/architecture.md for the
+before/after measurements). Exact and short queries read fewer still — a query whose page
+fills from confident hits stops before the fuzzy tail — and the four cache layers absorb
+repeats, so realistic figures are far below these cold numbers.
 
-| Usage | Searches/month | R2 Class B (at ~20 reads/search) | Class B cost (10M free) |
+| Usage | Searches/month | R2 Class B (at ~30 reads/search) | Class B cost (10M free) |
 | --- | --- | --- | --- |
-| 100 searches/day | 3,000 | 60,000 | $0 |
-| 300 searches/day | 9,000 | 180,000 | $0 |
-| 1,000 searches/day | 30,000 | 600,000 | $0 |
+| 100 searches/day | 3,000 | 90,000 | $0 |
+| 300 searches/day | 9,000 | 270,000 | $0 |
+| 1,000 searches/day | 30,000 | 900,000 | $0 |
 
-Even the worst case (30 read objects per search, 1,000 searches/day) is ~900,000 Class B
+Even the worst case (35 read objects per search, 1,000 searches/day) is ~1.05 M Class B
 operations/month — still inside the 10M free allowance. **Class A** operations are dominated by
 the initial index upload (a few thousand PUTs, once per version) and occasional lead writes;
 30,000 lead writes/month would still be under the 1M free allowance.
@@ -99,6 +101,27 @@ Interpretation:
   been activated, and none is required to finish development.**
 - Re-measure in production with `wrangler tail` (CPU time per request) before deciding; the
   sandbox timings are a proxy, not a production measurement.
+
+### If the Paid plan turns out to be the practical choice
+
+Workers Paid is **$5/month and includes 10 M requests plus 30 M CPU-milliseconds**, with overage
+at $0.30 per additional million requests and $0.02 per additional million CPU-ms
+([Cloudflare Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/)).
+Against this workload that is not the binding number:
+
+| Scenario | Requests/month | CPU-ms/month at ~20 ms/query | Paid cost |
+| --- | --- | --- | --- |
+| 100 searches/day | 0.003 M | 0.06 M (0.2% of allowance) | **$5.00** |
+| 1,000 searches/day | 0.03 M | 0.6 M (2% of allowance) | **$5.00** |
+| 30,000 searches/day | 0.9 M | 18 M (60% of allowance) | **$5.00** |
+
+So the realistic paid cost is the $5 minimum itself — CPU overage would only start somewhere
+around 45,000–50,000 searches/day at the measured ~20 ms, and even then at $0.02 per million
+CPU-ms. The reason to choose Paid is the **10 ms per-invocation ceiling**, not the bill: the
+Free plan fails hard (`1102`) when a request exceeds it, and the measured cold-query cost after
+the hydration bound (~20 ms in Bun on a sandbox vCPU, ~0.45 MB read, ~20 candidates scored) is
+close enough to that line that only a `wrangler tail` measurement on real hardware can settle
+it. Drop `SEARCH_MAX_HYDRATE` to 8 if a deployment measures too high.
 
 ## Total monthly estimate
 

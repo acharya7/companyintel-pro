@@ -14,6 +14,7 @@
  *   ALLOWED_EMAILS        comma separated single-user allowlist (secret)
  *   DEV_ALLOW_UNAUTHENTICATED  "true" only for local `wrangler dev`
  *   MAX_SEARCHES_PER_MINUTE    per-identity rate limit (default 60)
+ *   SEARCH_MAX_HYDRATE         profile partitions read per search (default 16)
  */
 export interface Env {
   COMPANY_DATA: R2Bucket;
@@ -25,6 +26,7 @@ export interface Env {
   ALLOWED_EMAILS?: string;
   DEV_ALLOW_UNAUTHENTICATED?: string;
   MAX_SEARCHES_PER_MINUTE?: string;
+  SEARCH_MAX_HYDRATE?: string;
 }
 
 export interface AccessIdentity {

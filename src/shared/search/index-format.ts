@@ -23,7 +23,7 @@
  *     can treat them as immutable.
  */
 
-export const INDEX_FORMAT_VERSION = 1;
+export const INDEX_FORMAT_VERSION = 2;
 
 export const R2_PREFIX = {
   raw: "raw/",
@@ -45,8 +45,24 @@ export const R2_PREFIX = {
  * records (~300 B each, gzip ≈ 20%) and are the only objects a company detail
  * page has to read.
  *
+ * Why `companiesPerPartition` is small (250, not 2000):
+ *
+ * A search hydrates candidate companies by *partition*, so its byte cost is
+ * `partitionsTouched × partitionBytes`, and a partition is read whole. With 2000
+ * companies per object every hydrated candidate dragged ~2000 unneeded
+ * neighbours into memory — measured on the real-data sample as 1.96 MB and 11
+ * reads for a page of 25 (docs/architecture.md). At 250 companies per object a
+ * partition is ~25 KB (26.8 KB measured on the 20 K real-data sample), so the hard
+ * ceiling for one search is `maxHydrate × partitionBytes` ≈ 400 KB — and it no
+ * longer grows with the
+ * collection size, because the partition size is fixed while the number of
+ * partitions is not. The price is more objects (4.7 M organizations → ~18.8 K
+ * company objects) and a few more reads per query, which R2 charges ~$0.36 per
+ * million of and can serve concurrently.
+ *
  * Query cost model (see docs/architecture.md for the measured numbers):
- *   exact/alias search → 1 exact shard + 1 prefix shard
+ *   exact/alias search → 1 exact shard + 1 prefix shard + the candidate profile
+ *                        partitions of confident matches only
  *   fuzzy search       → 1 exact (miss) + up to 6 prefix + up to 10 token +
  *                        up to 14 trigram shards, then ≤ maxHydrate profile parts
  */
@@ -57,12 +73,15 @@ export const SHARDING = {
   trigramShards: 512,
   /** companyId → document ref lookup (company detail pages). */
   idShards: 256,
-  /** Companies per company/profile object. */
-  companiesPerPartition: 2000,
+  /** Companies per company/profile object (see the sizing note above). */
+  companiesPerPartition: 250,
   /** Companies per contact object (contacts are grouped by company). */
   companiesPerContactPartition: 1000,
-  /** Upper bound on profile objects fetched to hydrate one search. */
-  maxHydrate: 24,
+  /**
+   * Hard ceiling on profile objects fetched to hydrate one search, counted
+   * across every hydration batch of that search. Bounds bytes AND reads.
+   */
+  maxHydrate: 16,
   /** Upper bound on candidate docs sent to the scorer for one search. */
   maxScored: 400,
   /** Prefixes longer than this are truncated to this length before lookup. */

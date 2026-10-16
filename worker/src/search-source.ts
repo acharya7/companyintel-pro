@@ -13,8 +13,9 @@
  *   3. every candidate accumulates a *cheap* score during retrieval using the
  *      prominence byte stored in the postings — exact > alias/prefix > token >
  *      trigram — so hydration sorts by that instead of fetching everything;
- *   4. hydration is capped at `SHARDING.maxScored` docs and `SHARDING.maxHydrate`
- *      profile objects.
+ *   4. hydration reads at most `SHARDING.maxHydrate` profile objects for the
+ *      whole search, chosen in candidate order and memoised across the engine's
+ *      hydration batches, and never re-reads a partition.
  */
 
 import type { Company } from "../../src/shared/models";
@@ -28,12 +29,13 @@ import type { Company } from "../../src/shared/models";
  */
 export interface ShardReader {
   getShard(version: string, kind: IndexKind, shard: number): Promise<ShardPayload | null>;
+  /** Partitions are taken in first-seen (candidate) order, up to `maxParts`. */
   getCompaniesByRefs(version: string, refs: number[], maxParts?: number): Promise<Map<number, Company>>;
 }
 import type { CandidateSource, DocRef } from "../../src/shared/search/engine";
 import type { SearchDoc } from "../../src/shared/search/score";
 import { toSearchDoc } from "../../src/shared/search/local-index";
-import { SHARDING, postingsFor, type IndexDirectory, type IndexKind, type ShardPayload } from "../../src/shared/search/index-format";
+import { SHARDING, partitionOfRef, postingsFor, type IndexDirectory, type IndexKind, type ShardPayload } from "../../src/shared/search/index-format";
 import { shardOf } from "../../src/shared/hash";
 import { R2Store, mapLimit } from "./store";
 
@@ -56,6 +58,17 @@ export class R2CandidateSource implements CandidateSource {
   private readonly observedDf: Record<string, number> = Object.create(null) as Record<string, number>;
   /** Companies hydrated during the last search, keyed by id (for enrichment). */
   private readonly byId = new Map<string, Company>();
+  /** Docs already hydrated during this search, keyed by ref (memo across batches). */
+  private readonly hydratedDocs = new Map<DocRef, SearchDoc>();
+  /**
+   * Profile partitions already read during this search.
+   *
+   * This is the hard byte bound of a query: hydration stops adding partitions
+   * once `SHARDING.maxHydrate` of them have been read, so one search can never
+   * fetch more than `maxHydrate × partitionBytes` no matter how dispersed its
+   * candidate set is (the engine may ask for up to 400 candidates in batches).
+   */
+  private readonly hydratedPartitions = new Set<number>();
 
   constructor(
     private readonly store: ShardReader,
@@ -64,6 +77,20 @@ export class R2CandidateSource implements CandidateSource {
 
   get datasetVersion(): string {
     return this.directory.version;
+  }
+
+  /**
+   * Reset the per-search state (retrieval evidence + hydration memory).
+   *
+   * The Worker builds one source per request, but tests and any future
+   * isolate-level reuse share one across searches — and both the tier lookup and
+   * the hydration memo would otherwise leak from the previous search.
+   */
+  beginSearch(): void {
+    this.cheap.clear();
+    this.hydratedDocs.clear();
+    this.hydratedPartitions.clear();
+    this.byId.clear();
   }
 
   /** Fetch one shard per distinct term and merge the postings. */
@@ -168,21 +195,67 @@ export class R2CandidateSource implements CandidateSource {
     return this.byId.get(id);
   }
 
-  private async hydrateRefs(refs: DocRef[]): Promise<SearchDoc[]> {
+  private async hydrateRefs(refs: DocRef[], maxPartitions: number = SHARDING.maxHydrate): Promise<SearchDoc[]> {
     const ordered = [...refs].sort((a, b) => (this.cheap.get(b) ?? 0) - (this.cheap.get(a) ?? 0)).slice(0, SHARDING.maxScored);
-    const companies = await this.store.getCompaniesByRefs(this.datasetVersion, ordered);
+
+    const found = new Map<DocRef, SearchDoc>();
+    const missing: DocRef[] = [];
+    for (const ref of ordered) {
+      const memo = this.hydratedDocs.get(ref);
+      if (memo) found.set(ref, memo);
+      else missing.push(ref);
+    }
+
+    // Read only partitions this search has not read yet, chosen in candidate
+    // order (best retrieval score first), and only up to the per-search cap.
+    const read: DocRef[] = [];
+    const fresh = new Set<number>();
+    for (const ref of missing) {
+      const partition = partitionOfRef(ref);
+      // Already read: the ref simply is not in the stored object.
+      if (this.hydratedPartitions.has(partition)) continue;
+      if (!fresh.has(partition)) {
+        if (this.hydratedPartitions.size + fresh.size >= maxPartitions) continue;
+        fresh.add(partition);
+      }
+      read.push(ref);
+    }
+
+    if (read.length) {
+      const companies = await this.store.getCompaniesByRefs(this.datasetVersion, read, maxPartitions);
+      for (const partition of fresh) this.hydratedPartitions.add(partition);
+      for (const ref of read) {
+        const company = companies.get(ref) as Company | undefined;
+        if (!company) continue;
+        this.byId.set(company.id, company);
+        const doc = toSearchDoc(company);
+        this.hydratedDocs.set(ref, doc);
+        found.set(ref, doc);
+      }
+    }
+
     const docs: SearchDoc[] = [];
     for (const ref of ordered) {
-      const company = companies.get(ref) as Company | undefined;
-      if (!company) continue;
-      this.byId.set(company.id, company);
-      docs.push(toSearchDoc(company));
+      const doc = found.get(ref);
+      if (doc) docs.push(doc);
     }
     return docs;
   }
 
-  docs(refs: DocRef[]): Promise<SearchDoc[]> {
-    return this.hydrateRefs(refs);
+  /**
+   * Retrieval strength of a candidate, from the evidence that retrieved it.
+   *
+   * A candidate is "strong" when it matched a whole-name signal — the exact
+   * index (which also holds aliases) or the prefix index — and "weak" when only
+   * token/trigram postings mentioned it. The engine uses this to stop hydrating
+   * once its page is full of confident hits (see `WEAK_CEILING` in engine.ts).
+   */
+  tierOf(ref: DocRef): "strong" | "weak" {
+    return (this.cheap.get(ref) ?? 0) >= STAGE_WEIGHT.prefix ? "strong" : "weak";
+  }
+
+  docs(refs: DocRef[], options?: { maxPartitions?: number }): Promise<SearchDoc[]> {
+    return this.hydrateRefs(refs, options?.maxPartitions ?? SHARDING.maxHydrate);
   }
 
   async stats(): Promise<{ docCount: number; df: Record<string, number> }> {

@@ -48,6 +48,12 @@ APP_VERSION = "0.1.0"
 # Per-identity API rate limit (requests per minute per route group).
 MAX_SEARCHES_PER_MINUTE = "180"
 
+# Search hydration dial: company profile partitions read per search. Each read
+# costs ~25 KB, so this is the query's byte ceiling (see docs/architecture.md).
+# Raising it returns deeper pages for broad fuzzy searches; lowering it cuts the
+# bytes and CPU of every query. The engine clamps it to 1..64.
+SEARCH_MAX_HYDRATE = "16"
+
 # ---------------------------------------------------------------------------
 # Observability: keep logs; no payload logging of private contact data.
 # ---------------------------------------------------------------------------
@@ -70,3 +76,5 @@ ENVIRONMENT = "development"
 APP_VERSION = "0.1.0-dev"
 DEV_ALLOW_UNAUTHENTICATED = "false"
 MAX_SEARCHES_PER_MINUTE = "600"
+SEARCH_MAX_HYDRATE = "16"
+SEARCH_MAX_HYDRATE = "16"
