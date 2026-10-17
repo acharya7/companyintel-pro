@@ -299,8 +299,10 @@ export interface ContactPageResponse {
 /**
  * Contacts preserved without an employer, looked up by the name they claimed.
  *
- * `candidateCompanyIds` on each contact lists the companies that remained
- * possible, so a reviewer can follow the ambiguity instead of guessing.
+ * `candidateCompanyIds` on each contact lists a bounded sample of the companies
+ * that remained possible and `candidateCount` how many there really were, so a
+ * reviewer can follow the ambiguity instead of guessing — and a name shared by
+ * thousands of companies cannot blow up one contact row.
  */
 export interface UnassignedContactsResponse {
   companyId: string;
@@ -379,7 +381,12 @@ export interface IndexingCounters {
   contactsUnresolved?: number;
   /** Contacts attached to a different company of the same name than they claimed. */
   contactsMoved?: number;
-  /** Identifier keys a later row tried to claim while another company owned them. */
+  /**
+   * Strong identifiers (domain / LinkedIn page / scoped source id) a later row
+   * tried to claim while another company already owned them. The shared normalized
+   * name key is deliberately not counted: every namesake "claims" it, and counting
+   * those would hide the signal this number exists for.
+   */
   identifierConflicts?: number;
   /** `unassigned/…` objects written (0 when every contact was resolvable). */
   unassignedObjects?: number;

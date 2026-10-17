@@ -16,6 +16,7 @@ import { describe, expect, test } from "bun:test";
 import {
   ASSOCIATION_CATEGORIES,
   ASSOCIATION_CATEGORY_HINTS,
+  MAX_CANDIDATE_IDS,
   ASSOCIATION_CATEGORY_LABELS,
   associateContact,
   associationMatchesFilter,
@@ -253,6 +254,9 @@ describe("contacts with no reliable employer evidence", () => {
     expect(decision.reason).toBe("several_candidates_remain");
     expect(decision.assignedRef).toBeNull();
     expect(decision.candidateCompanyIds?.sort()).toEqual([a.id, b.id].sort());
+    // Two candidates fit inside the cap, so the stored record is complete.
+    expect(decision.record.candidateCompanyIds).toHaveLength(2);
+    expect(decision.record.candidateCount).toBe(2);
   });
 
   test("several companies with the same name and country stay unresolved", () => {
@@ -384,7 +388,11 @@ describe("a very large shared-name family", () => {
       if (withDomain) expect(decision.category).toBe("high_confidence");
       else {
         expect(decision.category).toBe("unresolved");
-        expect(decision.record.candidateCompanyIds).toHaveLength(FAMILY);
+        // The decision carries every candidate; the STORED record keeps a bounded
+        // sample plus the real count, so a thousand-member family cannot bloat it.
+        expect(decision.candidateCompanyIds).toHaveLength(FAMILY);
+        expect(decision.record.candidateCompanyIds).toHaveLength(MAX_CANDIDATE_IDS);
+        expect(decision.record.candidateCount).toBe(FAMILY);
         unresolved += 1;
       }
     }

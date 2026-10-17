@@ -58,6 +58,17 @@ import { formatNumber, formatPercent } from "@/lib/format";
 import { rememberCompany } from "@/lib/recent";
 import type { ContactFilters, ContactSortField, SortOrder } from "@/shared/models";
 
+/**
+ * How many candidate companies an association decision left open.
+ *
+ * A stored record keeps at most `MAX_CANDIDATE_IDS` ids plus the real count, because
+ * a shared name can have thousands of members; records written before the cap carry
+ * the complete list. Both report the same number to a reviewer.
+ */
+function candidateCount(association: { candidateCompanyIds?: string[]; candidateCount?: number }): number {
+  return association.candidateCount ?? association.candidateCompanyIds?.length ?? 0;
+}
+
 export default function CompanyDetails() {
   const { companyId } = useParams<{ companyId: string }>();
   const company = useCompany(companyId);
@@ -674,8 +685,8 @@ export default function CompanyDetails() {
                       <TableCell className="text-right">
                         <Badge variant="outline" className="text-[10px] font-normal">
                           {ASSOCIATION_CATEGORY_LABELS[contact.association.category]}
-                          {contact.association.candidateCompanyIds?.length
-                            ? ` · ${contact.association.candidateCompanyIds.length} candidates`
+                          {candidateCount(contact.association)
+                            ? ` · ${formatNumber(candidateCount(contact.association))} candidates`
                             : ""}
                         </Badge>
                       </TableCell>

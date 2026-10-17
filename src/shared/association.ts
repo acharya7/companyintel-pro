@@ -130,13 +130,36 @@ export interface AssociationEvidence {
   candidates: number;
 }
 
+/**
+ * How many candidate ids are stored on one association record.
+ *
+ * A shared name can have thousands of members (a national brand, or a name like
+ * "Delta"), and an unresolved contact used to store *every* candidate: on the
+ * benchmark's largest families that is thousands of ids per contact, which is index
+ * bloat and exceeds the API schema's own bound. The review needs to know how many
+ * candidates remained and which a few of them were, not all of them, so the stored
+ * list is capped and the true number is kept in `candidateCount`. The cap is
+ * deterministic (the same candidates in the same order every run), so the record is
+ * still reproducible.
+ */
+export const MAX_CANDIDATE_IDS = 8;
+
 /** The stored verdict. `category` is the only field the UI must understand. */
 export interface AssociationRecord {
   category: AssociationCategory;
   reason: AssociationReason;
   evidence: AssociationEvidence;
-  /** Company ids that were genuinely possible, when the family was ambiguous. */
+  /**
+   * Up to `MAX_CANDIDATE_IDS` company ids that were genuinely possible when the
+   * family was ambiguous — a sample for review, not the full set.
+   */
   candidateCompanyIds?: string[];
+  /**
+   * How many candidates there really were (`candidateCompanyIds.length` when it is
+   * below the cap). Absent when the decision was not about a live choice between
+   * candidates — for example a domain match, where exactly one company was possible.
+   */
+  candidateCount?: number;
 }
 
 /** One company record that a contact could belong to, within its name family. */
@@ -391,7 +414,12 @@ export function associateContact(input: AssociateInput): AssociationDecision {
       category,
       reason,
       evidence,
-      ...(candidateCompanyIds && candidateCompanyIds.length ? { candidateCompanyIds } : {}),
+      // The STORED record keeps a bounded sample plus the real count; the decision
+      // returned to the caller keeps the full list, because the caller needs every
+      // candidate id to write contact counts — it is the index that must stay small.
+      ...(candidateCompanyIds && candidateCompanyIds.length
+        ? { candidateCompanyIds: candidateCompanyIds.slice(0, MAX_CANDIDATE_IDS), candidateCount: candidateCompanyIds.length }
+        : {}),
     },
   });
 

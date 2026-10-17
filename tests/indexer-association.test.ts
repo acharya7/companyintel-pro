@@ -430,7 +430,9 @@ describe("identifier ownership is never reassigned", () => {
       );
     }
     expect(repeated.size).toBe(3);
-    expect(repeated.stats().conflicts).toBeGreaterThanOrEqual(2000);
+    // Two STRONG refusals per row (the domain and the LinkedIn page); the shared
+    // name key is not counted as a conflict, or a name family would look like one.
+    expect(repeated.stats().conflicts).toBe(2 * 1000);
     expect(repeated.stats().samples.length).toBeLessThanOrEqual(RESOLVER_CONFLICT_SAMPLE_LIMIT);
     expect(repeated.refFor("d:acme.example")).toBe(0);
   });

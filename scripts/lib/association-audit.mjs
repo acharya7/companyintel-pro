@@ -286,7 +286,13 @@ export function auditAssociations({ companies, contactsByRef, sampleLimit = 25 }
   const familiesWithProblems = new Set();
   const sharedNameFamilies = new Set();
   /** What the index itself recorded, when it recorded anything (format v3). */
-  const stored = { byCategory: { high_confidence: 0, plausible: 0, conflicting: 0 }, unclassified: 0, moved: 0 };
+  const stored = {
+    byCategory: { high_confidence: 0, plausible: 0, conflicting: 0 },
+    unclassified: 0,
+    moved: 0,
+    /** Which kind of evidence each stored verdict rests on (see `REASON_BASIS`). */
+    byBasis: { domain: 0, domain_contradiction: 0, record_identity: 0, country: 0, country_contradiction: 0, name: 0, unknown: 0 },
+  };
   /** Legacy class → stored category, so the before/after comparison is measurable. */
   const crossTab = new Map();
 
@@ -328,6 +334,12 @@ export function auditAssociations({ companies, contactsByRef, sampleLimit = 25 }
       if (storedCategory === "unclassified") stored.unclassified += 1;
       else if (storedCategory in stored.byCategory) stored.byCategory[storedCategory] += 1;
       if (contact.association?.movedFrom) stored.moved += 1;
+      // The evidence the INDEX says it used, mapped to one of six bases so
+      // "associated through a company domain" and "through a record identifier"
+      // are separate numbers rather than a single confidence label.
+      if (storedCategory !== "unclassified") {
+        stored.byBasis[REASON_BASIS[contact.association?.reason] ?? "unknown"] += 1;
+      }
       const cell = `${result.klass}|${storedCategory}`;
       crossTab.set(cell, (crossTab.get(cell) ?? 0) + 1);
       byReason.set(result.reason, (byReason.get(result.reason) ?? 0) + 1);
@@ -753,6 +765,15 @@ export function formatAuditReport(report) {
     say(`  conflicting       ${num(a.stored.byCategory.conflicting)}  attached, disputed, never shown as verified`);
     say(`  unclassified      ${num(a.stored.unclassified)}  no category stored (format-v2 contact, or written before Stage B)`);
     say(`  moved between companies of the same name  ${num(a.stored.moved)}`);
+    const basis = a.stored.byBasis ?? {};
+    say("  evidence the stored verdicts rest on");
+    say(`    company domain in the email            ${num(basis.domain)}`);
+    say(`    source record's own employer identity  ${num(basis.record_identity)}  (domain/website/LinkedIn/scoped source id on the row)`);
+    say(`    country evidence                       ${num(basis.country)}  (supporting)`);
+    say(`    name uniqueness only                   ${num(basis.name)}`);
+    say(`    domain contradiction                   ${num(basis.domain_contradiction)}`);
+    say(`    country contradiction                  ${num(basis.country_contradiction)}`);
+    if (basis.unknown) say(`    unrecognised reason                    ${num(basis.unknown)}`);
   }
 
   if (a.crossTab?.length) {

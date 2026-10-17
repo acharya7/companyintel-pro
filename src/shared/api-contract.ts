@@ -297,6 +297,12 @@ export const associationRecordSchema = z.object({
     candidates: z.number().int().nonnegative(),
   }),
   candidateCompanyIds: z.array(z.string()).max(50).optional(),
+  /**
+   * How many candidates there really were when the index stored only a bounded
+   * sample of ids (`MAX_CANDIDATE_IDS`). Absent on records written before the cap,
+   * where the id list was complete.
+   */
+  candidateCount: z.number().int().nonnegative().optional(),
 });
 
 export const companySchema = z.object({

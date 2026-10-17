@@ -27,6 +27,7 @@
     "index:benchmark-1m:preflight": "bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json --sample 1000000 --version v1-bench-1m --preflight-only",
     "index:spool-doctor": "bun scripts/spool-doctor.mjs --config tools/indexer/indexer.config.json",
     "index:bench-pass2": "bun scripts/benchmark-pass2.mjs",
+    "index:bench-assoc": "bun scripts/benchmark-association.mjs",
     "index:run": "bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json --version v1",
     "index:upload": "bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json --version v1 --upload",
     "index:sample-report": "bun scripts/sample-report.mjs",

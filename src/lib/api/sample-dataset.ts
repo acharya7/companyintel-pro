@@ -15,6 +15,7 @@
 
 import type { AssociationCounts, Company, Contact, ContactFilters, FacetBucket, UnassignedContact } from "@/shared/models";
 import {
+  MAX_CANDIDATE_IDS,
   associationMatchesFilter,
   associateContact,
   type AssociationCandidate,
@@ -365,7 +366,11 @@ export function buildSampleDataset(companyTarget = 800): SampleDataset {
           category: "unresolved",
           reason: "several_candidates_remain",
           evidence: { name: "shared", domain: "absent", country: "absent", rowIdentity: false, candidates: family.length },
-          candidateCompanyIds: family.map((member) => member.id),
+          // Same bound the indexer applies to a stored record (see
+          // `MAX_CANDIDATE_IDS`), so the preview cannot show a shape production
+          // never writes.
+          candidateCompanyIds: family.slice(0, MAX_CANDIDATE_IDS).map((member) => member.id),
+          candidateCount: family.length,
         },
       });
     }

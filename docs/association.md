@@ -25,6 +25,13 @@ that, all reproduced by tests before being fixed:
 | 3 | **Contacts were attached with no separate evidence step.** A normalized-name match was the whole decision, so a person could be attached to any company sharing the name, including a placeholder that carries nothing but the name. | `tools/indexer/src/build.ts` (pass 2) | "companies with one name and different domains stay separate", `tests/association.test.ts` |
 | 4 | Repeated self-contradicting rows created one empty company **per row** (unbounded on a real file). | `CompanyResolver` | "a repeated contradicting pattern joins one record instead of creating one per row" |
 
+One measurement consequence worth knowing before reading a run report: `identifierConflicts` counts
+only **strong** refusals (`d:` / `l:` / `s:`). Every namesake record "claims" the shared `n:` name
+key, and counting those would report tens of thousands of meaningless conflicts on real data
+(measured in `tests/indexer-association.test.ts`: 5,000 same-name rows with their own domains report
+**0** conflicts, while 1,000 rows that really do re-claim two owned strong identifiers report
+**2,000**).
+
 Two hypotheses that the audit raised are **not** confirmed defects, and the rules
 below are deliberately written so they cannot become one:
 
@@ -59,8 +66,11 @@ Rules, in the order the resolver applies them:
    the row (domain / LinkedIn / scoped source id), the row joins that record.
    Name similarity is never consulted when that happens.
 2. **First owner wins, permanently.** `claim()` never reassigns a key. A refused
-   claim is counted (`identifierConflicts`) and sampled (bounded, 32 entries),
-   and the run reports the count. Replaying the same rows can never move a key.
+   claim of a *strong* identifier is counted (`identifierConflicts`) and sampled
+   (bounded, 32 entries), and the run reports the count. Refusals of the shared
+   `n:` name key are not counted: every namesake "claims" it, and counting those
+   would drown the signal the number exists for. Replaying the same rows can never
+   move a key.
 3. **Contradictory rows get their own record, keyed by evidence.** A row whose
    keys point at two different records creates a record whose identity is the
    *evidence pattern* (`normalized name + sorted strong keys`), so every later row
@@ -135,10 +145,13 @@ A contact is never dropped because its employer cannot be identified.
   (`spoolPartitionOfNormalizedName`), so the reader can locate the object from a
   company record alone — no listing, no R2 search.
 - Each preserved contact keeps its contact details, `source` provenance, the
-  category and reason, the candidate company ids, and `claimedCompanyName` /
-  `claimedNormalizedName` exactly as the source row carried them. `companyId` is
-  `""` and its `p_…` id is derived from the contact's own fingerprint, never from
-  a company (a company-scoped id would fabricate an employer).
+  category and reason, a bounded sample of candidate company ids
+  (`MAX_CANDIDATE_IDS` = 8) plus `candidateCount` with the real number, and
+  `claimedCompanyName` / `claimedNormalizedName` exactly as the source row carried
+  them. `companyId` is `""` and its `p_…` id is derived from the contact's own
+  fingerprint, never from a company (a company-scoped id would fabricate an
+  employer). The cap matters: a name shared by 1,000 companies used to store 1,000
+  ids on every preserved contact (measured below).
 - **Where to review them:** the company profile's "Employer unresolved" panel
   (`GET /api/companies/:id/unassigned`), which lists preserved contacts that named
   this company and the number of candidates that remained; the Contacts page
@@ -268,6 +281,55 @@ are re-ingesting — stop and read the message rather than accepting the cost.
   validated v2 index stays the baseline until you approve the upgrade.
 
 ---
+
+## 7b. Measured cost of the association stage
+
+All numbers below are synthetic, measured on a 1-vCPU Linux sandbox with the real code paths
+(`bun run index:bench-assoc` and `bun run index:bench-pass2`). Re-run them on the machine that
+runs the indexer; they are evidence, not a prediction for the 64 GB corpus.
+
+### The adversarial corpus: one name, many companies
+
+`bun run index:bench-assoc --companies N --contacts M` builds N organizations with the *same*
+normalized name and one unique domain each, and M contacts whose claimed name is that same name:
+a third carry a corporate address that names one company (evidence, and typically a reassignment),
+a third carry a personal address (not evidence), a third carry nothing but a country every
+candidate shares (undecided).
+
+| Corpus | Outcome (the run's own counters) | pass 2 merge | contacts/s | RSS during the run |
+| --- | --- | --- | --- | --- |
+| 500 companies / 5,000 contacts | 1,667 high confidence, 3,333 preserved, 1,663 moved | **0.4 s** | 12,887 | 74 MB |
+| 1,000 companies / 10,000 contacts | 3,334 high confidence, 6,666 preserved, 3,330 moved | **0.9 s** | 11,682 | 98 MB |
+| 1,000 / 10,000, **before** the candidate-id cap | same decisions, but 1,000 ids stored on each preserved contact | 2.1 s | 4,710 | 335 MB |
+
+The last row is the reason `MAX_CANDIDATE_IDS` exists: storing every candidate id on an unresolved
+contact cost more than the decision itself (2.1 s → 0.9 s, 335 MB → 98 MB on the same corpus), and
+would have produced records the API schema rejects (`candidateCompanyIds` is capped at 50).
+Per-contact cost is linear in the family size (`O(family × contacts)` comparisons), which is why the
+numbers above are the worst case rather than the average: the real data's families are mostly 2–5
+members, so a 64 GB run's association cost is dominated by the merge, not by this stage.
+
+### The common corpus: one company per name
+
+`bun run index:bench-pass2 --rows 20000` (20,000 companies, 256 partitions, 1,792 shard files,
+1,275,668 postings) is the shape Stage B has almost no work in — a single candidate per contact:
+
+| Lane | pass 2 merge | companies/s | Objects | Postings | Shard appends | Peak buffer |
+| --- | --- | --- | --- | --- | --- | --- |
+| Before the association stage (documented in `docs/indexing.md`) | 2.1–2.5 s | 9,333 | 1,896 | 1,275,668 | 5,376 in 3 flushes | 8.39 MB |
+| With Stage A + Stage B | **2.9 s** | 6,947 | 1,896 | 1,275,668 | 5,376 in 3 flushes | 8.39 MB |
+
+So the change costs roughly 15–35% of pass 2 on a corpus with no ambiguity at all, and buys the
+resolution and preservation behaviour described above. Object counts, postings, shard appends,
+flush behaviour and peak buffered bytes are unchanged — the existing indexer optimisations (batched
+shard writing, bounded memory, restart-safe reset, deterministic output) are untouched.
+
+### Memory
+
+The benchmark's RSS figure is the whole run, not the association stage alone. Nothing in Stage A or
+B is proportional to the dataset: one resolver per partition (bounded by the partition's companies),
+one candidate record per company in the family, and contacts decided one at a time. The one place a
+large family could have grown was the stored candidate list, which the cap bounds.
 
 ## 8. Auditing the result
 

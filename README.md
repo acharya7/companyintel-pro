@@ -26,7 +26,7 @@ No Convex, no SQL database, no KV/D1/Durable Objects, no Redis, no search server
   contact is attached to a company only on evidence (row identity, email domain, country), never
   on a name match alone; ambiguous contacts are preserved under the name they claimed instead of
   being shown as employees (`docs/association.md`)
-- Tests: `bun test` (454 tests, 0 fail) — normalization, relevance, prototype-chain safety,
+- Tests: `bun test` (456 tests, 0 fail) — normalization, relevance, prototype-chain safety,
   CSV/indexer, R2 store, end-to-end index + Worker API over a generated index, the bounded
   hydration funnel, two-stage association (identity ownership, reassignment, preservation,
   dedupe, reconciliation), the association audit, lead recovery, security, the R2 probe and its
@@ -54,6 +54,7 @@ No Convex, no SQL database, no KV/D1/Durable Objects, no Redis, no search server
 bun install
 bun run check             # typechecks (frontend, worker, indexer, probe) + full test suite
 bun run bench:hydration   # completeness vs R2 cost of the search hydration budget (real-data sample)
+bun run index:bench-assoc # association cost on an adversarial shared-name family (synthetic)
 bun run r2:doctor         # credentials file + endpoint + one signed LIST of the real raw/ prefix
 bun run r2:schema         # both real source files: encoding, delimiter, columns, mapping
 bun run verify:r2         # inventory, sizes, ETags, bounded body reads, dataset state
@@ -130,7 +131,7 @@ The equivalent S3-key path remains available: `bun scripts/verify-raw.mjs[--json
 | Area | Status |
 | --- | --- |
 | Frontend, Worker, indexer, probe typechecks | **IMPLEMENTED AND TESTED** — `bun run check` → 5/5 PASS |
-| Test suite (454 tests, 0 fail) | **IMPLEMENTED AND TESTED** — normalization, prototype-chain safety, relevance, CSV parsing, indexer pipeline + R2 streaming sources, R2 store, Access security, end-to-end index build + Worker route handlers, the bounded hydration funnel (including checkpoint provenance), the read-only probe, the newline-safe JSONL codec (U+2028/U+2029, truncation, chunk boundaries, CRLF), spool-manifest integrity and the read-only spool doctor |
+| Test suite (456 tests, 0 fail) | **IMPLEMENTED AND TESTED** — normalization, prototype-chain safety, relevance, CSV parsing, indexer pipeline + R2 streaming sources, R2 store, Access security, end-to-end index build + Worker route handlers, the bounded hydration funnel (including checkpoint provenance), the read-only probe, the newline-safe JSONL codec (U+2028/U+2029, truncation, chunk boundaries, CRLF), spool-manifest integrity and the read-only spool doctor |
 | Build and bundles | **IMPLEMENTED AND TESTED** — `bun run build` exits 0 and the `dist/` scan finds no server identifier; `wrangler deploy --dry-run` bundles the Worker (737 KiB) and the probe (39 KiB) with the expected bindings and `workers_dev = false` |
 | Worker → R2 access path | **IMPLEMENTED AND TESTED** — `tests/worker-r2-binding.test.ts` proves the Worker reaches R2 only through the `COMPANY_DATA` binding, never with S3 secrets, and that the bucket is not published |
 | Read-only R2 probe (native binding, no keys) | **IMPLEMENTED AND TESTED locally** — `tests/r2-probe.test.ts`, `tests/r2-probe-schema.test.ts`, `tests/verify-r2-remote-script.test.ts` cover routing, bound clamping, the production refusal, 405 on writes, no write/delete call existing anywhere in the probe, 1 KB/6 MB read budgets, missing-object handling, the schema report and the runner's 0/1/2 exit codes. **Not run against your account** |
