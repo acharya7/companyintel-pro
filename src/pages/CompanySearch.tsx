@@ -28,7 +28,7 @@ import {
 } from "@/hooks/use-api";
 import { ASSOCIATION_CATEGORY_LABELS, type AssociationCategory } from "@/shared/association";
 import { formatNumber } from "@/lib/format";
-import type { CompanyFilters, CompanySortField, ContactSearchHit, SortOrder } from "@/shared/models";
+import type { CompanyFilters, CompanySortField, SortOrder } from "@/shared/models";
 import { cn } from "@/lib/utils";
 
 /**

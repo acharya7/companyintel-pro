@@ -153,6 +153,56 @@ bun tools/indexer/src/cli.ts validate --config tools/indexer/indexer.config.json
 bun tools/indexer/src/cli.ts publish --config tools/indexer/indexer.config.json --version v1 --yes
 ```
 
+### One command for the whole pipeline (recommended for the 64 GB run)
+
+The steps above are the building blocks; `index:full` runs them in order, stops at the first
+problem, and is resumable at every stage. It never passes `--no-resume`, never deletes a spool and
+never activates anything without being asked:
+
+```bash
+# 1. check only: auth, both source objects, TSV mapping, disk, RAM (reads nothing in bulk)
+bun run index:full:preflight -- --version v1-full-2026-10-17
+
+# 2. the material run: Pass 1 + Pass 2 + validation, then resumable upload + re-verification
+bun run index:full -- --version v1-full-2026-10-17 --yes
+
+# 3. activate it for the application (separate decision, separate flag)
+bun run index:full -- --version v1-full-2026-10-17 --activate --yes --upload-only
+```
+
+It writes a per-version log and JSON summary under `index-reports/`, so "what did the full run do"
+is one file rather than a scrollback. Interrupting it is safe: re-running the same command continues
+from the checkpoint (Pass 1), from the merge checkpoint (Pass 2), or with the remaining objects
+(upload skips anything already present at the right size).
+
+On a machine with little free space the default 512 MB free-space floor can refuse a run whose
+output is a few tens of MB; `--disk-floor <mb>` lowers that margin explicitly (`run` accepts it too):
+
+```bash
+bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.dev-full.json \
+  --sample 20000 --version dev-r2-20k-full-20261017 --disk-floor 150
+```
+
+### What a record carries: every source column
+
+The canonical model holds the fields the application searches, filters and ranks on. **Every other
+column of the source row is captured on the record** as `attributes` (`Record<label, value>`), by
+`capturedColumns` / `captureAttributes` in `tools/indexer/src/mapping.ts`:
+
+* only columns the canonical map did NOT consume are captured (nothing is duplicated),
+* empty cells are omitted — the record carries the values the row actually has,
+* each value is trimmed and cut at 400 characters, and a cut value ends with `…`,
+* at most 80 columns per record (`MAX_CAPTURED_FIELDS`),
+* the label is the file's own header text, tidied for display (`organization_founded_year` →
+  `organization founded year`) — never a renamed or invented field.
+
+Both detail screens render them (`CompanyDetails`, `ContactDetails`) with a copy button per value
+and clickable URLs, so a 51-column company row or a 39-column contact row is fully readable instead
+of being reduced to the dozen canonical fields. Captured columns are part of the shared API contract
+(`companySchema.attributes` / `contactSchema.attributes`), because responses are parsed with Zod and
+an undeclared field would be silently dropped.
+
+
 `--sample <n>` applies per source, so both schemas are always represented in a sample run — and in
 Mode B it also bounds the download: the reader stops fetching once the sample limit is reached and
 discards the partial cache. Sample versions are safe to upload to a `staging`/sample version id;

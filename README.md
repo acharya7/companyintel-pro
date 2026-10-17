@@ -96,7 +96,25 @@ bun run index:bench-pass2 --fs-count
 bun run index:upload
 bun run index:validate
 bun run index:publish
+
+# ONE COMMAND for the whole pipeline (preflight → index → validate → resumable upload →
+# re-verify → optional activation). Resumable at every stage; never passes --no-resume and
+# never activates without --activate.
+bun run index:full:preflight -- --version v1-full-<date>       # check only
+bun run index:full -- --version v1-full-<date> --yes           # the material run
+bun run index:full -- --version v1-full-<date> --activate --yes --upload-only
 ```
+
+Every record carries **every column of its source row**: the canonical mapping covers the fields the
+application searches and ranks on, and the remaining columns are captured verbatim as `attributes`
+(visible in the company and person detail screens). A 51-column company row and a 39-column contact
+row are therefore fully readable, not reduced to a dozen fields — see `docs/indexing.md`
+("What a record carries: every source column").
+
+Search covers **companies and people** from one box (`/companies`, source selector
+All / Companies / Contacts). Person search uses the contact name index
+(`contactToken`/`contactPrefix`/`contactTrigram` shards); an index built before it existed reports
+"contact search is not indexed" instead of returning an empty result.
 
 Iterating on search quality or the theme does not require data:
 `bun run bench` measures latency, retrieval cost and labelled relevance (recall@1/@5, false
@@ -147,7 +165,10 @@ The equivalent S3-key path remains available: `bun scripts/verify-raw.mjs[--json
 | Area | Status |
 | --- | --- |
 | Frontend, Worker, indexer, probe typechecks | **IMPLEMENTED AND TESTED** — `bun run check` → 5/5 PASS |
-| Test suite (491 tests, 0 fail) | **IMPLEMENTED AND TESTED** — normalization, prototype-chain safety, relevance, CSV parsing, indexer pipeline + R2 streaming sources, R2 store, Access security, end-to-end index build + Worker route handlers, the bounded hydration funnel (including checkpoint provenance), the read-only probe, the newline-safe JSONL codec (U+2028/U+2029, truncation, chunk boundaries, CRLF), spool-manifest integrity, the read-only spool doctor, the isolated Pass 2 rebuild from an existing spool (identity separation, isolation, corruption, byte-identical originals, mid-merge restart), the two-stage association rules (order-independence, no-claim rows, preservation, dedupe, reconciliation) and the synthetic scenario corpus |
+| Test suite (510 tests, 0 fail) | **IMPLEMENTED AND TESTED** — normalization, prototype-chain safety, relevance, CSV parsing, indexer pipeline + R2 streaming sources, R2 store, Access security, end-to-end index build + Worker route handlers, the bounded hydration funnel (including checkpoint provenance), the read-only probe, the newline-safe JSONL codec (U+2028/U+2029, truncation, chunk boundaries, CRLF), spool-manifest integrity, the read-only spool doctor, the isolated Pass 2 rebuild from an existing spool (identity separation, isolation, corruption, byte-identical originals, mid-merge restart), the two-stage association rules (order-independence, no-claim rows, preservation, dedupe, reconciliation), the synthetic scenario corpus, the contact name index + global person search (exact, partial, typo, nonsense, preserved contacts, a version without the contact index) and the captured source columns (mapped columns excluded, empty cells omitted, value and column bounds, record round-trip) |
+| Global contact (person) search | **IMPLEMENTED AND VERIFIED ON REAL R2 DATA** — the indexer writes `contactToken`/`contactPrefix`/`contactTrigram` shards; `GET /api/contacts/search` ranks by name and answers with the employer evidence. Verified live against the 20 K real-data development version: "malini umapathi" → the preserved contact, "malni umapathii" (two typos) → the same person, "umapathi" → 11 matches, a nonsense query → nothing plus the exact empty-state sentence. A version without a contact index answers `400` with the reason, never an empty result |
+| Every source field is accessible | **IMPLEMENTED AND VERIFIED ON REAL R2 DATA** — the 20 K development version was rebuilt with unmapped source columns captured verbatim (`attributes`); a real company record carries 21 additional columns and a real contact 19, and both detail screens render them with copy buttons and clickable URLs |
+| Freebuff preview over the real bucket | **WORKING** — `vite dev` mounts the production Hono Worker at `/api/*` with the R2 bucket substituted for the binding (`tools/dev-api/`), serving the active development version `dev-r2-20k-full-20261017` (20,259 companies / 19,414 contacts, 491 uploaded objects, all present and content-verified on R2). The published pointer `manifests/active.json` is never written by the preview |
 | Build and bundles | **IMPLEMENTED AND TESTED** — `bun run build` exits 0 and the `dist/` scan finds no server identifier; `wrangler deploy --dry-run` bundles the Worker (737 KiB) and the probe (39 KiB) with the expected bindings and `workers_dev = false` |
 | Worker → R2 access path | **IMPLEMENTED AND TESTED** — `tests/worker-r2-binding.test.ts` proves the Worker reaches R2 only through the `COMPANY_DATA` binding, never with S3 secrets, and that the bucket is not published |
 | Read-only R2 probe (native binding, no keys) | **IMPLEMENTED AND TESTED locally** — `tests/r2-probe.test.ts`, `tests/r2-probe-schema.test.ts`, `tests/verify-r2-remote-script.test.ts` cover routing, bound clamping, the production refusal, 405 on writes, no write/delete call existing anywhere in the probe, 1 KB/6 MB read budgets, missing-object handling, the schema report and the runner's 0/1/2 exit codes. **Not run against your account** |

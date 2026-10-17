@@ -313,9 +313,10 @@ export async function searchContacts(
     await retrieve(store, directory.version, shardCounts, "contactTrigram", termsFor("contactTrigram", normalized), MAX_SCORED, scores);
   }
 
+  // Best retrieval score first: hydration spends its fixed budget on the candidates
+  // the index ranked highest, never on whichever ids happened to come back first.
   const ranked = [...scores.entries()].sort((a, b) => b[1] - a[1]).slice(0, MAX_SCORED);
   const wanted = ranked.slice(0, MAX_HYDRATE_CONTACTS).map(([id]) => id);
-  const wantedSet = new Set(wanted);
 
   // Hop 2 + 3: contact id → ref (company or unassigned partition) → record.
   const refs = await store.refsForContactIds(directory.version, wanted, directory.shards.ids ?? SHARDING.idShards);
@@ -384,8 +385,24 @@ export async function searchContacts(
   const skip = Math.max(0, options.skip ?? 0);
   const page = justified.slice(skip, skip + options.pageSize);
 
+  /*
+   * Label a partial match.
+   *
+   * Searching a first name ("erin") legitimately returns every Erin, and a query with
+   * two words where only one matched is still useful. What must not happen is that a
+   * partial page looks like an exact one, so when no result covers every word of the
+   * query the response says so — the same honesty rule the company search follows.
+   */
+  const queryTerms = normalized.split(" ").filter(Boolean);
+  const bestCoverage = justified.length
+    ? Math.max(...justified.map((hit) => hit.matchedTerms.filter((term) => queryTerms.includes(term)).length))
+    : 0;
+  const partial = page.length > 0 && queryTerms.length > 1 && bestCoverage < queryTerms.length;
+
   const notice = page.length
-    ? null
+    ? partial
+      ? `Showing partial matches for “${options.query}”. No single record matched every word you typed.`
+      : null
     : notHydrated > 0
       ? "Matches exist but their records could not be read within this search's budget. Try a more specific name."
       : weak > 0

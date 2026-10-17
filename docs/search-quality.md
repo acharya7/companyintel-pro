@@ -265,6 +265,35 @@ before the production index is built from the same name-only join. `scripts/samp
 is deliberately left as the *shape* report and now prints a one-line pointer to `bun run
 index:audit` whenever it finds ambiguous companies or contacts on name-only companies.
 
+## 8b. Person search: the same rules, name-shaped
+
+A contact is not a document: it lives inside its company's contact object, so its postings carry a
+contact id and hydration goes through the ids index (id → company ref, or the `unassigned/` partition
+for a preserved contact). The retrieval rubric mirrors the company one, with the weights that make a
+name behave:
+
+| evidence | weight | why |
+| --- | --- | --- |
+| every word of the query equals the stored name | +1000 | the answer |
+| whole-name prefix either way | +400 | "satya n" |
+| a query word is a literal start of a name word (≥ 3 chars) | +220 | "Nade" → "Nadella" |
+| per-token overlap with name words | up to +300 | "nadella" alone |
+| best per-token edit similarity ≥ 0.7 | up to +250 | "Nadela", "Umapathii" |
+| whole-name edit similarity ≥ 0.82 / trigram dice ≥ 0.6 | up to +200 / +120 | word-order and spacing variants |
+
+Two rules keep it honest:
+
+* **A candidate that no rule can justify is dropped.** The trigram stage exists for typos and also
+  produces near-misses that share several trigrams with the query and nothing else; a record whose
+  final relevance is 0 was matched by no rule this search applies, so it is not shown (and if that
+  empties the page, the notice says nothing matched closely enough).
+* **A partial page is labelled.** Searching one word legitimately returns every match for it, so
+  when no result covers every word of the query the response carries
+  `Showing partial matches for “…”`. Measured live on the 20 K real-data development version:
+  `malini umapathi` → the preserved contact only, no notice; `malni umapathii` (two typos) → the same
+  person; `umapathi` → 11 matches; `erin boyle` (absent from the sample) → the partial-match notice
+  instead of a bare list.
+
 ## 9. Residual limitations and what would need a reindex
 
 1. **Domain queries are not supported** (`tcs.com`). The domain is not an indexed term.

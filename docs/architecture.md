@@ -220,7 +220,8 @@ weak ones; the typed query is never silently replaced.
 ```
 raw/                 original CSVs (app never writes here)
 staging/<version>/   unpublished intermediate output
-indexes/<version>/   exact|prefix|token|trigram|ids shards + directory.json
+indexes/<version>/   exact|prefix|token|trigram|ids shards + contactToken|contactPrefix|contactTrigram
+                     (the person-name index) + directory.json
 companies/<version>/ canonical company partitions (gzip JSON)
 contacts/<version>/  contact partitions grouped by company (gzip JSON)
 unassigned/<version>/ contacts preserved WITHOUT an employer (format v3)
@@ -254,10 +255,42 @@ The only LIST operation in the whole application is the bounded `raw/` listing o
 Management page (`GET /api/dataset/sources`, at most 25 objects, requested only when that page
 is opened). Search, contact retrieval, exports and the app shell never list the bucket.
 
+## Contact search (`worker/src/contact-search.ts`)
+
+Companies are found by document ref; people are found by id, because a contact lives *inside* its
+company's contact object and its position there is not part of its identity. The person-name index
+(`shards.contactIndex` in the directory) therefore stores contact ids, and hydration is two bounded
+hops:
+
+```
+term  → contactToken / contactPrefix / contactTrigram shards        (ids in postings)
+id    → the ids index  →  company ref, or -(partition+1) for a preserved contact
+ref   → contacts/<version>/<partition>.json.gz  (batched)  →  the record
+```
+
+* the negative ids ref is how a contact kept WITHOUT an employer is addressed: it points at the
+  `unassigned/<version>/<partition>.json.gz` object that holds it, and both search and
+  `/api/contacts/:id` resolve it. A preserved contact stays fully searchable and its employer is
+  reported as unconfirmed rather than invented;
+* an index built before the contact index existed has no `shards.contactIndex`, and
+  `/api/contacts/search` answers `400` with that reason instead of an empty result — "not indexed"
+  and "no such person" are different claims and the API never conflates them;
+* budgets mirror company search: deduplicated shard reads (concurrency 8), a fixed scored-candidate
+  cap, at most 12 contact objects and 60 hydrated contacts per search, and the trigram stage only
+  runs when the strong stages produced little to rank;
+* ranking is name-shaped: exact name, whole-name prefix, per-word prefix ("Nade" → "Nadella"),
+  token overlap, bounded per-token edit distance ("Nadela", "Umapathii") and trigram dice as the
+  last resort. A candidate that retrieval accepted but no rule can justify is dropped, so a typo
+  stage can never present an unrelated person as a hit.
+
 ## Frontend
 
 - Routes (`src/main.tsx`): `/` landing, `/dashboard`, `/companies`, `/companies/:companyId`,
-  `/contacts`, `/leads`, `/saved-searches`, `/exports`, `/dataset`, `/settings`.
+  `/contacts`, `/contacts/:contactId`, `/leads`, `/saved-searches`, `/exports`, `/dataset`,
+  `/settings`.
+- `/companies` is one search surface with a source selector (All / Companies / Contacts);
+  `/contacts/:contactId` is the full person record, including every captured source column and the
+  association evidence behind its employer.
 - `AppLayout` provides sidebar navigation, dataset status chip, theme toggle and command
   search entry point. Light and dark themes are provided by `next-themes` + Tailwind tokens in
   `src/index.css`.

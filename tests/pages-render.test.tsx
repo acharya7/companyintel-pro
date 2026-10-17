@@ -18,15 +18,16 @@
 
 import { describe, expect, test } from "bun:test";
 import { renderToString } from "react-dom/server";
-import { MemoryRouter } from "react-router";
+import { MemoryRouter, Route, Routes } from "react-router";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import Dashboard from "../src/pages/Dashboard";
 import DatasetManagement from "../src/pages/DatasetManagement";
 import CompanySearch from "../src/pages/CompanySearch";
+import ContactDetails from "../src/pages/ContactDetails";
 import { Pager } from "../src/components/common";
 import { queryKeys } from "../src/hooks/use-api";
-import type { DatasetStatusResponse, UserSettings } from "../src/shared/models";
+import type { Contact, DatasetStatusResponse, UserSettings } from "../src/shared/models";
 
 /* --------------------------------- fixtures ------------------------------- */
 
@@ -109,7 +110,9 @@ const settings: UserSettings = {
 
 /* --------------------------------- helpers -------------------------------- */
 
-async function makeClient(seed: { datasetStatus?: DatasetStatusResponse; error?: string } = {}) {
+async function makeClient(
+  seed: { datasetStatus?: DatasetStatusResponse; error?: string; contact?: { contact: Contact; companyName: string | null; companyId: string | null } } = {},
+) {
   const client = new QueryClient({
     defaultOptions: {
       // No mount refetch: the seeded state (data or error) is the state under test,
@@ -138,12 +141,16 @@ async function makeClient(seed: { datasetStatus?: DatasetStatusResponse; error?:
     client.setQueryData(queryKeys.exports, []);
     client.setQueryData(queryKeys.settings, settings);
   }
+  if (seed.contact) client.setQueryData(queryKeys.contact(seed.contact.contact.id), seed.contact);
   return client;
 }
 
 async function renderPage(
   ui: React.ReactElement,
-  options: { path?: string; seed?: { datasetStatus?: DatasetStatusResponse; error?: string } } = {},
+  options: {
+    path?: string;
+    seed?: { datasetStatus?: DatasetStatusResponse; error?: string; contact?: { contact: Contact; companyName: string | null; companyId: string | null } };
+  } = {},
 ): Promise<string> {
   const client = await makeClient(options.seed);
   return renderToString(
@@ -214,6 +221,67 @@ describe("pages render without a missing API method", () => {
     expect(html).toContain("microsoft");
     // The no-dataset explanation must NOT appear when a dataset is being served.
     expect(html).not.toContain("No dataset indexed");
+  });
+
+  test("Contact profile renders every captured field and the employer evidence", async () => {
+    const contact: Contact = {
+      id: "p_0123456789abcdef",
+      companyId: "c_0123456789abcdef",
+      fullName: "Malini Umapathi",
+      firstName: "Malini",
+      lastName: "Umapathi",
+      title: "Head of Data",
+      email: "malini.umapathi@example.com",
+      country: "India",
+      city: "Pune",
+      // A source column the canonical model has no field for: must be shown verbatim.
+      attributes: { seniority_source_column: "Director", industry_code: "7372" },
+      source: { source: "csv2", row: 4242 },
+      association: {
+        category: "email_domain_matches_company_domain",
+        reason: "email_domain_matches_company_domain",
+        evidence: { name: "unique", domain: "match", country: "match", rowIdentity: false, candidates: 3 },
+      },
+    } as Contact;
+    const html = await renderPage(
+      <Routes>
+        <Route path="/contacts/:contactId" element={<ContactDetails />} />
+      </Routes>,
+      {
+        path: "/contacts/p_0123456789abcdef",
+        seed: {
+          datasetStatus: realDataset,
+          contact: { contact, companyName: "Vertex Analytics", companyId: contact.companyId },
+        },
+      },
+    );
+    expect(html).toContain("Malini Umapathi");
+    expect(html).toContain("malini.umapathi@example.com");
+    // Captured source columns are rendered, not dropped.
+    expect(html).toContain("seniority_source_column");
+    expect(html).toContain("7372");
+    expect(html).toContain("Vertex Analytics");
+    expect(html).not.toContain("is not a function");
+  });
+
+  test("Contact profile says a preserved contact has no employer instead of inventing one", async () => {
+    const contact: Contact = {
+      id: "p_fedcba9876543210",
+      companyId: "",
+      fullName: "Unattached Person",
+      source: { source: "csv2", row: 7 },
+    } as Contact;
+    const html = await renderPage(
+      <Routes>
+        <Route path="/contacts/:contactId" element={<ContactDetails />} />
+      </Routes>,
+      {
+        path: "/contacts/p_fedcba9876543210",
+        seed: { datasetStatus: realDataset, contact: { contact, companyName: null, companyId: null } },
+      },
+    );
+    expect(html).toContain("Unattached Person");
+    expect(html).toContain("No employer record");
   });
 
   test("Company search renders without a query and without a dataset status", async () => {

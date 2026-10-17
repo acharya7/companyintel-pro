@@ -30,6 +30,8 @@
     "index:spool-doctor": "bun scripts/spool-doctor.mjs --config tools/indexer/indexer.config.json",
     "index:bench-pass2": "bun scripts/benchmark-pass2.mjs",
     "index:bench-assoc": "bun scripts/benchmark-association.mjs",
+    "index:full": "bun scripts/full-index.mjs",
+    "index:full:preflight": "bun scripts/full-index.mjs --preflight-only",
     "index:run": "bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json --version v1",
     "index:upload": "bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json --version v1 --upload",
     "index:sample-report": "bun scripts/sample-report.mjs",

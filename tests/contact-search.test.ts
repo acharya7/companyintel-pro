@@ -120,7 +120,10 @@ describe("person search over the real index", () => {
 describe("a version without a contact index says so", () => {
   test("searchContacts returns null instead of an empty result", async () => {
     const directory = await directoryOrThrow();
-    const { contactIndex: _omitted, ...shards } = directory.shards;
+    // A version whose directory has no `shards.contactIndex` — i.e. every index built
+    // before the contact name index existed.
+    const shards = { ...directory.shards };
+    delete shards.contactIndex;
     const legacy = { ...directory, shards } as IndexDirectory;
     const result = await searchContacts(store, legacy, { query: "satya", pageSize: 10 });
     // null is the caller's signal to answer "this version cannot search people".
