@@ -9,7 +9,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
-import { Building2, ChevronDown, Copy, Database, ExternalLink, Filter, Linkedin, Search, Star, X } from "lucide-react";
+import { Building2, ChevronDown, Copy, Database, ExternalLink, Filter, Linkedin, Mail, MapPin, Search, Star, UserRound, Users, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -19,18 +19,29 @@ import { Label } from "@/components/ui/label";
 import { EmptyState, ErrorBlock, LoadingBlock, MatchBadge, PageHeader, Pager, Section } from "@/components/common";
 import {
   useCompanySearch,
+  useContactSearch,
   useCreateSavedSearch,
   useDatasetMode,
   useDatasetStatus,
   useSaveLead as useInsertLead,
   recordActivity,
 } from "@/hooks/use-api";
+import { ASSOCIATION_CATEGORY_LABELS, type AssociationCategory } from "@/shared/association";
 import { formatNumber } from "@/lib/format";
-import type { CompanyFilters, CompanySortField, SortOrder } from "@/shared/models";
+import type { CompanyFilters, CompanySortField, ContactSearchHit, SortOrder } from "@/shared/models";
 import { cn } from "@/lib/utils";
+
+/**
+ * What the one search box looks through.
+ *
+ * `all` runs both indexes for the same query, so the user never has to know which
+ * kind of record they are looking for before they search.
+ */
+type SearchMode = "all" | "companies" | "contacts";
 
 interface SearchState {
   q: string;
+  mode: SearchMode;
   page: number;
   pageSize: number;
   sort: CompanySortField;
@@ -47,8 +58,10 @@ function readState(params: URLSearchParams): SearchState {
   }
   if (params.get("hasContacts") === "true") filters.hasContacts = true;
   if (params.get("hasDomain") === "true") filters.hasDomain = true;
+  const type = params.get("type");
   return {
     q: params.get("q") ?? "",
+    mode: type === "companies" || type === "contacts" ? type : "all",
     page: Math.max(1, Number(params.get("page") ?? 1)),
     pageSize: Math.min(100, Math.max(5, Number(params.get("pageSize") ?? 25))),
     sort: (params.get("sort") as CompanySortField) ?? "relevance",
@@ -56,6 +69,31 @@ function readState(params: URLSearchParams): SearchState {
     fuzzy: params.get("fuzzy") !== "false",
     filters,
   };
+}
+
+/**
+ * Employer-confidence badge for a person result.
+ *
+ * A contact is never presented as a confirmed employee of a company that merely
+ * shares the name: the category comes from the indexer's association decision, and
+ * anything short of verified evidence is labelled as unconfirmed on the card
+ * itself, not only on the detail page.
+ */
+function AssociationBadge({ category, unconfirmed }: { category: string | null; unconfirmed: boolean }) {
+  if (!category && !unconfirmed) return null;
+  const label = category ? ASSOCIATION_CATEGORY_LABELS[category as AssociationCategory] ?? category : "Employer unconfirmed";
+  return (
+    <Badge
+      variant="outline"
+      className={cn(
+        "text-[10px] font-normal",
+        unconfirmed ? "border-chart-4/50 text-chart-4" : "border-chart-2/50 text-chart-2",
+      )}
+      title={unconfirmed ? "The employer is claimed by the source row and was not verified" : "Employer supported by strong identity evidence"}
+    >
+      {label}
+    </Badge>
+  );
 }
 
 export default function CompanySearch() {
@@ -103,8 +141,14 @@ export default function CompanySearch() {
     resultBudget: 800,
     filters: state.filters,
   });
+  const contactQuery = useContactSearch({
+    query: state.mode === "companies" ? "" : state.q,
+    page: state.page,
+    pageSize: state.pageSize,
+  });
+  const suggestionQuery = state.mode === "contacts" ? "" : debouncedDraft.trim().length >= 2 && debouncedDraft !== state.q ? debouncedDraft : "";
   const suggestions = useCompanySearch({
-    query: debouncedDraft.trim().length >= 2 && debouncedDraft !== state.q ? debouncedDraft : "",
+    query: suggestionQuery,
     page: 1,
     pageSize: 6,
     sort: "relevance",
@@ -113,6 +157,11 @@ export default function CompanySearch() {
     resultBudget: 200,
     filters: {},
   });
+  const contactSuggestions = useContactSearch({
+    query: state.mode === "contacts" && debouncedDraft.trim().length >= 2 && debouncedDraft !== state.q ? debouncedDraft : "",
+    page: 1,
+    pageSize: 6,
+  });
 
   const datasetVersion = query.data?.datasetVersion ?? dataset.data?.activeVersion ?? "unknown";
 
@@ -120,6 +169,10 @@ export default function CompanySearch() {
     const next = new URLSearchParams(params);
     const merged = { ...state, ...patch };
     if (patch.q !== undefined) next.set("q", patch.q);
+    if (patch.mode !== undefined) {
+      next.set("type", patch.mode);
+      next.set("page", "1");
+    }
     if (patch.page !== undefined) next.set("page", String(patch.page));
     if (patch.pageSize !== undefined) {
       next.set("pageSize", String(patch.pageSize));
@@ -154,16 +207,31 @@ export default function CompanySearch() {
   }
 
   const activeFilterCount = Object.values(state.filters).filter(Boolean).length;
-  const hits = query.data?.hits ?? [];
+  const hits = state.mode === "contacts" ? [] : query.data?.hits ?? [];
+  const contactHits = state.mode === "companies" ? [] : contactQuery.data?.hits ?? [];
+  const suggestionHits = state.mode === "contacts" ? [] : suggestions.data?.hits ?? [];
+  const contactSuggestionHits = state.mode === "contacts" ? contactSuggestions.data?.hits ?? [] : [];
   const showSuggestions =
-    suggestOpen && debouncedDraft.trim().length >= 2 && debouncedDraft !== state.q && (suggestions.data?.hits.length ?? 0) > 0;
+    suggestOpen &&
+    debouncedDraft.trim().length >= 2 &&
+    debouncedDraft !== state.q &&
+    suggestionHits.length + contactSuggestionHits.length > 0;
+  const showContacts = state.mode !== "companies";
+  const showCompanies = state.mode !== "contacts";
+  const searching = state.mode === "contacts" ? contactQuery.isLoading : state.mode === "companies" ? query.isLoading : query.isLoading || contactQuery.isLoading;
+  const searchError = state.mode === "companies" ? query.error : state.mode === "contacts" ? contactQuery.error : query.error ?? contactQuery.error;
+  const resultsEmpty = hits.length === 0 && contactHits.length === 0;
+  const refetchBoth = () => {
+    if (showCompanies) void query.refetch();
+    if (showContacts) void contactQuery.refetch();
+  };
 
   return (
     <>
       <PageHeader
         eyebrow="Intelligence"
-        title="Company search"
-        description="Exact, partial and typo-tolerant matching across every company in the indexed dataset. Similar names stay separate — nothing is merged by similarity."
+        title="Search"
+        description="One box for both indexes: search companies, people, or everything at once. Matching is exact-first, then name variants, prefixes and bounded typo correction — the query you typed is never silently replaced, and similar names are never merged."
         actions={
           <>
             <Button
@@ -230,10 +298,36 @@ export default function CompanySearch() {
                 role="listbox"
                 className="surface-raised absolute left-0 right-0 top-[calc(100%+6px)] z-30 overflow-hidden p-1.5"
               >
-                {suggestions.isFetching ? (
+                {suggestions.isFetching || contactSuggestions.isFetching ? (
                   <p className="px-3 py-2 text-xs text-muted-foreground">Searching index…</p>
                 ) : (
-                  suggestions.data!.hits.map((hit) => (
+                  [
+                    ...contactSuggestionHits.map((hit) => (
+                      <button
+                        key={`c-${hit.id}`}
+                        type="button"
+                        role="option"
+                        aria-selected={false}
+                        className="flex w-full items-center gap-3 rounded-md px-3 py-2 text-left hover:bg-accent"
+                        onClick={() => {
+                          setDraft(hit.fullName);
+                          setSuggestOpen(false);
+                          update({ q: hit.fullName, page: 1 });
+                        }}
+                      >
+                        <UserRound className="size-3.5 shrink-0 text-muted-foreground" />
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-sm font-medium">{hit.fullName}</p>
+                          <p className="truncate text-[11px] text-muted-foreground">
+                            {[hit.title, hit.companyName].filter(Boolean).join(" · ") || "Person record"}
+                          </p>
+                        </div>
+                        <span className="tabular shrink-0 text-[11px] text-muted-foreground">{hit.relevance.toFixed(2)}</span>
+                      </button>
+                    )),
+                  ]
+                )}
+                {suggestionHits.map((hit) => (
                     <button
                       key={hit.id}
                       type="button"
@@ -254,8 +348,7 @@ export default function CompanySearch() {
                       </div>
                       <span className="tabular shrink-0 text-[11px] text-muted-foreground">{hit.relevance.toFixed(2)}</span>
                     </button>
-                  ))
-                )}
+                  ))}
               </div>
             ) : null}
           </div>
@@ -265,6 +358,32 @@ export default function CompanySearch() {
             Search
           </Button>
         </form>
+
+        <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-border/60 pt-4" role="group" aria-label="What to search">
+          {(
+            [
+              { value: "all", label: "All", icon: <Search className="size-3.5" /> },
+              { value: "companies", label: "Companies", icon: <Building2 className="size-3.5" /> },
+              { value: "contacts", label: "Contacts", icon: <Users className="size-3.5" /> },
+            ] as const
+          ).map((option) => (
+            <button
+              key={option.value}
+              type="button"
+              aria-pressed={state.mode === option.value}
+              onClick={() => update({ mode: option.value })}
+              className={cn(
+                "inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium transition-colors",
+                state.mode === option.value
+                  ? "border-primary/40 bg-primary/10 text-foreground"
+                  : "border-border text-muted-foreground hover:text-foreground",
+              )}
+            >
+              {option.icon}
+              {option.label}
+            </button>
+          ))}
+        </div>
 
         <div className="mt-4 flex flex-wrap items-center gap-x-6 gap-y-3 border-t border-border/60 pt-4">
           <div className="flex items-center gap-2">
@@ -319,6 +438,12 @@ export default function CompanySearch() {
               <p>{query.data.notice}</p>
             </div>
           ) : null}
+          {contactQuery.data?.notice ? (
+            <div className="flex items-start gap-2.5 rounded-lg border border-chart-3/40 bg-chart-3/[0.08] px-4 py-3 text-xs">
+              <span className="mt-0.5 size-1.5 shrink-0 rounded-full bg-chart-3" />
+              <p>{contactQuery.data.notice}</p>
+            </div>
+          ) : null}
 
           {datasetMode.mode === "no-dataset" && !datasetMode.isLoading ? (
             // Nothing is published, so there is nothing honest to search. This is a
@@ -340,32 +465,135 @@ export default function CompanySearch() {
                 </Button>
               }
             />
-          ) : query.isLoading ? (
-            <LoadingBlock label="Searching the index" rows={6} />
-          ) : query.error ? (
-            <ErrorBlock error={query.error as Error} onRetry={() => query.refetch()} />
+          ) : searching ? (
+            <LoadingBlock label={showContacts && !showCompanies ? "Searching the contact index" : "Searching the index"} rows={6} />
+          ) : searchError ? (
+            <ErrorBlock error={searchError as Error} onRetry={refetchBoth} />
           ) : !state.q ? (
             <EmptyState
               icon={<Search className="size-5" />}
-              title="Search the company index"
-              description="Start typing a company name. Matching is exact-first, then name variants, prefixes and finally bounded typo correction — the entered query is never silently replaced."
+              title="Search companies and people"
+              description="Start typing a company or a person's name. Matching is exact-first, then name variants, prefixes and finally bounded typo correction — the entered query is never silently replaced."
             />
-          ) : hits.length === 0 ? (
+          ) : resultsEmpty ? (
             <EmptyState
-              icon={<Building2 className="size-5" />}
-              title={`No companies matched “${state.q}”`}
-              description="Try fewer words, check the spelling of a distinctive word, or turn on fuzzy matching. Nothing outside the indexed dataset can be returned."
+              icon={<Search className="size-5" />}
+              title="No results"
+              description="We did not find anything related to this company or contact in our database."
             />
           ) : (
             <>
+              {showContacts && contactHits.length ? (
+                <section className="space-y-3">
+                  <div className="flex items-baseline justify-between gap-3">
+                    <h2 className="flex items-center gap-2 text-sm font-semibold">
+                      <Users className="size-4 text-muted-foreground" />
+                      People
+                    </h2>
+                    <p className="text-xs text-muted-foreground">
+                      {formatNumber(contactQuery.data?.matchedIds ?? contactHits.length)} matched · {contactQuery.data?.tookMs ?? 0} ms
+                    </p>
+                  </div>
+                  <ul className="surface divide-y divide-border/60 overflow-hidden">
+                    {contactHits.map((hit) => (
+                      <li
+                        key={hit.id}
+                        className="flex flex-col gap-3 px-5 py-4 transition-colors hover:bg-muted/35 sm:flex-row sm:items-center"
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <Link to={`/contacts/${hit.id}`} className="truncate text-sm font-semibold hover:text-primary">
+                              {hit.fullName || "Unnamed contact"}
+                            </Link>
+                            <AssociationBadge category={hit.association} unconfirmed={hit.employerUnconfirmed} />
+                          </div>
+                          <p className="mt-1 truncate text-xs text-muted-foreground">
+                            {[hit.title ?? hit.designation, hit.companyName].filter(Boolean).join(" · ") || "No role or employer in the source row"}
+                          </p>
+                          <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
+                            {hit.email ? (
+                              <span className="inline-flex items-center gap-1.5">
+                                <Mail className="size-3" />
+                                {hit.email}
+                              </span>
+                            ) : null}
+                            {[hit.city, hit.country].filter(Boolean).length ? (
+                              <span className="inline-flex items-center gap-1.5">
+                                <MapPin className="size-3" />
+                                {[hit.city, hit.country].filter(Boolean).join(", ")}
+                              </span>
+                            ) : null}
+                          </div>
+                        </div>
+                        <div className="flex shrink-0 items-center gap-1.5">
+                          {hit.email ? (
+                            <Button
+                              variant="ghost"
+                              size="icon-sm"
+                              title={`Copy ${hit.email}`}
+                              aria-label={`Copy email ${hit.email}`}
+                              onClick={() => void navigator.clipboard?.writeText(hit.email!)}
+                            >
+                              <Copy className="size-3.5" />
+                            </Button>
+                          ) : null}
+                          {hit.linkedinUrl ? (
+                            <Button variant="ghost" size="icon-sm" asChild title="Open LinkedIn profile">
+                              <a href={hit.linkedinUrl} target="_blank" rel="noreferrer noopener">
+                                <Linkedin className="size-3.5" />
+                              </a>
+                            </Button>
+                          ) : null}
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="gap-1.5"
+                            onClick={() =>
+                              saveLead.mutate({
+                                kind: "contact",
+                                targetId: hit.id,
+                                datasetVersion,
+                                snapshot: {
+                                  fullName: hit.fullName,
+                                  title: hit.title ?? null,
+                                  companyName: hit.companyName ?? null,
+                                  email: hit.email ?? null,
+                                },
+                              })
+                            }
+                          >
+                            <Star className="size-3.5" />
+                            Save
+                          </Button>
+                          <Button size="sm" asChild>
+                            <Link to={`/contacts/${hit.id}`}>View</Link>
+                          </Button>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                  <Pager
+                    page={contactQuery.data!.page.page}
+                    pageSize={contactQuery.data!.page.pageSize}
+                    total={contactQuery.data!.page.total}
+                    hasMore={contactQuery.data!.page.hasMore}
+                    totalIsLowerBound={contactQuery.data!.page.totalIsLowerBound}
+                    onPage={(page) => update({ page })}
+                    onPageSize={(pageSize) => update({ pageSize })}
+                  />
+                </section>
+              ) : null}
+
+              {showCompanies && hits.length ? (
               <div className="surface overflow-hidden">
                 <div className="flex items-center justify-between gap-3 border-b border-border/70 px-5 py-3">
+                  <h2 className="flex items-center gap-2 text-sm font-semibold">
+                    <Building2 className="size-4 text-muted-foreground" />
+                    Companies
+                  </h2>
                   <p className="text-xs text-muted-foreground">
-                    {query.data?.retrieval.scored ?? 0} candidates scored · {query.data?.tookMs ?? 0} ms · dataset{" "}
-                    {query.data?.datasetVersion}
-                  </p>
-                  <p className="tabular hidden text-xs text-muted-foreground sm:block">
-                    {formatNumber(query.data?.page.total ?? 0)} ranked results
+                    {query.data?.retrieval.scored ?? 0} candidates scored · {query.data?.tookMs ?? 0} ms ·{" "}
+                    {formatNumber(query.data?.page.total ?? 0)} ranked
                   </p>
                 </div>
                 <ul className="divide-y divide-border/60">
@@ -452,16 +680,19 @@ export default function CompanySearch() {
                   ))}
                 </ul>
               </div>
+              ) : null}
 
-              <Pager
-                page={query.data!.page.page}
-                pageSize={query.data!.page.pageSize}
-                total={query.data!.page.total}
-                hasMore={query.data!.page.hasMore}
-                totalIsLowerBound={query.data!.page.totalIsLowerBound}
-                onPage={(page) => update({ page })}
-                onPageSize={(pageSize) => update({ pageSize })}
-              />
+              {showCompanies ? (
+                <Pager
+                  page={query.data!.page.page}
+                  pageSize={query.data!.page.pageSize}
+                  total={query.data!.page.total}
+                  hasMore={query.data!.page.hasMore}
+                  totalIsLowerBound={query.data!.page.totalIsLowerBound}
+                  onPage={(page) => update({ page })}
+                  onPageSize={(pageSize) => update({ pageSize })}
+                />
+              ) : null}
             </>
           )}
         </div>

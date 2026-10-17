@@ -18,6 +18,8 @@ import type {
   CompanySearchResponse,
   Contact,
   ContactPageResponse,
+  ContactSearchHit,
+  ContactSearchResponse,
   ContactSortField,
   DatasetSourcesResponse,
   DatasetStatusResponse,
@@ -26,6 +28,7 @@ import type {
   SavedLead,
   SavedSearch,
   SortOrder,
+  UnassignedContact,
   UnassignedContactsResponse,
   UserSettings,
 } from "@/shared/models";
@@ -33,7 +36,7 @@ import type { AssociationCategory } from "@/shared/association";
 import { DEFAULT_SETTINGS } from "@/shared/models";
 import { LEAD_STATUSES } from "@/shared/models";
 import { leadId } from "@/shared/hash";
-import { normalizeEmail } from "@/shared/normalize";
+import { normalizeEmail, normalizeQuery } from "@/shared/normalize";
 import { searchCompanies } from "@/shared/search/engine";
 import { LocalCandidateSource } from "@/shared/search/local-index";
 import { EXPORT_COLUMN_HEADERS, exportFilename, toCsv, type CsvColumn } from "@/shared/csv";
@@ -49,6 +52,7 @@ import type {
   ApiClient,
   CompanySearchParams,
   ContactQueryParams,
+  ContactSearchParams,
   HealthResponse,
   LeadListResponse,
   SaveLeadInput,
@@ -264,6 +268,83 @@ export class LocalApiClient implements ApiClient {
       ? params.companyIds.flatMap((id) => this.dataset.contactsByCompany.get(id) ?? [])
       : this.dataset.contacts;
     return this.paginateContacts(pool, params.companyId ?? null, params);
+  }
+
+  /**
+   * Person search over the in-memory sample dataset.
+   *
+   * The sample dataset is small enough to scan, and that is deliberate: this
+   * adapter exists to keep the preview usable when no index is configured, and it
+   * labels its data `sample` so nothing here can be mistaken for a real hit. The
+   * production path (`WorkerApiClient.searchContacts`) goes through the sharded
+   * contact index instead.
+   */
+  async searchContacts(params: ContactSearchParams): Promise<ContactSearchResponse> {
+    const started = Date.now();
+    const normalized = normalizeQuery(params.query).replace(/\s+/g, " ").trim();
+    const pageSize = Math.min(Math.max(params.pageSize ?? DEFAULT_PAGE_SIZE, 1), MAX_PAGE_SIZE);
+    const page = Math.max(params.page ?? 1, 1);
+
+    const pool: Contact[] = [...this.dataset.contacts];
+    for (const group of this.dataset.unassignedByCompany.values()) pool.push(...group);
+
+    const ranked: { contact: Contact; score: number; matched: string[] }[] = [];
+    for (const contact of pool) {
+      const key = normalizeQuery(contact.fullName ?? "").replace(/\s+/g, " ").trim();
+      if (!key) continue;
+      const terms = normalized.split(" ").filter(Boolean);
+      const keyTokens = key.split(" ").filter(Boolean);
+      const matched = terms.filter((term) => keyTokens.some((token) => token.startsWith(term)));
+      if (!matched.length) continue;
+      let score = 300 * (matched.length / terms.length);
+      if (key === normalized) score += 1000;
+      else if (key.startsWith(normalized)) score += 400;
+      ranked.push({ contact, score, matched });
+    }
+    ranked.sort((a, b) => b.score - a.score || a.contact.fullName.localeCompare(b.contact.fullName));
+
+    const start = (page - 1) * pageSize;
+    const hits: ContactSearchHit[] = ranked.slice(start, start + pageSize).map(({ contact, score, matched }) => {
+      const company = contact.companyId ? this.companyById.get(contact.companyId) : undefined;
+      const claimed = (contact as Partial<UnassignedContact>).claimedCompanyName ?? null;
+      const association = contact.association?.category ?? (company ? null : "unresolved");
+      return {
+        id: contact.id,
+        fullName: contact.fullName,
+        firstName: contact.firstName ?? null,
+        lastName: contact.lastName ?? null,
+        title: contact.title ?? null,
+        designation: contact.designation ?? null,
+        seniority: contact.seniority ?? null,
+        department: contact.department ?? null,
+        email: contact.email ?? null,
+        phone: contact.phone ?? null,
+        linkedinUrl: contact.linkedinUrl ?? null,
+        country: contact.country ?? null,
+        city: contact.city ?? null,
+        companyId: company?.id ?? null,
+        companyName: company?.name ?? claimed,
+        association,
+        // Only `high_confidence` evidence counts as a confirmed employer; anything
+        // else (including a v2 index with no category) is shown as unconfirmed.
+        employerUnconfirmed: association !== "high_confidence",
+        relevance: score,
+        matchedTerms: matched,
+      };
+    });
+
+    return {
+      query: params.query,
+      normalizedQuery: normalized,
+      correctedQuery: null,
+      notice: hits.length ? null : "We did not find anything related to this company or contact in our database.",
+      hits,
+      matchedIds: ranked.length,
+      notHydrated: 0,
+      page: { page, pageSize, total: ranked.length, totalIsLowerBound: false, hasMore: start + pageSize < ranked.length },
+      datasetVersion: SAMPLE_DATASET_VERSION,
+      tookMs: Date.now() - started,
+    };
   }
 
   /**

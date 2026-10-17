@@ -110,11 +110,46 @@ export const SHARDING = {
   maxPrefixLength: 12,
 } as const;
 
-export type IndexKind = "exact" | "prefix" | "token" | "trigram" | "ids" | "stats";
+/**
+ * Index objects the reader can fetch.
+ *
+ * The three `contact*` kinds are the person-name index: the company index is keyed
+ * by document ref, but contacts are stored per company, so their postings carry a
+ * contact id and are hydrated through the `ids` index (which maps a contact id to
+ * the company ref that owns it). They are additive — an index built before they
+ * existed has no `shards.contactIndex` and the API answers with an honest
+ * "contact search not indexed" instead of pretending to search.
+ */
+export type IndexKind =
+  | "exact"
+  | "prefix"
+  | "token"
+  | "trigram"
+  | "ids"
+  | "stats"
+  | "contactToken"
+  | "contactPrefix"
+  | "contactTrigram";
 
 /** Shard count for a given index kind (recorded in the directory). */
-export function shardCountFor(directory: { shards: Record<string, number> }, kind: Exclude<IndexKind, "stats">): number {
-  return directory.shards[kind] ?? 1;
+export function shardCountFor(directory: { shards: Record<string, unknown> }, kind: Exclude<IndexKind, "stats">): number {
+  const value = directory.shards[kind];
+  return typeof value === "number" && value > 0 ? value : 1;
+}
+
+/**
+ * Shard counts of the contact name index, or `null` when the version has none.
+ *
+ * Callers must treat `null` as "this version cannot answer a global contact
+ * search" and say so — returning zero hits would claim the person is absent from
+ * the database when the index simply never looked.
+ */
+export function contactShardCounts(
+  directory: IndexDirectory,
+): { token: number; prefix: number; trigram: number } | null {
+  const counts = directory.shards.contactIndex;
+  if (!counts || !counts.token || !counts.prefix || !counts.trigram) return null;
+  return counts;
 }
 
 export function manifestKey(version: string): string {
@@ -252,6 +287,16 @@ export interface IndexDirectory {
     companyPartitions: number;
     contactPartitions: number;
     /**
+     * Contact name index shard counts. Absent on an index whose run did not build
+     * one (every index built before contact search existed), which the API
+     * reports as "contact search is not indexed" rather than an empty result.
+     */
+    contactIndex?: {
+      token: number;
+      prefix: number;
+      trigram: number;
+    };
+    /**
      * Spool partitions the Pass 1 run used (format v3). Required to locate an
      * `unassigned/` object; absent on v2 indexes, which have none.
      */
@@ -314,6 +359,37 @@ export interface Postings {
 /** Shard payload: term → postings (terms are the shard's own key space). */
 export interface ShardPayload {
   terms: Record<string, Postings>;
+}
+
+/**
+ * Postings of the contact name index: contact ids, not document refs.
+ *
+ * A contact is stored inside its company's contact object, so its postings point
+ * at `p_…` ids and hydration resolves the owning company through the `ids` index.
+ * `q` is the same prominence byte the company index uses, pre-ranking candidates
+ * before any contact object is read.
+ */
+export interface ContactPostings {
+  ids: string[];
+  q?: number[];
+  df?: number;
+}
+
+export interface ContactShardPayload {
+  terms: Record<string, ContactPostings>;
+}
+
+/** The three shard kinds of the contact name index. */
+export type ContactShardKind = "contactToken" | "contactPrefix" | "contactTrigram";
+
+/** Postings for one contact-name term, or `undefined` (own-property lookup). */
+export function contactPostingsFor(
+  payload: ContactShardPayload | null | undefined,
+  term: string,
+): ContactPostings | undefined {
+  const terms = payload?.terms;
+  if (!terms || !Object.prototype.hasOwnProperty.call(terms, term)) return undefined;
+  return terms[term];
 }
 
 /**

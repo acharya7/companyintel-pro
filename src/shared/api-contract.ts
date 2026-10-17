@@ -324,6 +324,12 @@ export const companySchema = z.object({
   sources: z.array(sourceRefSchema),
   ambiguous: z.boolean().optional(),
   associations: associationCountsSchema.optional(),
+  /**
+   * Unmapped source columns, verbatim. Part of the contract on purpose: the
+   * response is parsed with Zod, which strips unknown keys, so a field the client
+   * is meant to display has to be declared here or it silently disappears.
+   */
+  attributes: z.record(z.string(), z.string()).optional(),
 });
 
 export const contactSchema = z.object({
@@ -342,6 +348,8 @@ export const contactSchema = z.object({
   country: z.string().optional(),
   state: z.string().optional(),
   city: z.string().optional(),
+  /** Unmapped source columns, verbatim (see `companySchema.attributes`). */
+  attributes: z.record(z.string(), z.string()).optional(),
   source: sourceRefSchema,
   association: associationRecordSchema.optional(),
 });
@@ -379,6 +387,49 @@ export const companySearchHitSchema = z.object({
   revenue: z.string().optional(),
   contactCount: z.number().int(),
   multiSource: z.boolean(),
+});
+
+/** Person-search request: one query, one page. Mirrors the company request. */
+export const contactSearchRequestSchema = z.object({
+  q: z.string().min(1, "Enter a name to search for.").max(200),
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(25),
+});
+
+/** One person result, with the employer evidence it was hydrated with. */
+export const contactSearchHitSchema = z.object({
+  id: z.string(),
+  fullName: z.string(),
+  firstName: z.string().nullable(),
+  lastName: z.string().nullable(),
+  title: z.string().nullable(),
+  designation: z.string().nullable(),
+  seniority: z.string().nullable(),
+  department: z.string().nullable(),
+  email: z.string().nullable(),
+  phone: z.string().nullable(),
+  linkedinUrl: z.string().nullable(),
+  country: z.string().nullable(),
+  city: z.string().nullable(),
+  companyId: z.string().nullable(),
+  companyName: z.string().nullable(),
+  association: z.string().nullable(),
+  employerUnconfirmed: z.boolean(),
+  relevance: z.number(),
+  matchedTerms: z.array(z.string()),
+});
+
+export const contactSearchResponseSchema = z.object({
+  query: z.string(),
+  normalizedQuery: z.string(),
+  correctedQuery: z.string().nullable(),
+  notice: z.string().nullable(),
+  hits: z.array(contactSearchHitSchema),
+  matchedIds: z.number().int(),
+  notHydrated: z.number().int(),
+  page: pageInfoSchema,
+  datasetVersion: z.string(),
+  tookMs: z.number(),
 });
 
 export const companySearchResponseSchema = z.object({
@@ -455,6 +506,8 @@ export const unassignedContactsResponseSchema = z.object({
 export const contactDetailResponseSchema = z.object({
   contact: contactSchema,
   company: companySchema.nullable(),
+  /** True when the contact is preserved without an employer (format v3+). */
+  unassigned: z.boolean().optional(),
   datasetVersion: z.string(),
 });
 

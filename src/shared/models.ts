@@ -70,6 +70,16 @@ export interface Company {
    * object instead of reading every contact row for the company.
    */
   facets?: CompanyFacets;
+  /**
+   * Source columns that are not part of the canonical model, kept verbatim.
+   *
+   * The canonical fields are what the application searches, filters and ranks on;
+   * everything else the source row carried lives here, so a record detail view can
+   * show ALL of its attributes instead of a curated subset (§ 11 of the
+   * specification). The indexer bounds the count and each value's length
+   * (`MAX_CAPTURED_FIELDS` / `MAX_CAPTURED_VALUE_LENGTH` in `mapping.ts`).
+   */
+  attributes?: Record<string, string>;
 }
 
 /** Attached-contact split by association category (see `association.ts`). */
@@ -109,6 +119,8 @@ export interface Contact {
   country?: string;
   state?: string;
   city?: string;
+  /** Every other column of the source row, kept verbatim (see `Company.attributes`). */
+  attributes?: Record<string, string>;
   source: SourceRef;
   /**
    * Why this contact is attached to `companyId`, with the evidence behind it.
@@ -191,6 +203,51 @@ export interface CompanySearchHit {
   contactCount: number;
   /** True when strong identity evidence merged rows from more than one file. */
   multiSource: boolean;
+}
+
+/**
+ * One person result from the global contact search.
+ *
+ * Carries the employer *and* how confident that employer is (`association`,
+ * `employerUnconfirmed`), because a contact whose company could not be justified
+ * must still be returned — with the uncertainty visible rather than hidden.
+ */
+export interface ContactSearchHit {
+  id: string;
+  fullName: string;
+  firstName: string | null;
+  lastName: string | null;
+  title: string | null;
+  designation: string | null;
+  seniority: string | null;
+  department: string | null;
+  email: string | null;
+  phone: string | null;
+  linkedinUrl: string | null;
+  country: string | null;
+  city: string | null;
+  companyId: string | null;
+  companyName: string | null;
+  /** Association category, or `"unresolved"` for a preserved contact. */
+  association: string | null;
+  employerUnconfirmed: boolean;
+  relevance: number;
+  matchedTerms: string[];
+}
+
+export interface ContactSearchResponse {
+  query: string;
+  normalizedQuery: string;
+  correctedQuery: string | null;
+  notice: string | null;
+  hits: ContactSearchHit[];
+  /** Contact ids the index matched, before hydration (a lower bound on hits). */
+  matchedIds: number;
+  /** Candidates the hydration budget could not read. */
+  notHydrated: number;
+  page: PageInfo;
+  datasetVersion: string;
+  tookMs: number;
 }
 
 export interface PageInfo {

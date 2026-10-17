@@ -15,6 +15,7 @@ import {
   companyFiltersSchema,
   companySearchRequestSchema,
   contactFiltersSchema,
+  contactSearchRequestSchema,
   datasetActivateRequestSchema,
   exportRequestSchema,
   parseAssociationFilter,
@@ -25,6 +26,8 @@ import {
   updateLeadRequestSchema,
 } from "../../src/shared/api-contract";
 import { associationMatchesFilter, type AssociationCategory } from "../../src/shared/association";
+import { loadContactById, searchContacts } from "./contact-search";
+import { normalizeQuery } from "../../src/shared/normalize";
 import { spoolPartitionOfNormalizedName, type IndexDirectory } from "../../src/shared/search/index-format";
 import { DEFAULT_SETTINGS, LEAD_STATUSES } from "../../src/shared/models";
 import type {
@@ -584,6 +587,57 @@ app.get("/api/companies/:id/unassigned", async (c) => {
   return c.json(response);
 });
 
+/**
+ * Global person search across the contact name index.
+ *
+ * Separate from `/api/contacts` (which lists the contacts OF given companies) so a
+ * person search can never be answered by a listing that never looked at the index:
+ * when the active version has no contact index this route says exactly that, and a
+ * search that does run reports how many ids matched before hydration.
+ *
+ * Cost: one shard read per distinct term (deduplicated, so "john smith" and "john
+ * smyth" that land in the same shard cost one GET), one ids read per distinct id
+ * shard, and at most `MAX_CONTACT_PARTS` contact objects — the same shape of budget
+ * the company search runs under, and the same isolate cache serves both.
+ */
+app.get("/api/contacts/search", async (c) => {
+  const query = Object.fromEntries(new URL(c.req.url).searchParams.entries());
+  const parsed = contactSearchRequestSchema.parse(query);
+  const dataset = await datasetFor(c);
+  const result = await searchContacts(dataset.store, dataset.directory, {
+    query: parsed.q,
+    pageSize: parsed.pageSize,
+    skip: (parsed.page - 1) * parsed.pageSize,
+  });
+  if (!result) {
+    throw new HttpError(
+      400,
+      "invalid_request",
+      `Dataset ${dataset.version} has no contact name index, so a global person search cannot run. Rebuild the index with this version of the indexer (it writes contactToken/contactPrefix/contactTrigram shards) or search inside a company.`,
+    );
+  }
+  return c.json({
+    query: parsed.q,
+    normalizedQuery: normalizeQuery(parsed.q),
+    correctedQuery: result.correctedQuery,
+    notice:
+      result.notice ??
+      (result.hits.length ? null : "We did not find anything related to this company or contact in our database."),
+    hits: result.hits,
+    matchedIds: result.matched,
+    notHydrated: result.notHydrated,
+    page: {
+      page: parsed.page,
+      pageSize: parsed.pageSize,
+      total: result.matched,
+      totalIsLowerBound: result.notHydrated > 0,
+      hasMore: (parsed.page - 1) * parsed.pageSize + result.hits.length < result.matched,
+    },
+    datasetVersion: dataset.version,
+    tookMs: result.tookMs,
+  });
+});
+
 app.get("/api/contacts", async (c) => {
   const dataset = await datasetFor(c);
   const query = Object.fromEntries(new URL(c.req.url).searchParams.entries());
@@ -595,7 +649,7 @@ app.get("/api/contacts", async (c) => {
     throw new HttpError(
       400,
       "invalid_request",
-      "Global contact listing across the whole dataset requires a dedicated contact index, which is not enabled. Pass companyIds (max 50) to list contacts for specific companies.",
+      "Listing contacts across the whole dataset needs companyIds. Use /api/contacts/search?q= to search for a person by name.",
     );
   }
   if (companyIds.length > MAX_CONTACT_COMPANIES) {
@@ -619,14 +673,12 @@ app.get("/api/contacts/:id", async (c) => {
   const contactIdParam = c.req.param("id");
   // Contact ids are hashed from the company ref, so the company is discoverable
   // only through the index: walk the id index for the owning company instead of
-  // scanning contact partitions.
-  const ref = await dataset.source.refForContactId(contactIdParam);
-  if (ref === null) throw new HttpError(404, "not_found", "Contact is not part of the active dataset.");
-  const contacts = await dataset.store.getContactsByCompanyRef(dataset.version, ref);
-  const contact = contacts.find((item) => item.id === contactIdParam);
-  if (!contact) throw new HttpError(404, "not_found", "Contact record could not be read.");
-  const company = await dataset.store.getCompanyByRef(dataset.version, ref);
-  return c.json({ contact, company, datasetVersion: dataset.version });
+  // scanning contact partitions. `loadContactById` also resolves a preserved
+  // contact, whose id index ref points at the `unassigned/` object holding it — a
+  // person kept without an employer must open like any other record.
+  const found = await loadContactById(dataset.store, dataset.directory, contactIdParam);
+  if (!found.contact) throw new HttpError(404, "not_found", "Contact is not part of the active dataset.");
+  return c.json({ contact: found.contact, company: found.company, unassigned: found.unassigned, datasetVersion: dataset.version });
 });
 
 /* -------------------------------- leads ---------------------------------- */

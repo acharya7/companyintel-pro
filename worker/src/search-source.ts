@@ -39,7 +39,15 @@ import { SHARDING, partitionOfRef, postingsFor, type IndexDirectory, type IndexK
 import { shardOf } from "../../src/shared/hash";
 import { R2Store, mapLimit } from "./store";
 
-type RetrievalKind = Exclude<IndexKind, "stats">;
+/**
+ * Retrieval stages of the COMPANY index.
+ *
+ * Spelled out rather than `Exclude<IndexKind, "stats">` because `IndexKind` also
+ * carries the contact name kinds, which index contact ids and are read by
+ * `contact-search.ts` — a company source that accepted them would look postings up
+ * in the wrong key space.
+ */
+type RetrievalKind = "exact" | "prefix" | "token" | "trigram" | "ids";
 
 /** Stage weights: an exact hit always outranks a trigram hit. */
 const STAGE_WEIGHT: Record<RetrievalKind, number> = {

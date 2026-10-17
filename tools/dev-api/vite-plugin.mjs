@@ -224,14 +224,21 @@ export function companyIntelDevApi(options = {}) {
        * the *old* module objects; without this, a fix to `r2.ts` looks like it did
        * nothing until the whole dev server happens to restart.
        */
-      const watched = [
-        resolve(root, "tools/indexer/src/r2.ts"),
-        resolve(root, "tools/dev-api/dev-bucket.mjs"),
-        resolve(root, "tools/dev-api/vite-plugin.mjs"),
-      ].filter((file) => existsSync(file));
-      server.watcher.add(watched);
+      /*
+       * Any module the handler was built from. The Worker routes, the shared
+       * search/index code and the R2 client all load through Vite's SSR module
+       * runner, and the handler closure keeps the OLD module objects alive — so an
+       * edit to `worker/src/app.ts` would otherwise look like it did nothing until
+       * the dev server happened to restart.
+       */
+      const watchedDirs = [
+        resolve(root, "worker/src"),
+        resolve(root, "src/shared"),
+        resolve(root, "tools/indexer/src"),
+        resolve(root, "tools/dev-api"),
+      ].filter((dir) => existsSync(dir));
       const invalidate = (file) => {
-        if (!watched.includes(file)) return;
+        if (!watchedDirs.some((dir) => file.startsWith(dir))) return;
         handler = null;
         failure = null;
       };

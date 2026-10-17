@@ -23,6 +23,12 @@
  * Everything else (reads of `companies/`, `contacts/`, `indexes/`, `unassigned/`,
  * `manifests/<version>/…`, the bounded `raw/` listing) is served straight from the
  * bucket, so search results and record details are the real ones.
+ *
+ * That includes the contact name index (`indexes/<version>/contactToken`,
+ * `contactPrefix`, `contactTrigram`), so a person search in the preview reads the
+ * same shards a deployed Worker would — and a preserved contact is opened through
+ * its `unassigned/` object using the negative ref the ids index records for it
+ * (see `worker/src/contact-search.ts`).
  */
 
 /** Keys the development server is allowed to write, and how they are stored. */

@@ -29,6 +29,7 @@ export const queryKeys = {
   companyUnassigned: (id: string, params: unknown) => ["company-unassigned", id, params] as const,
   contacts: (params: unknown) => ["contacts", params] as const,
   contact: (id: string) => ["contact", id] as const,
+  contactSearch: (params: unknown) => ["contact-search", params] as const,
   leads: ["leads"] as const,
   savedSearches: ["saved-searches"] as const,
   settings: ["settings"] as const,
@@ -148,6 +149,24 @@ export function useCompanySearch(params: CompanySearchQuery) {
       }),
     enabled: params.query.trim().length > 0,
     // Keep the previous page visible while the next one loads.
+    placeholderData: keepPreviousData,
+    staleTime: 5 * 60_000,
+  });
+}
+
+/**
+ * Global person search (`/api/contacts/search`).
+ *
+ * Disabled while the query is empty, and it keeps the previous page visible while
+ * the next one loads, exactly like company search. An index without a contact
+ * index answers an error, which the page shows verbatim rather than as "no
+ * results" — the two are very different claims.
+ */
+export function useContactSearch(params: { query: string; page: number; pageSize: number }) {
+  return useQuery({
+    queryKey: queryKeys.contactSearch(params),
+    queryFn: () => api.searchContacts(params),
+    enabled: params.query.trim().length > 0,
     placeholderData: keepPreviousData,
     staleTime: 5 * 60_000,
   });

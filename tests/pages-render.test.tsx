@@ -218,7 +218,11 @@ describe("pages render without a missing API method", () => {
 
   test("Company search renders without a query and without a dataset status", async () => {
     const html = await renderPage(<CompanySearch />, { path: "/companies" });
-    expect(html).toContain("Search the company index");
+    // The empty state names both indexes: one box searches companies and people.
+    expect(html).toContain("Search companies and people");
+    // …and the source selector is present, with "All" selected by default.
+    expect(html).toContain("What to search");
+    expect(html).toContain("aria-pressed=\"true\"");
   });
 });
 

@@ -9,6 +9,7 @@ import type {
   Contact,
   ContactFilters,
   ContactPageResponse,
+  ContactSearchResponse,
   ContactSortField,
   DatasetSourcesResponse,
   DatasetStatusResponse,
@@ -32,6 +33,13 @@ export interface CompanySearchParams {
   fuzzy?: boolean;
   resultBudget?: number;
   filters?: CompanyFilters;
+}
+
+/** Parameters of the global person search (`/api/contacts/search`). */
+export interface ContactSearchParams {
+  query: string;
+  page?: number;
+  pageSize?: number;
 }
 
 export interface ContactQueryParams {
@@ -113,6 +121,8 @@ export interface ApiClient {
    */
   getCompanyUnassigned(companyId: string, params?: UnassignedQueryParams): Promise<UnassignedContactsResponse>;
   listContacts(params?: ContactQueryParams): Promise<ContactPageResponse>;
+  /** Search every person in the dataset by name (contact index). */
+  searchContacts(params: ContactSearchParams): Promise<ContactSearchResponse>;
   getContact(id: string): Promise<{ contact: Contact; companyName: string | null; companyId: string | null }>;
 
   listLeads(): Promise<LeadListResponse>;
@@ -158,6 +168,7 @@ export const API_CLIENT_METHODS = [
   "getCompanyContacts",
   "getCompanyUnassigned",
   "listContacts",
+  "searchContacts",
   "getContact",
   "listLeads",
   "saveLead",

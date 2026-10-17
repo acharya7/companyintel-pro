@@ -15,6 +15,7 @@ const Dashboard = lazy(() => import("./pages/Dashboard.tsx"));
 const CompanySearch = lazy(() => import("./pages/CompanySearch.tsx"));
 const CompanyDetails = lazy(() => import("./pages/CompanyDetails.tsx"));
 const Contacts = lazy(() => import("./pages/Contacts.tsx"));
+const ContactDetails = lazy(() => import("./pages/ContactDetails.tsx"));
 const SavedLeads = lazy(() => import("./pages/SavedLeads.tsx"));
 const SavedSearches = lazy(() => import("./pages/SavedSearches.tsx"));
 const Exports = lazy(() => import("./pages/Exports.tsx"));
@@ -129,6 +130,7 @@ createRoot(document.getElementById("root")!).render(
                   <Route path="/companies" element={<CompanySearch />} />
                   <Route path="/companies/:companyId" element={<CompanyDetails />} />
                   <Route path="/contacts" element={<Contacts />} />
+                  <Route path="/contacts/:contactId" element={<ContactDetails />} />
                   <Route path="/leads" element={<SavedLeads />} />
                   <Route path="/saved-searches" element={<SavedSearches />} />
                   <Route path="/exports" element={<Exports />} />

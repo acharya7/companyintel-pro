@@ -158,7 +158,14 @@ export class R2Client {
    * Worker never lists the bucket except for the bounded `raw/` page listing.
    */
   async list(prefix: string, maxKeys = 50): Promise<{ key: string; size: number; lastModified: string | null }[]> {
-    return (await this.listPage(prefix, maxKeys)).objects;
+    // Projected onto the documented shape: callers that want the ETag or the
+    // continuation token use `listPage` directly, and returning a wider object here
+    // would silently change what every existing caller receives.
+    return (await this.listPage(prefix, maxKeys)).objects.map((object) => ({
+      key: object.key,
+      size: object.size,
+      lastModified: object.lastModified,
+    }));
   }
 
   /**

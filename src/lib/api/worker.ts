@@ -18,6 +18,7 @@ import {
   companySearchResponseSchema,
   contactDetailResponseSchema,
   contactPageResponseSchema,
+  contactSearchResponseSchema,
   datasetSourcesResponseSchema,
   datasetStatusResponseSchema,
   datasetValidationResponseSchema,
@@ -34,6 +35,7 @@ import type {
   ApiClient,
   CompanySearchParams,
   ContactQueryParams,
+  ContactSearchParams,
   HealthResponse,
   LeadListResponse,
   SaveLeadInput,
@@ -220,6 +222,20 @@ export class WorkerApiClient implements ApiClient {
         // the same way), and the server re-validates every name.
         category: params.category?.length ? params.category.join(",") : undefined,
       },
+    });
+  }
+
+  /**
+   * Global person search: the whole contact index, not a company's contacts.
+   *
+   * A version without a contact index answers 400 with the reason, which surfaces
+   * here as an `ApiRequestError` the page shows verbatim — the search never
+   * degrades into an empty result that would read as "this person is not in the
+   * database".
+   */
+  searchContacts(params: ContactSearchParams) {
+    return this.request("/api/contacts/search", contactSearchResponseSchema, {
+      query: { q: params.query, page: params.page, pageSize: params.pageSize },
     });
   }
 

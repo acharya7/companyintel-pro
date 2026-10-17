@@ -1,0 +1,14 @@
+{
+  "version": "dev-r2-20k-full-20261017",
+  "passed": true,
+  "checkedAt": "2026-10-17T08:21:37.772Z",
+  "verifiedObjects": 489,
+  "missingObjects": [],
+  "issues": [
+    {
+      "severity": "info",
+      "code": "row_sample",
+      "message": "39505 rows read, 1376 rejected."
+    }
+  ]
+}

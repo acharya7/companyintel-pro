@@ -30,7 +30,7 @@ import { gzipSync } from "node:zlib";
 
 import type { AssociationCounts, Company, Contact, DatasetStats, DatasetVersionSummary, FacetBucket, IndexingCounters, SourceRef, UnassignedContact } from "../../../src/shared/models";
 import { NO_CLAIM_REF, associateContact, type AssociationCandidate, type AssociationRecord } from "../../../src/shared/association";
-import { NORMALIZER_VERSION, normalizeAttribute, normalizeDomain } from "../../../src/shared/normalize";
+import { NORMALIZER_VERSION, normalizeAttribute, normalizeDomain, normalizeQuery } from "../../../src/shared/normalize";
 import {
   INDEX_FORMAT_VERSION,
   SHARDING,
@@ -40,6 +40,8 @@ import {
   type CompanyPartitionPayload,
   type ContactPartitionPayload,
   type IndexDirectory,
+  type ContactPostings,
+  type ContactShardPayload,
   type Postings,
   type ShardPayload,
   type UnassignedPartitionPayload,
@@ -50,6 +52,8 @@ import {
   ALL_CANONICAL_FIELDS,
   CompanyResolver,
   buildColumnMap,
+  capturedColumns,
+  type CapturedColumn,
   buildCompany,
   buildContact,
   companyKeysFromInput,
@@ -594,10 +598,28 @@ async function freeDiskBytesFor(path: string): Promise<number | null> {
 /* Shard writing                                                              */
 /* -------------------------------------------------------------------------- */
 
-type ShardKind = "exact" | "prefix" | "token" | "trigram" | "ids";
+type ShardKind = "exact" | "prefix" | "token" | "trigram" | "ids" | "contactToken" | "contactPrefix" | "contactTrigram";
 
-const SHARD_KINDS: ShardKind[] = ["exact", "prefix", "token", "trigram", "ids"];
-const SHARD_KIND_INDEX: Record<ShardKind, number> = { exact: 0, prefix: 1, token: 2, trigram: 3, ids: 4 };
+const SHARD_KINDS: ShardKind[] = [
+  "exact",
+  "prefix",
+  "token",
+  "trigram",
+  "ids",
+  "contactToken",
+  "contactPrefix",
+  "contactTrigram",
+];
+const SHARD_KIND_INDEX: Record<ShardKind, number> = {
+  exact: 0,
+  prefix: 1,
+  token: 2,
+  trigram: 3,
+  ids: 4,
+  contactToken: 5,
+  contactPrefix: 6,
+  contactTrigram: 7,
+};
 /** Room for every shard number under one kind; keys stay small integers. */
 const SHARD_KEY_STRIDE = 1 << 20;
 
@@ -681,6 +703,21 @@ class ShardWriter {
    * an `await` per posting cost a microtask hop per posting on top of the I/O.
    */
   write(kind: ShardKind, shard: number, term: string, ref: number, quality: number): void {
+    this.push(kind, shard, `${escapeTerminators(term)}\u0001${ref}\u0001${quality}`);
+  }
+
+  /**
+   * Buffer one posting of the contact name index.
+   *
+   * Same file format as a company posting (`term␁target␁quality`) but the target is
+   * a `p_…` contact id instead of a document ref, because a contact's position is
+   * not derivable from its id: it lives inside its company's contact object.
+   */
+  writeContact(kind: ShardKind, shard: number, term: string, contactId: string, quality: number): void {
+    this.push(kind, shard, `${escapeTerminators(term)}\u0001${contactId}\u0001${quality}`);
+  }
+
+  private push(kind: ShardKind, shard: number, record: string): void {
     const key = SHARD_KIND_INDEX[kind] * SHARD_KEY_STRIDE + shard;
     let group = this.groups.get(key);
     if (!group) {
@@ -690,7 +727,7 @@ class ShardWriter {
     // `escapeTerminators` keeps U+2028/U+2029 out of the record for the same
     // reason `encodeJsonlLine` does for the spool: a term containing one used to
     // split the posting across two "lines" and lose it.
-    const line = `${escapeTerminators(term)}\u0001${ref}\u0001${quality}\n`;
+    const line = `${record}\n`;
     group.push(line);
     this.bufferedBytes += line.length;
     this.stats.appends += 1;
@@ -1195,6 +1232,14 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   const profilingStart = Date.now();
   const profiles: FileProfile[] = [];
   const columnMaps: Record<string, number>[] = [];
+  /**
+   * Unmapped columns of each source, in the file's own order.
+   *
+   * Recorded next to the column map because both are derived from the header row:
+   * the map says which columns the canonical model consumes, and this says which
+   * ones are carried verbatim on every record so no source field is lost.
+   */
+  const capturedBySource: CapturedColumn[][] = [];
   /*
    * A resumed run does not profile the sources, and that is not just a saving: the
    * column map exists to build the spool, and the spool is already built. Profiling
@@ -1226,6 +1271,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       }
     }
     columnMaps.push(map);
+    capturedBySource.push(capturedColumns(profile.headers, map));
     // Report the columns that are STILL unmapped after the config overrides were
     // applied, not the raw profiler view: the profiler cannot know about
     // `source.columns`, so printing its list would show a mapping as missing in a
@@ -1306,6 +1352,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     for (let sourceIndex = 0; sourceIndex < config.sources.length; sourceIndex += 1) {
       const source = config.sources[sourceIndex];
       const map = columnMaps[sourceIndex];
+      const captured = capturedBySource[sourceIndex] ?? [];
       let rows = 0;
       // The first record of each file is its header row, which was already read
       // by the profiler and must never be indexed as data.
@@ -1325,7 +1372,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
         counters.rowsRead += 1;
         counters.perSource[source.id].rowsRead += 1;
 
-        const companyInput = extractCompanyInput(record.fields, map);
+        const companyInput = extractCompanyInput(record.fields, map, captured);
         if (!companyInput) {
           counters.rowsRejected += 1;
           counters.perSource[source.id].rowsRejected += 1;
@@ -1339,7 +1386,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
           counters.recordsMissingCompanyId += 1;
         }
 
-        const contactInput = extractContactInput(record.fields, map);
+        const contactInput = extractContactInput(record.fields, map, captured);
         const keys = companyKeysFromInput(companyInput, source.id);
         // Partition by the normalized name, so a company row and the contact rows
         // that name it are resolved in the same partition (see mapping.ts).
@@ -1838,6 +1885,22 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       const payload: UnassignedPartitionPayload = { partition: entry.partition, contacts: unresolvedContacts };
       await writer.writeJson(unassignedPartitionKey(config.datasetVersion, entry.partition), payload);
       counters.unassignedObjects = (counters.unassignedObjects ?? 0) + 1;
+      for (const contact of unresolvedContacts) {
+        /*
+         * A preserved contact is indexed like any other person, and its id index
+         * posting points at NEGATIVE ref `-(partition + 1)`.
+         *
+         * The reader needs two facts to open a contact: which company owns it (a
+         * non-negative document ref) and, for one with no employer, which
+         * `unassigned/` object holds it. The object key is the Pass 1 partition of
+         * the name the row claimed, which is not derivable from the contact id — so
+         * the ids index carries it. A negative ref can never collide with a company
+         * ref (those start at 0), and older readers that only know about companies
+         * never see these postings.
+         */
+        shardWriter.write("ids", shardOf(contact.id, config.shards.ids), contact.id, -(entry.partition + 1), 255);
+        emitContactNamePostings(shardWriter, config.shards, contact);
+      }
     }
 
     // Emit companies in a deterministic order so refs stay reproducible.
@@ -1941,6 +2004,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       shardWriter.write("ids", shardOf(company.id, config.shards.ids), company.id, globalRef, 255);
       for (const contact of contacts) {
         shardWriter.write("ids", shardOf(contact.id, config.shards.ids), contact.id, globalRef, 255);
+        emitContactNamePostings(shardWriter, config.shards, contact);
       }
 
       // Record where this object starts: the reader hydrates a candidate with
@@ -2081,11 +2145,55 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     }
   };
 
+  /*
+   * Contact name shards: same line format, but the target is a contact id.
+   *
+   * A malformed line is a hard error for the same reason it is for a company
+   * shard: silently dropping it would make a person unfindable while the index
+   * still claims to cover every contact.
+   */
+  const indexContactShard = async (kind: ShardKind, shards: number) => {
+    for (let shard = 0; shard < shards; shard += 1) {
+      const linesPath = join(shardDir, `${kind}/${String(shard).padStart(4, "0")}.lines`);
+      if (!existsSync(linesPath)) continue;
+      const terms = Object.create(null) as Record<string, ContactPostings>;
+      const lastId = new Map<string, string>();
+      for await (const line of readJsonlLines(linesPath)) {
+        const first = line.text.indexOf("\u0001");
+        const second = first === -1 ? -1 : line.text.indexOf("\u0001", first + 1);
+        if (first === -1 || second === -1) {
+          throw new Error(
+            `Contact index shard ${kind}/${String(shard).padStart(4, "0")} has a malformed posting record at line ${line.line}. ` +
+              "The index is incomplete; re-run the build.",
+          );
+        }
+        const term = line.text.slice(0, first);
+        const id = line.text.slice(first + 1, second);
+        const quality = Number(line.text.slice(second + 1)) || 0;
+        if (!id) {
+          throw new Error(`Contact index shard ${kind}/${String(shard).padStart(4, "0")} has an empty contact id at line ${line.line}.`);
+        }
+        if (lastId.get(term) === id) continue;
+        lastId.set(term, id);
+        const postings = terms[term] ?? { ids: [], q: [] };
+        postings.ids.push(id);
+        postings.q!.push(quality);
+        terms[term] = postings;
+      }
+      const payload: ContactShardPayload = { terms };
+      await writer.writeJson(folderFor("indexes", config.datasetVersion, `${kind}/${String(shard).padStart(4, "0")}.json`), payload);
+      await rm(linesPath, { force: true });
+    }
+  };
+
   await indexPathIndex("exact", config.shards.exact);
   await indexPathIndex("prefix", config.shards.prefix);
   await indexPathIndex("token", config.shards.token);
   await indexPathIndex("trigram", config.shards.trigram);
   await indexPathIndex("ids", config.shards.ids);
+  await indexContactShard("contactToken", config.shards.token);
+  await indexContactShard("contactPrefix", config.shards.prefix);
+  await indexContactShard("contactTrigram", config.shards.trigram);
 
   const stats: DatasetStats = {
     version: config.datasetVersion,
@@ -2126,6 +2234,13 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       ids: config.shards.ids,
       companyPartitions: companyPartitionIndex,
       contactPartitions: contactPartitionIndex,
+      // Presence of this block is what enables a global person search: the reader
+      // must be able to tell "no index was built" from "no such person".
+      contactIndex: {
+        token: config.shards.token,
+        prefix: config.shards.prefix,
+        trigram: config.shards.trigram,
+      },
       // Recorded so the reader can locate an `unassigned/` object from a company
       // record alone: the object key is that company's Pass 1 partition, and only
       // the run that wrote the spool knows how many partitions there were.
@@ -2447,6 +2562,69 @@ function recordCoverage(coverage: { email: number; linkedin: number; phone: numb
 function buildContactId(companyIdValue: string, contact: Contact): string {
   const fingerprint = contact.email ?? contact.linkedinUrl ?? `${contact.fullName}|${contact.title ?? ""}|${contact.source.row}`;
   return contactIdFor(`${companyIdValue}|${fingerprint}`);
+}
+
+/**
+ * Person-name key used by the contact index.
+ *
+ * `normalizeQuery` is the same normalizer companies are indexed with (deaccent,
+ * lowercase, punctuation → spaces), so "José O'Brien" and "jose obrien" are one
+ * key. Legal-suffix stripping is a company rule and is a no-op on a person's
+ * name.
+ */
+function contactNameKey(contact: Contact): string {
+  return normalizeQuery(contact.fullName ?? "").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * 0..255 prominence byte for a contact, used to pre-rank candidates before any
+ * contact object is fetched. A reachable person (email, then LinkedIn) and one
+ * with a known role wins a tie against a bare name.
+ */
+function contactQualityByte(contact: Contact): number {
+  let score = 40;
+  if (contact.email) score += 80;
+  if (contact.linkedinUrl) score += 60;
+  if (contact.phone) score += 30;
+  if (contact.title || contact.designation) score += 20;
+  return Math.min(255, score);
+}
+
+/**
+ * Write every posting a contact contributes to the person-name index.
+ *
+ * Three kinds, mirroring the company index so the same retrieval logic applies:
+ *   token   — any word of the name ("smith", "john")
+ *   prefix  — the start of the whole name AND of each word ("john sm", "smi")
+ *   trigram — the whole name, for a typo ("jhon smith")
+ * Every posting carries the contact id, because a contact's position inside its
+ * company's object is not part of its identity.
+ */
+function emitContactNamePostings(
+  writer: ShardWriter,
+  shards: IndexerConfig["shards"],
+  contact: Contact,
+): void {
+  const name = contactNameKey(contact);
+  if (!name) return;
+  const quality = contactQualityByte(contact);
+  const tokens = name.split(" ").filter(Boolean);
+  const prefixes = new Set<string>();
+  const maxPrefix = Math.min(SHARDING.maxPrefixLength, name.length);
+  for (let i = 1; i <= maxPrefix; i += 1) prefixes.add(name.slice(0, i));
+  for (const token of tokens) {
+    const max = Math.min(SHARDING.maxPrefixLength, token.length);
+    for (let i = 1; i <= max; i += 1) prefixes.add(token.slice(0, i));
+  }
+  for (const prefix of prefixes) {
+    writer.writeContact("contactPrefix", shardOf(prefix, shards.prefix), prefix, contact.id, quality);
+  }
+  for (const token of new Set(tokens)) {
+    writer.writeContact("contactToken", shardOf(token, shards.token), token, contact.id, quality);
+  }
+  for (const gram of trigrams(name)) {
+    writer.writeContact("contactTrigram", shardOf(gram, shards.trigram), gram, contact.id, quality);
+  }
 }
 
 

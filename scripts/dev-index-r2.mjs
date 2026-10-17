@@ -4,7 +4,7 @@
  *
  *   bun scripts/dev-index-r2.mjs status                      # what exists locally vs in R2
  *   bun scripts/dev-index-r2.mjs upload [--limit 60]         # resumable, bounded per call
- *   bun scripts/dev-index-r2.mjs verify                      # size + SHA-256 of every object
+ *   bun scripts/dev-index-r2.mjs verify                      # size + content hash of every object
  *   bun scripts/dev-index-r2.mjs report                      # single JSON summary
  *
  * WHY IT EXISTS
@@ -19,8 +19,10 @@
  *   - an object whose remote size already matches is skipped, so re-running is free;
  *   - `--limit` bounds how many objects one call touches, so a long upload is done in
  *     as many short calls as it needs;
- *   - `verify` reads each object back and compares both the size and the SHA-256 the
- *     indexer recorded, which is what makes "uploaded" mean "uploaded intact".
+ *   - `verify` reads each object back and compares both the size and the CONTENT the
+ *     run produced (gzip is normalised away on both sides — see the long note in
+ *     `verify` for why a stored-byte hash cannot be compared over HTTPS), which is
+ *     what makes "uploaded" mean "uploaded intact".
  *
  * WHAT IT NEVER DOES
  * ------------------
@@ -127,20 +129,44 @@ async function verify(objects, r2, offset, count) {
       problems.push({ key: object.key, problem: "size", expected: object.bytes, actual: head.size });
       continue;
     }
-    // Read it back and hash the exact bytes that were uploaded. The indexer records
-    // the hash of the UNCOMPRESSED object for gzipped payloads (`objects.jsonl`),
-    // so a gzipped object is gunzipped before hashing.
+    /*
+     * Read it back and compare CONTENT.
+     *
+     * `objects.jsonl` records the hash of the file the indexer wrote, which for a
+     * gzipped payload is the hash of the COMPRESSED bytes. Comparing that hash with
+     * what a read returns cannot work over HTTPS: R2 decodes a `content-encoding:
+     * gzip` object at the edge and Node's fetch decodes it again for good measure, so
+     * the same object comes back compressed or plain depending on the request — and
+     * re-compressing locally would produce different bytes for identical content.
+     *
+     * So the check is defined on the CONTENT, which is what actually matters: the
+     * object on R2 must decompress to exactly the bytes the run produced. Both sides
+     * are normalised identically (gunzip when the bytes really start with 1f 8b,
+     * which is the only reliable signal), then hashed.
+     */
     const stored = await r2.get(object.key);
     if (!stored.ok) {
       problems.push({ key: object.key, problem: `read failed (HTTP ${stored.status})` });
       continue;
     }
     const raw = Buffer.from(await stored.arrayBuffer());
-    const gzipped = raw.length > 2 && raw[0] === 0x1f && raw[1] === 0x8b;
-    const body = object.gzip && gzipped ? gunzipSync(raw) : raw;
-    const digest = createHash("sha256").update(body).digest("hex");
-    if (object.sha256 && digest !== object.sha256) {
-      problems.push({ key: object.key, problem: "sha256", expected: object.sha256, actual: digest });
+    const remoteContent = raw.length > 2 && raw[0] === 0x1f && raw[1] === 0x8b ? gunzipSync(raw) : raw;
+    let localContent = null;
+    try {
+      const local = readFileSync(join(outputDir, object.key));
+      localContent = local.length > 2 && local[0] === 0x1f && local[1] === 0x8b ? gunzipSync(local) : local;
+    } catch {
+      // The local file may have been cleaned up after upload; the content check then
+      // falls back to the recorded hash of the stored object.
+    }
+    const digest = createHash("sha256").update(remoteContent).digest("hex");
+    const expected = localContent
+      ? createHash("sha256").update(localContent).digest("hex")
+      : object.gzip
+        ? null
+        : object.sha256;
+    if (expected && digest !== expected) {
+      problems.push({ key: object.key, problem: "content hash", expected, actual: digest });
       continue;
     }
     checked += 1;

@@ -44,8 +44,76 @@ export {
   buildColumnMap,
 } from "../../../src/shared/headers";
 
+/**
+ * One source column that is not part of the canonical model.
+ *
+ * Captured columns are what make "all available source fields" true rather than
+ * aspirational: the canonical mapping covers the fields the app searches, filters
+ * and ranks on, and every OTHER column of the row is carried alongside the record
+ * so a detail page can show it (§ 11 of the specification).
+ */
+export interface CapturedColumn {
+  /** Position in the source record. */
+  index: number;
+  /** Human-readable label derived from the file's own header. */
+  label: string;
+}
+
+/**
+ * Ceilings on the captured attributes of one record.
+ *
+ * A cap is necessary rather than nice: with no bound, one source column holding a
+ * 100 KB JSON blob would be copied into every row of a 10 GB file. 80 columns and
+ * 400 characters per value cover the schemas this project ingests (51 company / 39
+ * contact columns) with room to spare, and a truncated value is marked as such by
+ * the interface instead of being silently cut.
+ */
+export const MAX_CAPTURED_FIELDS = 80;
+export const MAX_CAPTURED_VALUE_LENGTH = 400;
+
+/**
+ * Every column of a record that is not already an index key.
+ *
+ * `mappedIndexes` is the set of positions the canonical field map consumed, so the
+ * label shown for a captured column is exactly what the file calls it (tidied for
+ * display), never an invented name.
+ */
+export function capturedColumns(headers: string[], map: Record<string, number>): CapturedColumn[] {
+  const mapped = new Set(Object.values(map));
+  const out: CapturedColumn[] = [];
+  const seenLabels = new Set<string>();
+  for (let index = 0; index < headers.length; index += 1) {
+    if (mapped.has(index)) continue;
+    const header = (headers[index] ?? "").trim();
+    if (!header) continue;
+    const label = header.replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
+    if (!label || seenLabels.has(label.toLowerCase())) continue;
+    seenLabels.add(label.toLowerCase());
+    out.push({ index, label });
+    if (out.length >= MAX_CAPTURED_FIELDS) break;
+  }
+  return out;
+}
+
+/** Values of the captured columns of one row, with empty cells omitted. */
+export function captureAttributes(record: string[], columns: CapturedColumn[]): Record<string, string> | undefined {
+  if (!columns.length) return undefined;
+  const attributes: Record<string, string> = {};
+  for (const column of columns) {
+    const raw = record[column.index];
+    if (raw === undefined || raw === null) continue;
+    let value = String(raw).trim();
+    if (!value) continue;
+    if (value.length > MAX_CAPTURED_VALUE_LENGTH) value = `${value.slice(0, MAX_CAPTURED_VALUE_LENGTH)}…`;
+    attributes[column.label] = value;
+  }
+  return Object.keys(attributes).length ? attributes : undefined;
+}
+
 export interface RawCompanyInput {
   name: string;
+  /** Unmapped source columns of this row, kept verbatim for the detail view. */
+  attributes?: Record<string, string>;
   domain?: string;
   website?: string;
   linkedinUrl?: string;
@@ -60,6 +128,8 @@ export interface RawCompanyInput {
 }
 
 export interface RawContactInput {
+  /** Unmapped source columns of this row, kept verbatim for the detail view. */
+  attributes?: Record<string, string>;
   name?: string;
   firstName?: string;
   lastName?: string;
@@ -76,7 +146,11 @@ export interface RawContactInput {
 }
 
 /** Extract the canonical company input from one CSV row. */
-export function extractCompanyInput(record: string[], map: Record<string, number>): RawCompanyInput | null {
+export function extractCompanyInput(
+  record: string[],
+  map: Record<string, number>,
+  captured: CapturedColumn[] = [],
+): RawCompanyInput | null {
   const pick = (field: string) => {
     const index = map[field];
     if (index === undefined) return undefined;
@@ -86,6 +160,7 @@ export function extractCompanyInput(record: string[], map: Record<string, number
   if (!name) return null;
   return {
     name,
+    attributes: captureAttributes(record, captured),
     domain: pick("companydomain"),
     website: pick("companywebsite"),
     linkedinUrl: pick("companylinkedin"),
@@ -101,7 +176,11 @@ export function extractCompanyInput(record: string[], map: Record<string, number
 }
 
 /** Extract the canonical contact input from one CSV row. */
-export function extractContactInput(record: string[], map: Record<string, number>): RawContactInput | null {
+export function extractContactInput(
+  record: string[],
+  map: Record<string, number>,
+  captured: CapturedColumn[] = [],
+): RawContactInput | null {
   const pick = (field: string) => {
     const index = map[field];
     if (index === undefined) return undefined;
@@ -113,6 +192,7 @@ export function extractContactInput(record: string[], map: Record<string, number
   if (!full && !pick("email")) return null;
   return {
     name: full || undefined,
+    attributes: captureAttributes(record, captured),
     firstName: firstName ?? undefined,
     lastName: lastName ?? undefined,
     title: pick("jobtitle"),
@@ -516,6 +596,7 @@ export function buildCompany(params: {
     contactCount: 0,
     sources: params.sources,
     ambiguous: params.ambiguous || undefined,
+    attributes: params.input.attributes,
     facets: emptyFacets(),
   };
 }
@@ -557,6 +638,7 @@ export function buildContact(params: {
     country: normalizeAttribute(params.input.country) ?? undefined,
     state: normalizeAttribute(params.input.state) ?? undefined,
     city: normalizeAttribute(params.input.city) ?? undefined,
+    attributes: params.input.attributes,
     source: params.source,
   };
 }

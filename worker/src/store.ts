@@ -13,8 +13,8 @@
  */
 
 import type { Company, Contact, DatasetStats, DatasetVersionSummary, SavedLead, SavedSearch, UnassignedContact, UserSettings, ActivityEntry } from "../../src/shared/models";
-import { R2_PREFIX, leadShardKey, statsKey, activeManifestKey, companyPartitionKey, contactPartitionKey, exportMetaKey, exportObjectKey, indexDirectoryKey, indexShardKey, manifestKey, partitionOfRef, contactPartitionOfRef, savedSearchesKey, settingsKey, activityKey, unassignedPartitionKey, validationKey, progressKey, type IndexDirectory, type ShardPayload, type IndexKind, type CompanyPartitionPayload, type ContactPartitionPayload, type UnassignedPartitionPayload } from "../../src/shared/search/index-format";
-import { SHARDING, contactsFor, snapshotKey } from "../../src/shared/search/index-format";
+import { R2_PREFIX, leadShardKey, statsKey, activeManifestKey, companyPartitionKey, contactPartitionKey, exportMetaKey, exportObjectKey, indexDirectoryKey, indexShardKey, manifestKey, partitionOfRef, contactPartitionOfRef, savedSearchesKey, settingsKey, activityKey, unassignedPartitionKey, validationKey, progressKey, type IndexDirectory, type ShardPayload, type IndexKind, type CompanyPartitionPayload, type ContactPartitionPayload, type ContactShardKind, type ContactShardPayload, type UnassignedPartitionPayload } from "../../src/shared/search/index-format";
+import { SHARDING, contactsFor, postingsFor, snapshotKey } from "../../src/shared/search/index-format";
 import { shardOf } from "../../src/shared/hash";
 import { isCacheableKey, type ObjectCache, type ReadMetrics } from "./search-cache";
 
@@ -245,6 +245,49 @@ export class R2Store {
   }
 
   /**
+   * One shard of the contact name index.
+   *
+   * A separate accessor because the payload is shaped differently: its postings
+   * hold contact ids, not document refs. Reading it through `getShard` would type
+   * as a company payload and hide the difference at every call site.
+   */
+  async getContactShard(
+    version: string,
+    kind: ContactShardKind,
+    shard: number,
+  ): Promise<ContactShardPayload | null> {
+    return this.getJson<ContactShardPayload>(indexShardKey(version, kind, shard));
+  }
+
+  /**
+   * Ids index postings for many contact ids at once, grouped by shard.
+   *
+   * This is the second half of contact hydration: a name posting names a contact
+   * id, and the ids index says which company owns it (or, for a contact kept
+   * without an employer, which `unassigned/` object holds it — see the negative
+   * ref convention in `tools/indexer/src/build.ts`).
+   */
+  async refsForContactIds(version: string, ids: string[], idShards: number): Promise<Map<string, number>> {
+    const byShard = new Map<number, string[]>();
+    for (const id of ids) {
+      const shard = shardOf(id, idShards);
+      const list = byShard.get(shard);
+      if (list) list.push(id);
+      else byShard.set(shard, [id]);
+    }
+    const out = new Map<string, number>();
+    await mapLimit([...byShard.entries()], 8, async ([shard, shardIds]) => {
+      const payload = await this.getShard(version, "ids", shard);
+      if (!payload) return;
+      for (const id of shardIds) {
+        const ref = postingsFor(payload, id)?.refs?.[0];
+        if (typeof ref === "number") out.set(id, ref);
+      }
+    });
+    return out;
+  }
+
+  /**
    * Hydrate companies for a set of global refs.
    *
    * Profile objects are grouped by `companiesPerPartition`, so refs that fall in
@@ -297,6 +340,56 @@ export class R2Store {
     // `contactsFor` does the own-property lookup: a parsed payload must never
     // answer from `Object.prototype`.
     return (contactsFor(payload, ref) as Contact[] | undefined) ?? [];
+  }
+
+  /**
+   * Contacts of several companies, read partition by partition.
+   *
+   * Contact objects hold `companiesPerContactPartition` companies each, and a
+   * result page clusters around few partitions, so batched hydration costs a
+   * handful of reads instead of one per company. `maxParts` bounds the worst case
+   * for a dispersed result set; refs from partitions beyond it are simply absent
+   * from the map, which the caller reports as "not hydrated".
+   */
+  async getContactsByCompanyRefs(
+    version: string,
+    refs: number[],
+    maxParts = 8,
+  ): Promise<Map<number, Contact[]>> {
+    const grouped = new Map<number, number[]>();
+    for (const ref of refs) {
+      const partition = contactPartitionOfRef(ref);
+      const list = grouped.get(partition);
+      if (list) list.push(ref);
+      else grouped.set(partition, [ref]);
+    }
+    const ordered: [number, number[]][] = [];
+    for (const entry of grouped) {
+      if (ordered.length >= maxParts) break;
+      ordered.push(entry);
+    }
+    const out = new Map<number, Contact[]>();
+    await mapLimit(ordered, 8, async ([partition, partitionRefs]) => {
+      const payload = await this.getJson<ContactPartitionPayload>(contactPartitionKey(version, partition));
+      if (!payload) return;
+      for (const ref of partitionRefs) {
+        const contacts = contactsFor(payload, ref) as Contact[] | undefined;
+        if (contacts) out.set(ref, contacts);
+      }
+    });
+    return out;
+  }
+
+  /**
+   * Partition that holds one preserved contact, from its ids-index ref.
+   *
+   * The ids index stores `-(partition + 1)` for a contact with no employer (see
+   * the negative-ref note in the indexer), so this is the only translation the
+   * reader needs to open the right `unassigned/` object. Returns `null` when the
+   * ref is a normal, company-owned document ref.
+   */
+  unassignedPartitionOfRef(ref: number): number | null {
+    return ref < 0 ? -ref - 1 : null;
   }
 
   /**

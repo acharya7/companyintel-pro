@@ -132,6 +132,8 @@ export default function CompanyDetails() {
   }
 
   const record = company.data!.company;
+  /** Unmapped source columns of this company row (see the "All source fields" section). */
+  const capturedAttributes = Object.entries(record.attributes ?? {});
   const rows = contacts.data?.contacts ?? [];
   const allSelected = rows.length > 0 && rows.every((contact) => selected.has(contact.id));
 
@@ -304,6 +306,50 @@ export default function CompanyDetails() {
             ) : null}
           </dl>
         </Section>
+
+        {capturedAttributes.length ? (
+          /*
+           * Every OTHER column of the source row.
+           *
+           * The section above shows the fields the application has a canonical place
+           * for; this one shows the rest of the record — the industry codes, employee
+           * counts and source-specific columns that used to be dropped on the floor.
+           * Each value is copyable and a URL is clickable, and nothing is truncated
+           * by the UI (the indexer bounds a value's length when it captures it).
+           */
+          <Section
+            title="All source fields"
+            description={`${capturedAttributes.length} additional columns exactly as the source row carries them`}
+          >
+            <dl className="divide-y divide-border/60">
+              {capturedAttributes.map(([label, value]) => (
+                <InfoRow key={label} label={label}>
+                  <span className="flex items-start justify-between gap-3">
+                    <span className="min-w-0 break-words">
+                      {/^https?:\/\//i.test(value) ? (
+                        <a className="text-primary hover:underline" href={value} target="_blank" rel="noreferrer noopener">
+                          {value}
+                        </a>
+                      ) : (
+                        value
+                      )}
+                    </span>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      className="shrink-0"
+                      title={`Copy ${label}`}
+                      aria-label={`Copy ${label}`}
+                      onClick={() => void navigator.clipboard?.writeText(value)}
+                    >
+                      <Copy className="size-3.5" />
+                    </Button>
+                  </span>
+                </InfoRow>
+              ))}
+            </dl>
+          </Section>
+        ) : null}
 
         <Section title="Contact filters" description="Server-side filters across the company's contacts">
           {!facetCount || facetCount.designations.length === 0 ? (

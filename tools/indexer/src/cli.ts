@@ -357,6 +357,19 @@ async function cmdRun(config: IndexerConfig, flags: Record<string, string | bool
   // indexer stops rather than merging two inputs (see CheckpointIdentity in
   // build.ts).
   const noResume = Boolean(flags["no-resume"]);
+  /*
+   * `--disk-floor <mb>` lowers the free-space floor pass 2 stops at.
+   *
+   * The default (512 MB) is a comfortable margin for a full 60 GB run, but it is a
+   * constant: on a small machine — or a bounded sandbox — a run whose output is
+   * 30 MB can be refused because the disk has 400 MB free instead of 520 MB. The
+   * floor is a safety margin, not a correctness rule, so it is an explicit operator
+   * choice rather than a value edited in source. An unparseable or non-positive
+   * value is ignored (the default applies), because silently lowering the guard is
+   * exactly the failure mode it exists to prevent.
+   */
+  const diskFloorMb = Number(flags["disk-floor"]);
+  const diskFloorBytes = Number.isFinite(diskFloorMb) && diskFloorMb > 0 ? Math.round(diskFloorMb * 1024 * 1024) : undefined;
 
   // `sample` must reach preflight: a sample run's temporary-space estimate is based
   // on the sampled row count, so a machine that cannot hold the 60 GB job can still
@@ -396,7 +409,7 @@ async function cmdRun(config: IndexerConfig, flags: Record<string, string | bool
     () =>
       runIndex(
         { ...config, datasetVersion: version, upload: { enabled: upload, bucket: config.upload?.bucket ?? "company-intel-data" } },
-        { sampleLimit: sample, resume: !noResume, onProgress: progressLogger() },
+        { sampleLimit: sample, resume: !noResume, onProgress: progressLogger(), diskFloorBytes },
       ),
   );
 
@@ -798,6 +811,10 @@ Flags
                       (nothing is read in bulk, built or uploaded)
   --no-resume         ignore the checkpoint and rebuild from the sources; clears
                       the stale spool in workDir
+  --disk-floor <mb>   run: free-space floor pass 2 stops at (default 512 MB). Lower
+                      it only when the machine cannot hold that much free space and
+                      the run's output is known to be small — it is a safety margin,
+                      not a correctness rule
   --repair-manifest   spool: record spool-manifest.json for an EXISTING spool whose
                       partitions all verify (the recovery path for a failed run
                       from a build that did not write a manifest)

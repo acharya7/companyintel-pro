@@ -1,0 +1,75 @@
+{
+  "$comment": [
+    "CompanyIntel — DEVELOPMENT sample config with EVERY source column captured.",
+    "",
+    "Identical sources and mapping overrides to indexer.dev-sample.json, but its own",
+    "work/output directories, so the earlier development versions and the verified",
+    "v1 / v1-bench-1m artifacts are never touched.",
+    "",
+    "It exists because captured attributes are a Pass 1 concern: the column list is",
+    "derived from each file's header row, and a spool written before that existed can",
+    "only be re-merged, not enriched. So this version needs a fresh Pass 1 over the",
+    "same bounded sample.",
+    "",
+    "Run:  bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.dev-full.json \\",
+    "        --sample 20000 --version dev-r2-20k-full-<date>",
+    ""
+  ],
+  "datasetVersion": "dev",
+  "sources": [
+    {
+      "id": "csv1",
+      "path": "r2://company-intel-data/raw/file1.csv",
+      "encoding": "utf-8",
+      "delimiter": "\t",
+      "columns": {
+        "companyid": "organization_id",
+        "companyname": "organization_name",
+        "companydomain": "organization_domain",
+        "companywebsite": "organization_website_url",
+        "industry": "organization_industries",
+        "companysize": "organization_num_current_employees",
+        "companyrevenue": "organization_revenue_in_thousands_int",
+        "companycity": "organization_hq_location_city",
+        "companystate": "organization_hq_location_state",
+        "companycountry": "organization_hq_location_country"
+      }
+    },
+    {
+      "id": "csv2",
+      "path": "r2://company-intel-data/raw/file2.csv",
+      "encoding": "utf-8",
+      "delimiter": "\t",
+      "columns": {
+        "contactname": "person_name",
+        "firstname": "person_first_name_unanalyzed",
+        "lastname": "person_last_name_unanalyzed",
+        "jobtitle": "person_title",
+        "seniority": "person_seniority",
+        "department": "person_functions",
+        "email": "person_email",
+        "phone": "person_phone",
+        "linkedin": "person_linkedin_url",
+        "contactcity": "person_location_city",
+        "contactstate": "person_location_state",
+        "contactcountry": "person_location_country",
+        "companyname": "sanitized_organization_name_unanalyzed"
+      }
+    }
+  ],
+  "workDir": ".indexer-dev-work-full",
+  "outputDir": ".indexer-dev-output-full",
+  "rawCacheDir": null,
+  "partitions": 64,
+  "shards": {
+    "exact": 64,
+    "prefix": 32,
+    "token": 32,
+    "trigram": 64,
+    "ids": 32
+  },
+  "upload": {
+    "enabled": true,
+    "bucket": "company-intel-data"
+  }
+}

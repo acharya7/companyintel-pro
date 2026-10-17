@@ -106,8 +106,12 @@ describe("indexer output", () => {
       ),
     ).toBe(true);
     // Tier 3: the object count is bounded by the configured shard skeleton
-    // (5 kinds × 8 shards) + partitions + manifests, independent of record count.
-    const shardSkeleton = 5 * 8;
+    // + partitions + manifests, independent of record count.
+    //
+    // The skeleton is 8 kinds × 8 shards: the five company kinds (exact, prefix,
+    // token, trigram, ids) plus the three person-name kinds (contactToken,
+    // contactPrefix, contactTrigram) that make a global contact search possible.
+    const shardSkeleton = 8 * 8;
     expect(fixture.result.objects.length).toBeLessThanOrEqual(shardSkeleton + 8);
   });
 });
