@@ -8,6 +8,9 @@
  *                                                      # disk and RAM, then stops
  *   bun tools/indexer/src/cli.ts run --no-resume         # ignore the checkpoint and rebuild;
  *                                                      # clears the stale spool in workDir
+ *   bun tools/indexer/src/cli.ts pass2-from-spool --config <cfg> --version v1-assoc
+ *                                                      # experimental: merge a VERIFIED Pass 1
+ *                                                      # spool into a new version, no source read
  *   bun tools/indexer/src/cli.ts validate  --config <cfg> --version v1
  *   bun tools/indexer/src/cli.ts publish   --config <cfg> --version v1 --yes
  *
@@ -24,6 +27,7 @@ import { ALL_CANONICAL_FIELDS, buildColumnMap } from "./mapping";
 import {
   ROWS_PER_SECOND_MEASURED,
   STORAGE,
+  identityFor,
   preflight,
   publishVersion,
   runIndex,
@@ -33,6 +37,13 @@ import {
 } from "./build";
 import { credentialsFromEnv } from "./r2";
 import { adoptSpool, inspectSpool, spoolManifestPathFor, type SpoolInspection } from "./spool";
+import {
+  defaultExperimentalOutputDir,
+  defaultExperimentalWorkDir,
+  executeSpoolImport,
+  prepareSpoolImport,
+  type SpoolImportPlan,
+} from "./spool-import";
 import { createSourceContext, credentialsHelp, missingCredentialBuckets, parseR2Source, sourceProfile, type SourceContext } from "./source";
 
 function parseArgs(argv: string[]): { command: string; flags: Record<string, string | boolean> } {
@@ -476,6 +487,142 @@ async function cmdRun(config: IndexerConfig, flags: Record<string, string | bool
   }
 }
 
+function printImportPlan(plan: SpoolImportPlan): void {
+  const gb = (bytes: number) => `${(bytes / 1e9).toFixed(2)} GB`;
+  console.log("\nExperimental Pass 2 import — validated read-only");
+  for (const check of plan.checks) console.log(`  ok   ${check}`);
+  console.log(`  source run version   ${plan.sourceVersion}  (kept intact; never used as the output)`);
+  console.log(`  output version       ${plan.outputVersion}`);
+  console.log(`  spool                ${plan.totals.files} files · ${plan.totals.lines.toLocaleString()} rows · ${gb(plan.totals.bytes)}`);
+  console.log(`  experimental work    ${plan.workDir}`);
+  console.log(`  experimental output  ${plan.outputDir}`);
+  console.log("  the source checkpoint, manifest, partitions and generated index are opened for READING only");
+  console.log("");
+}
+
+/**
+ * `pass2-from-spool` — the one explicit workflow that separates the source run's
+ * identity from the output index version.
+ *
+ * Ordinary `run` still refuses a version difference (the spool belongs to the run
+ * that wrote it). This command exists because "merge this finished Pass 1 spool
+ * into a NEW version" is a legitimate, and separately verifiable, operation: the
+ * source run identity is validated as recorded and left untouched, while Pass 2
+ * writes only into the isolated directories the operator names.
+ *
+ * It deliberately has no upload or publish path, and it refuses `--sample`
+ * (the limit is a property of the spool, not of the merge).
+ */
+async function cmdPass2FromSpool(config: IndexerConfig, flags: Record<string, string | boolean>): Promise<void> {
+  if (flags.upload) {
+    console.error("Refusing --upload: pass2-from-spool never uploads. The experimental index stays on this machine until you upload it deliberately.");
+    process.exitCode = 1;
+    return;
+  }
+  if (flags.sample !== undefined) {
+    console.error(
+      "Refusing --sample: the sample limit belongs to the Pass 1 spool that is being imported and cannot be changed now.\n" +
+        "  Use --expect-sample <n> to ASSERT the recorded limit instead.",
+    );
+    process.exitCode = 1;
+    return;
+  }
+  // A flag that was typed without its value becomes `true`; that would silently
+  // fall back to a default (or assert sample 1), so it is refused explicitly.
+  const textFlag = (name: string): string | undefined | null => {
+    const value = flags[name];
+    if (value === undefined) return undefined;
+    if (typeof value !== "string" || !value.trim()) return null;
+    return value;
+  };
+  const badFlag = ["version", "source-work-dir", "work-dir", "output-dir", "expect-sample"].find((name) => textFlag(name) === null);
+  if (badFlag) {
+    console.error(`--${badFlag} needs a value (for example --${badFlag} <value>).`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const versionFlag = textFlag("version");
+  if (!versionFlag) {
+    console.error(
+      "pass2-from-spool needs --version <new-output-version>, e.g. v1-bench-1m-assoc.\n" +
+        "  The source run keeps its own version; only the generated index uses the new one.",
+    );
+    process.exitCode = 1;
+    return;
+  }
+  const version = versionFlag;
+  const sourceFlag = textFlag("source-work-dir");
+  const workFlag = textFlag("work-dir");
+  const outputFlag = textFlag("output-dir");
+  const sourceWorkDir = sourceFlag ? resolve(sourceFlag) : config.workDir;
+  const workDir = workFlag ? resolve(workFlag) : defaultExperimentalWorkDir(sourceWorkDir, version);
+  const outputDir = outputFlag ? resolve(outputFlag) : defaultExperimentalOutputDir(config.outputDir, version);
+
+  const sampleAssertion = textFlag("expect-sample");
+  let expectSampleLimit: number | null | undefined;
+  if (sampleAssertion !== undefined) {
+    const value = Number(sampleAssertion);
+    if (!Number.isInteger(value) || value <= 0) {
+      console.error("--expect-sample must be a positive whole number of records per source (omit it to accept the recorded limit).");
+      process.exitCode = 1;
+      return;
+    }
+    expectSampleLimit = value;
+  }
+
+  // Validation touches no source. `requireSourceAccess` is deliberately NOT called:
+  // this command must work on a machine whose R2 objects are unreachable.
+  const plan = await prepareSpoolImport({
+    sourceWorkDir,
+    workDir,
+    outputDir,
+    sourceOutputDir: config.outputDir,
+    outputVersion: version,
+    expectation: { partitions: config.partitions, sources: identityFor(config, undefined).sources, sampleLimit: expectSampleLimit },
+  });
+  printImportPlan(plan);
+
+  if (flags["check-only"]) {
+    console.log("Check only: the spool is valid and the isolated bookkeeping is prepared. Nothing was merged, uploaded or published.");
+    return;
+  }
+
+  const { result, peaks } = await withResourcePeaks([workDir, outputDir], () =>
+    executeSpoolImport(config, plan, { onProgress: progressLogger() }),
+  );
+
+  console.log(`\nRebuilt version ${result.version} from the imported Pass 1 spool`);
+  console.log(`  rows merged       ${result.counters.rowsRead.toLocaleString()}`);
+  console.log(`  rows rejected     ${result.counters.rowsRejected.toLocaleString()}`);
+  console.log(`  unique companies  ${result.counters.uniqueCompanies.toLocaleString()}`);
+  console.log(`  unique contacts   ${result.counters.uniqueContacts.toLocaleString()}`);
+  console.log(
+    `  association       ${(result.counters.contactsHighConfidence ?? 0).toLocaleString()} high confidence, ` +
+      `${(result.counters.contactsPlausible ?? 0).toLocaleString()} plausible, ` +
+      `${(result.counters.contactsConflicting ?? 0).toLocaleString()} conflicting, ` +
+      `${(result.counters.contactsUnresolved ?? 0).toLocaleString()} preserved without an employer`,
+  );
+  console.log(`  association moves ${(result.counters.contactsMoved ?? 0).toLocaleString()}`);
+  console.log(`  objects written   ${result.objects.length.toLocaleString()}`);
+  console.log(`  index output      ${formatBytes(result.outputBytes)} in ${outputDir}`);
+  console.log(`  elapsed           ${(result.elapsedMs / 1000).toFixed(1)} s (pass 1 and profiling skipped: imported spool)`);
+  console.log(`  stage timings     profiling 0.0 s · pass 1 0.0 s (skipped) · pass 2 ${(result.stages.pass2Ms / 1000).toFixed(1)} s · finalize ${(result.stages.finalizeMs / 1000).toFixed(1)} s`);
+  if (result.pass2Reset.shardFiles || result.pass2Reset.outputFiles) {
+    console.log(
+      `  restart reset     ${result.pass2Reset.shardFiles.toLocaleString()} shard file(s), ${result.pass2Reset.outputFiles.toLocaleString()} generated object(s) ` +
+        `(${formatBytes(result.pass2Reset.outputBytes)}) — no duplicate postings or stale objects`,
+    );
+  }
+  console.log(`  peak memory       ${formatBytes(peaks.peakRssBytes)} RSS`);
+  console.log(`  peak temp disk    ${formatBytes(peaks.peakDiskBytes)} (${workDir} + ${outputDir})`);
+  console.log(`  source reads      ${result.sourceStats.requests} request(s) — the sources were not read`);
+  console.log(`  validation        ${result.manifest.validationPassed ? "passed" : `FAILED — inspect ${resolve(outputDir, "manifests", version, "validation.json")}`}`);
+  console.log("\nNothing was uploaded, nothing was published, and manifests/active.json was not written.");
+  console.log(`Audit it read-only with:\n  bun run index:audit -- --dir ${outputDir} --version ${version}`);
+  if (!result.manifest.validationPassed) process.exitCode = 1;
+}
+
 /**
  * `spool` — read-only inspection of an existing work directory.
  *
@@ -614,6 +761,11 @@ function usage(): void {
 
   profile    Inspect both CSV files: headers, fill rates, mapping suggestions
   run        Stream, resolve, index, validate and optionally upload
+  pass2-from-spool
+             EXPERIMENTAL: merge a VERIFIED Pass 1 spool into a NEW dataset version
+             without re-reading any source. The source run identity is validated,
+             never rewritten; output and bookkeeping go to isolated directories;
+             nothing is uploaded or published.
   spool      Read-only: inspect an existing spool/checkpoint after a failed run
              (positions only — never record content; modifies nothing)
   validate   Re-check the generated objects against their checksums
@@ -628,7 +780,8 @@ Sources (sources[].path in the config) accept either mode:
 Flags
   --config <path>     indexer configuration (required for every command)
   --sample <n>        limit each source to n records (sample runs)
-  --version <id>      dataset version id (default from the config)
+  --version <id>      dataset version id (run: default from the config;
+                      pass2-from-spool: REQUIRED, and must differ from the source)
   --preflight-only    run: check auth, keys, TSV mapping, disk and RAM, then stop
                       (nothing is read in bulk, built or uploaded)
   --no-resume         ignore the checkpoint and rebuild from the sources; clears
@@ -637,13 +790,26 @@ Flags
                       partitions all verify (the recovery path for a failed run
                       from a build that did not write a manifest)
   --work-dir <path>   spool: inspect this directory instead of the config's workDir
+                      pass2-from-spool: the NEW experimental directory for this
+                      run's bookkeeping/shards (default: <source-work-dir>-<version>)
   --hashes            spool: also re-verify every partition checksum (re-reads it)
+  --source-work-dir   pass2-from-spool: the verified Pass 1 work directory to import
+                      (default: the config's workDir; always read only)
+  --output-dir        pass2-from-spool: the NEW isolated output directory for the
+                      experimental index (default: <config outputDir>-<version>)
+  --expect-sample     pass2-from-spool: assert the source run's records-per-source
+                      limit (e.g. 1000000); the recorded value is used when omitted
+  --check-only        pass2-from-spool: validate the spool and prepare the isolated
+                      bookkeeping, then stop before merging anything
   --upload            upload generated objects to R2
   --yes               confirm a publish operation
 
 Example (Windows PowerShell)
   bun tools/indexer/src/cli.ts profile  --config tools/indexer/indexer.config.json
   bun tools/indexer/src/cli.ts run      --config tools/indexer/indexer.config.json --sample 100000 --version v1-sample
+  bun tools/indexer/src/cli.ts pass2-from-spool --config tools/indexer/indexer.config.json \`
+    --source-work-dir .indexer-work --work-dir .indexer-work-assoc \`
+    --output-dir .indexer-output-assoc --version v1-bench-1m-assoc --expect-sample 1000000
 `);
 }
 
@@ -680,6 +846,9 @@ async function main(): Promise<void> {
       break;
     case "run":
       await cmdRun(config, flags);
+      break;
+    case "pass2-from-spool":
+      await cmdPass2FromSpool(config, flags);
       break;
     case "validate":
       await cmdValidate(config, flags);

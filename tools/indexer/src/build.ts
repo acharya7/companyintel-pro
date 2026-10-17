@@ -68,6 +68,7 @@ import { encodeJsonlLine, escapeTerminators, isJsonlError, readJsonlFile, readJs
 // `encodeJsonlLine` is used for every JSONL file this pipeline writes — the spool
 // partitions, `rejected.jsonl` and `objects.jsonl` — so there is one place where the
 // record encoding is defined and one place to fix it.
+import type { SpoolImportSource } from "./spool-import";
 import {
   SPOOL_MANIFEST_FILE,
   clearSpoolManifest,
@@ -326,8 +327,15 @@ interface CheckpointFile {
   counters?: Partial<IndexingCounters>;
 }
 
-/** The identity of the run about to start, compared against a stored checkpoint. */
-function identityFor(config: IndexerConfig, sampleLimit: number | undefined): CheckpointIdentity {
+/**
+ * The identity of the run about to start, compared against a stored checkpoint.
+ *
+ * Exported for the one explicit workflow that separates the SOURCE RUN IDENTITY
+ * from the OUTPUT INDEX VERSION (`tools/indexer/src/spool-import.ts`): it needs to
+ * build the same identity from the operator's config, with only the version
+ * replaced. Ordinary resume keeps using it unchanged, version included.
+ */
+export function identityFor(config: IndexerConfig, sampleLimit: number | undefined): CheckpointIdentity {
   return {
     version: config.datasetVersion,
     sampleLimit: sampleLimit ?? null,
@@ -342,7 +350,7 @@ function identityFor(config: IndexerConfig, sampleLimit: number | undefined): Ch
 }
 
 /** Human-readable difference between two run identities, for the stop message. */
-function identityDiff(stored: CheckpointIdentity, current: CheckpointIdentity): string[] {
+export function identityDiff(stored: CheckpointIdentity, current: CheckpointIdentity): string[] {
   const differences: string[] = [];
   if (stored.version !== current.version) differences.push(`version ${stored.version} → ${current.version}`);
   if (stored.sampleLimit !== current.sampleLimit) {
@@ -415,6 +423,15 @@ export interface PreflightOptions {
    * the machine a sample run is for.
    */
   sampleLimit?: number;
+  /**
+   * Spooled rows for a Pass 2 rebuild from an existing spool.
+   *
+   * When set, the sources are NOT probed at all — no `stat`, no R2 HEAD, no
+   * ranged read — because the rows are already on disk in the source spool. The
+   * space estimate is then just this run's output plus bookkeeping (the spool is
+   * not rewritten), which is also the honest number for that workflow.
+   */
+  importedRows?: number;
 }
 
 /**
@@ -485,24 +502,48 @@ export async function preflight(
   const sources: PreflightReport["sources"] = [];
   let totalInputBytes = 0;
   const warnings: string[] = [];
+  const importedRows = options.importedRows;
 
-  for (const source of config.sources) {
-    // Mode A reads the local file size; Mode B asks R2 for the object size with a
-    // bounded HEAD. An unknown size stays unknown (`null`) rather than 0.
-    const bytes = await sourceBytes(source, context);
-    const exists = bytes !== null;
-    if (!exists) warnings.push(`Source ${source.id} was not found at ${source.path}`);
-    sources.push({ id: source.id, path: source.path, bytes, exists });
-    totalInputBytes += bytes ?? 0;
+  if (importedRows === undefined) {
+    for (const source of config.sources) {
+      // Mode A reads the local file size; Mode B asks R2 for the object size with a
+      // bounded HEAD. An unknown size stays unknown (`null`) rather than 0.
+      const bytes = await sourceBytes(source, context);
+      const exists = bytes !== null;
+      if (!exists) warnings.push(`Source ${source.id} was not found at ${source.path}`);
+      sources.push({ id: source.id, path: source.path, bytes, exists });
+      totalInputBytes += bytes ?? 0;
+    }
+  } else {
+    /*
+     * An experimental Pass 2 rebuild: the spool already holds the rows, so the
+     * sources are not touched. Marking them `exists` (unknown size) rather than
+     * probing keeps this path free of R2 requests — the whole point of importing a
+     * spool — and stops a machine whose objects are unreachable from failing a run
+     * it could complete.
+     */
+    for (const source of config.sources) sources.push({ id: source.id, path: source.path, bytes: null, exists: true });
+    warnings.push("Experimental Pass 2 rebuild: the Pass 1 spool is imported, so the sources are not read and no spool is written.");
   }
 
   const freeDiskBytes = await freeDiskBytesFor(config.workDir);
-  const estimate = estimateWorkingSet(config, sources, { sampleLimit: options.sampleLimit, chunkBytes: context.chunkBytes });
+  const estimate: WorkEstimate =
+    importedRows === undefined
+      ? estimateWorkingSet(config, sources, { sampleLimit: options.sampleLimit, chunkBytes: context.chunkBytes })
+      : {
+          spoolBytes: 0,
+          rawCachePeakBytes: 0,
+          outputBytes: Math.round(importedRows * STORAGE.outputBytesPerRow),
+          overheadBytes: STORAGE.fixedOverheadBytes,
+          safetyMargin: STORAGE.safetyMargin,
+          totalBytes: Math.ceil((Math.round(importedRows * STORAGE.outputBytesPerRow) + STORAGE.fixedOverheadBytes) * STORAGE.safetyMargin),
+          perSource: [],
+        };
   const estimatedWorkBytes = estimate.totalBytes;
   const estimatedOutputBytes = estimate.outputBytes;
   const sampleRows = options.sampleLimit === undefined ? null : options.sampleLimit * config.sources.length;
-  const estimatedRows = sampleRows;
-  const estimatedDurationSeconds = sampleRows === null ? null : sampleRows / ROWS_PER_SECOND_MEASURED;
+  const estimatedRows = importedRows ?? sampleRows;
+  const estimatedDurationSeconds = estimatedRows === null ? null : estimatedRows / ROWS_PER_SECOND_MEASURED;
   const cpuCount = cpus().length || 1;
 
   if (freeDiskBytes !== null && freeDiskBytes < estimatedWorkBytes) {
@@ -905,6 +946,18 @@ export interface RunOptions {
   resume?: boolean;
   /** Free-space floor on the output volume; the run stops cleanly below it. */
   diskFloorBytes?: number;
+  /**
+   * Merge a VERIFIED Pass 1 spool that lives in another work directory, without
+   * profiling or reading any source.
+   *
+   * Only `pass2-from-spool` sets this, and only after
+   * `prepareSpoolImport` (spool-import.ts) has validated the source checkpoint,
+   * manifest, source configuration, partition count and every partition's length
+   * and checksum. The experimental work directory already holds a derived
+   * checkpoint and manifest for this output version, so `reuseSpool` is true and
+   * the source spool is opened for reading only — this run never writes there.
+   */
+  spoolImport?: SpoolImportSource;
 }
 
 export interface RunResult {
@@ -1001,7 +1054,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     cacheDir: config.rawCacheDir === undefined ? undefined : config.rawCacheDir,
     onNotice: (message) => options.onProgress?.({ stage: "preflight", message, rowsRead: 0, rowsRejected: 0, companies: 0, contacts: 0, progress: null, rowsPerSecond: null, etaSeconds: null }),
   });
-  const report = await preflight(config, sourceContext, { sampleLimit: options.sampleLimit });
+  const report = await preflight(config, sourceContext, { sampleLimit: options.sampleLimit, importedRows: options.spoolImport?.rows });
   const emit = (event: Partial<ProgressEvent> & { stage: ProgressEvent["stage"]; message: string }) =>
     options.onProgress?.({
       rowsRead: 0,
@@ -1017,7 +1070,9 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   for (const warning of report.warnings) emit({ stage: "preflight", message: `warning: ${warning}` });
 
   const workDir = config.workDir;
-  const spoolDir = join(workDir, "spool");
+  // An experimental import merges a spool that stays in the SOURCE work directory;
+  // this run's own workDir holds only its bookkeeping and shards.
+  const spoolDir = options.spoolImport?.spoolDir ?? join(workDir, "spool");
   const shardDir = join(workDir, "shards");
   const checkpointPath = join(workDir, "checkpoint.json");
   const diskFloorBytes = options.diskFloorBytes ?? DISK_FLOOR_BYTES;
@@ -1063,16 +1118,46 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
    * new spool.
    */
   const reuseSpool = checkpoint?.stage === "pass2-merge";
+  /*
+   * Belt-and-braces for the experimental import: an imported spool is NEVER cleared
+   * or rebuilt by this run. Without this guard, a missing derived checkpoint (which
+   * `pass2-from-spool` writes immediately before calling here) would take the
+   * ordinary "starting fresh" path — and that path deletes `part-*.jsonl` in
+   * `spoolDir`, which for an import is the SOURCE Pass 1 spool. The source/output
+   * path check is the same class of protection for the generated index.
+   */
+  if (options.spoolImport) {
+    const sameResolved = (a: string, b: string) => {
+      const left = resolve(a);
+      const right = resolve(b);
+      return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right;
+    };
+    if (!reuseSpool) {
+      throw new Error(
+        `Refusing to run: ${workDir} has no pass2-merge checkpoint, so the imported spool in ${spoolDir} cannot be shown to be ready to merge.\n` +
+          "  An imported spool is never cleared or rebuilt, and nothing was read or written by this attempt. Re-run pass2-from-spool.",
+      );
+    }
+    if (sameResolved(config.workDir, options.spoolImport.sourceWorkDir) || sameResolved(config.outputDir, options.spoolImport.sourceOutputDir)) {
+      throw new Error(
+        "Refusing to run: an experimental import must use its own work directory and output directory.\n" +
+          "  Writing into the source locations would replace the original checkpoint or the validated index. Nothing was written.",
+      );
+    }
+  }
   if (reuseSpool) {
     emit({
       stage: "pass2-merge",
-      message:
-        `pass 2: reusing the Pass 1 spool in ${spoolDir} (checkpoint ${checkpointPath} records stage pass2-merge` +
-        `${identity.version ? `, version ${identity.version}` : ""}); the sources are NOT read again.`,
+      message: options.spoolImport
+        ? `pass 2: experimental rebuild — merging the verified Pass 1 spool in ${spoolDir} into version ${identity.version}; ` +
+          "the sources are NOT read and the source spool is not written."
+        : `pass 2: reusing the Pass 1 spool in ${spoolDir} (checkpoint ${checkpointPath} records stage pass2-merge` +
+          `${identity.version ? `, version ${identity.version}` : ""}); the sources are NOT read again.`,
     });
   }
 
-  await mkdir(spoolDir, { recursive: true });
+  // `spoolDir` is read-only for an import; creating it is the ordinary run's job.
+  if (!options.spoolImport) await mkdir(spoolDir, { recursive: true });
   await mkdir(shardDir, { recursive: true });
   await mkdir(config.outputDir, { recursive: true });
 

@@ -218,15 +218,38 @@ A/B corrections run in Pass 2 from data the spool already holds:
 | company country / state / city | yes (company input) |
 
 No field the association rules use is missing, so no source column has to be
-re-read, no partition scheme changes, and `checkpoint.json` identity stays valid.
-Pass 2 replays from partition 1 with the same run identity; nothing about
-`v1-bench-1m` is renamed or rewritten.
+re-read and no partition scheme changes. What *does* change is the **output
+dataset version**, and that is exactly why the plain `run` command cannot do this
+rebuild — see below.
+
+### Source run identity vs. output version (why a dedicated command exists)
+
+A run identity deliberately includes the dataset version, because the spool in a
+work directory belongs to the run that wrote it. So on the preserved benchmark:
+
+- `run --version v1-bench-1m-assoc` **stops** with
+  `workDir already holds a checkpoint for a different run: version v1-bench-1m →
+  v1-bench-1m-assoc` — correct, but not the operation you want;
+- `run --no-resume` would **delete `workDir/spool/part-*.jsonl`** and re-read the
+  64 GB from R2 — destroying the artifact this exercise is meant to preserve.
+
+`pass2-from-spool` is the explicit third option. Only this command separates the
+two concepts:
+
+| Concept | Where it lives | What this command does |
+| --- | --- | --- |
+| **Source run identity** | `checkpoint.json` + `spool-manifest.json` in the source work dir | validates it as recorded; never rewrites, renames or deletes it |
+| **Output index version** | `--version` | a new value; Pass 2 writes objects/manifests under it |
+
+Ordinary `run`/resume keeps the strict, version-inclusive check
+(`tests/indexer-spool-import.test.ts` asserts that a version or sample-limit
+change is still refused).
 
 ### Windows PowerShell — verifying the change on the preserved benchmark
 
 Do this on the machine that holds the completed `v1-bench-1m` spool. It builds an
-**experimental** version next to the validated one; `v1-bench-1m` is never opened
-for writing.
+**experimental** version into new directories; `v1-bench-1m`, its spool and
+`manifests/active.json` are never opened for writing.
 
 ```powershell
 cd C:\path\to\companyintel-pro
@@ -239,21 +262,73 @@ bun run index:spool-doctor          # read-only: confirms the spool is clean
 bun run index:audit -- --version v1-bench-1m
 bun run index:audit -- --version v1-bench-1m --json > audit-before.json
 
-# Rebuild pass 2 from the SAME spool under a new version:
-bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json `
-  --sample 1000000 --version v1-bench-1m-assoc
+# 1. Validate the recorded source run and hash every partition, then STOP.
+#    Writes only the isolated bookkeeping in .indexer-work-v1-bench-1m-assoc.
+bun tools/indexer/src/cli.ts pass2-from-spool `
+  --config tools/indexer/indexer.config.json `
+  --source-work-dir .indexer-work `
+  --work-dir .indexer-work-v1-bench-1m-assoc `
+  --output-dir .indexer-output-assoc `
+  --version v1-bench-1m-assoc `
+  --expect-sample 1000000 `
+  --check-only
 
-# Audit the experimental index (the "after" number, same evidence):
-bun run index:audit -- --version v1-bench-1m-assoc
-bun run index:audit -- --version v1-bench-1m-assoc --json > audit-after.json
+# 2. The same command without --check-only performs the merge (pass 1 and the
+#    sources are skipped). `bun run index:benchmark-1m-assoc` is this same call.
+bun tools/indexer/src/cli.ts pass2-from-spool `
+  --config tools/indexer/indexer.config.json `
+  --source-work-dir .indexer-work `
+  --work-dir .indexer-work-v1-bench-1m-assoc `
+  --output-dir .indexer-output-assoc `
+  --version v1-bench-1m-assoc `
+  --expect-sample 1000000
+
+# Audit the experimental index (the "after" number, same evidence).
+# Note --dir: the experimental index deliberately lives outside .indexer-output.
+bun run index:audit -- --dir .indexer-output-assoc --version v1-bench-1m-assoc
+bun run index:audit -- --dir .indexer-output-assoc --version v1-bench-1m-assoc --json > audit-after.json
 ```
 
-What to expect on the screen: the run prints `pass 2: reusing the Pass 1 spool …
-the sources are NOT read again`, then the new
-`association  N high confidence, M plausible, K conflicting, U preserved without
-an employer` and `association moves …` lines, and no R2 request for the sources
-(`r2 requests 0 …` unless the raw cache is cold). Compare the two audit JSON
-reports on the fields:
+**Validated before anything is merged** (all read-only):
+
+- the source `checkpoint.json` exists, parses, records stage `pass2-merge` and a
+  run identity, and its version is different from `--version`;
+- `spool-manifest.json` exists, is marked complete, describes the same run as the
+  checkpoint, its totals add up, and the partition files on disk are exactly its
+  list (none missing, none extra, unique partition numbers);
+- the configuration matches the source run except the version: source ids, paths,
+  delimiters and column-override counts, partition count, and the sample limit
+  (`--expect-sample` asserts it — `1000000` here; omit it to accept the recorded
+  value);
+- every partition's byte length matches, and on a first import every SHA-256
+  matches. A **restart** re-checks lengths and leaves the content check to the
+  merge, which re-hashes each partition as it reads it (so a restart does not
+  re-read the whole spool just to reach the same place).
+
+**Never written**: the source checkpoint, `spool-manifest.json`, every
+`spool/part-*.jsonl`, the source output directory (including `objects.jsonl`) and
+`manifests/active.json`. There is no upload or publish path from this command, and
+`--upload` is refused. Isolation is enforced, not advisory: `--work-dir` may not be
+the source work dir or contain/be contained by it, and `--output-dir` may not be
+the config's output dir or sit inside/around it.
+
+What to expect on the screen: `pass 2: experimental rebuild — merging the verified
+Pass 1 spool in … the sources are NOT read and the source spool is not written.`,
+then the new `association  N high confidence, M plausible, K conflicting, U
+preserved without an employer` and `association moves …` lines, `stage timings …
+pass 1 0.0 s (skipped)`, `source reads 0 request(s)`, and finally
+`Nothing was uploaded, nothing was published, and manifests/active.json was not
+written.` A resumed/restarted experimental run prints the same thing after its
+reset line.
+
+**Interruption**: re-run the same command. The experimental workspace records the
+source checkpoint/manifest SHA-256, output version and output directory; the run
+refuses to adopt it if any of those changed, and otherwise resets its own shards and
+this version's objects before replaying from partition 1 — no duplicate postings and
+no stale objects (asserted by killing the real process mid-merge in
+`tests/indexer-spool-import.test.ts`).
+
+Compare the two audit JSON reports on the fields:
 
 - `associations.stored.byCategory` — the categories actually written;
 - `preserved.total` — contacts kept without an employer;
@@ -263,22 +338,28 @@ reports on the fields:
 - `manifestCounters.uniqueContacts` versus
   `reconciliation.attached + reconciliation.preserved` — must be equal.
 
-`pass 1` output is not rebuilt, so its duration should be `0.0 s (skipped:
-resumed)`; if it is not, the spool was rejected (see `docs/recovery.md`) and you
-are re-ingesting — stop and read the message rather than accepting the cost.
+`pass 1` output is not rebuilt, so its duration must be `0.0 s (skipped)`; if it
+is not, the spool was rejected (see `docs/recovery.md`) and you are re-ingesting —
+stop and read the message rather than accepting the cost.
 
 ### Keeping the two runs apart
 
 - The experimental version has a **different `datasetVersion`**, so `companies/`,
   `contacts/`, `indexes/`, `unassigned/` and `manifests/` all live under their own
-  prefix. Nothing can overwrite another version's objects.
+  prefix — and here, in their own `--output-dir` as well.
+- The experimental **work directory** (`.indexer-work-v1-bench-1m-assoc`) holds
+  only this import's bookkeeping (`experimental-import.json`, the derived
+  `spool-manifest.json` and `checkpoint.json`) plus its `shards/`. It never holds
+  spool partitions: the rows stay in the source work dir, opened read-only.
 - `manifests/active.json` is untouched: nothing is published, and the app keeps
-  serving `v1-bench-1m` until you explicitly publish (which this task does not do).
-- If you would rather not have both runs share one `workDir`, copy `workDir` and
-  pass `--work-dir` — but the spool is only read, never written, during a resumed
-  pass 2, so a copy is not required.
+  serving `v1-bench-1m` until you explicitly publish a version from the output
+  directory the app actually reads.
+- `--work-dir`/`--output-dir` default to siblings of the source directories
+  (`<work-dir>-<version>`, `<output-dir>-<version>`), so a no-flag run is already
+  isolated; passing them explicitly (as above) makes the isolation visible in the
+  command you keep.
 - Never pass `--upload` for the experimental version, and never `publish` it: the
-  validated v2 index stays the baseline until you approve the upgrade.
+  validated baseline stays active until you approve the upgrade.
 
 ---
 
@@ -371,3 +452,8 @@ category.
 - Real-data numbers for the new rules are pending: this environment has no access
   to the Windows spool or the 64 GB sources, so all measurements here are on
   synthetic fixtures with the real code paths.
+- A run identity records each source's path, delimiter and the *number* of column
+  overrides, not the override names. An edited `columns` mapping with the same
+  number of entries cannot be detected from the checkpoint, so `pass2-from-spool`
+  trusts the recorded identity as the provenance of the spool. Change the mapping
+  only by rebuilding Pass 1.

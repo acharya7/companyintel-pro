@@ -710,6 +710,35 @@ Remaining unverified for this change: the real-data category distribution, the n
 reassigned on real data, and Worker CPU/memory for the `unassigned` read path (it is one extra
 small object per company-profile review request, and is cached like any immutable object).
 
+## Phase I — experimental Pass 2 rebuild from an existing spool
+
+Scope: make the documented `v1-bench-1m` association comparison actually runnable. The old procedure
+(`run --version v1-bench-1m-assoc`) is refused because the run identity includes the dataset version;
+its documented fallback (`--no-resume`) would delete the 1.02 GB Pass 1 spool and re-read 64 GB from
+R2. The fix separates **source run identity** from **output index version** for one explicit command
+(`pass2-from-spool`) and leaves ordinary resume strict.
+
+| Item | Result | Evidence |
+| --- | --- | --- |
+| Ordinary resume still rejects an incompatible version | Confirmed by test, including a sample-limit and a partition-count difference; the source work directory is byte-identical afterwards | `tests/indexer-spool-import.test.ts` → "ordinary resume still owns its run identity" (3) |
+| Explicit rebuild accepts a verified compatible spool | Confirmed: `resumed: true`, `pass1Ms: 0`, `profilingMs: 0`, **0** source/R2 requests, validation passed, and the same counters as the source run | same file → "accepts a verified compatible source spool …" |
+| Source configuration mismatch is rejected | Path, delimiter, partition count and an asserted sample limit each stop before anything is merged | same file → "source validation" (path, delimiter, partitions, sample limit) |
+| The engine itself never clears an imported spool | `runIndex` called directly with an import whose derived checkpoint is missing refuses, and the source `spool/` is byte-identical with no directory created | same file → "the engine never clears an imported spool …" |
+| Corrupted spool is rejected | Truncated partition (length) and same-size byte flip (SHA-256) both refused; an incomplete manifest too | same file (3) |
+| The original checkpoint, manifest and partitions are byte-identical | Whole source work directory digested before/after an import (`toEqual`) | same file → "checkpoint, manifest and every partition stay byte-identical" |
+| The original generated index is unchanged | Whole source output directory digested before/after, plus `manifests/active.json` at file level | same file → "the original generated index and manifests/active.json …" |
+| The experimental index has its own version and output files | `directory.json` version, `manifests/<new>/`, `companies/<new>/`, **no** `active.json` in the experimental output, and no `<new>` directory in the source output | same file → "the experimental index is its own artifact" |
+| Interruption and restart create no duplicate postings or stale objects | The real process is killed mid-merge (`process.exit(97)` from the progress callback); the restart is byte-identical to a clean import (timestamps excluded), has the same object keys, and every shard's `refs` list is duplicate-free. A workspace interrupted between the import record and the checkpoint is recovered too | same file → "interruption and restart" (3) |
+| The two-stage association works on the imported spool | high-confidence, reassigned (`movedFrom`) and unresolved contacts are all present after import; the unresolved one is only in `unassigned/`, with `companyId: ""`; counters match the source run; every company's `contactCount` equals its association total | same file → "association on the imported spool" |
+| The CLI is the operator interface | `--check-only` validates and writes only the isolated bookkeeping; the full command builds and validates the new version; `--upload` and malformed flags are refused with exit 1 and nothing written | same file → "the CLI is the interface an operator actually uses" (3) |
+| Quality gates | `bun run typecheck` **0** (4 projects), `bun test` **479 pass / 0 fail** (34 files; +23 this phase), `bun run lint` **0** problems, `bun run build` **0** | commands run in this phase |
+
+**Not run here (and why):** the real 1 M rebuild. This environment has no access to the Windows
+Pass 1 spool (`v1-bench-1m`), so nothing was read from R2, no index was uploaded, published or
+deployed, and `manifests/active.json` was never written. The exact PowerShell is in
+`docs/association.md` §7; the safety properties above are asserted against synthetic corpora using
+the real indexer, including a real mid-merge process kill.
+
 ## Remaining risk (unchanged by this phase)
 
 | Risk | Why it remains | Mitigation |

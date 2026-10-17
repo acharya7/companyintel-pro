@@ -454,6 +454,53 @@ The run reuses the verified Pass 1 spool, resets the abandoned pass-2 output (it
 files), and merges from partition 1. `bun run index:spool-doctor` first, if you want the spool
 re-checked read-only before the merge starts.
 
+### Rebuilding Pass 2 under a different version (explicit and isolated)
+
+Sometimes the desired change is *only* the output version — the new association
+rules, for example, which read nothing the spool does not already hold. An
+ordinary run cannot do that, and should not: the identity includes the dataset
+version, so `run --version <new>` stops with `workDir already holds a checkpoint
+for a different run`, while `--no-resume` would clear the spool and re-read the
+sources. **Do not use `--no-resume` on a spool you want to keep.**
+
+Use the dedicated command instead. It validates the recorded source run, keeps its
+identity intact, and writes a new index into isolated directories:
+
+```powershell
+# validate + hash every partition, prepare isolated bookkeeping, then stop
+bun tools/indexer/src/cli.ts pass2-from-spool `
+  --config tools/indexer/indexer.config.json `
+  --source-work-dir .indexer-work `
+  --work-dir .indexer-work-v1-bench-1m-assoc `
+  --output-dir .indexer-output-assoc `
+  --version v1-bench-1m-assoc `
+  --expect-sample 1000000 `
+  --check-only
+
+# same call without --check-only: merge Pass 2 only (equivalent to the npm script)
+bun run index:benchmark-1m-assoc
+```
+
+| | |
+| --- | --- |
+| Validated before merging | source checkpoint (stage `pass2-merge`, has a run identity, version differs), complete spool manifest (same run, totals add up, partitions match the files on disk), source configuration (ids, paths, delimiters, override counts, partitions, sample limit), every partition's byte length and (first import) SHA-256 |
+| Written | only `<work-dir>/{experimental-import.json, spool-manifest.json, checkpoint.json, shards/}` and `<output-dir>/…` for the new version |
+| Never written | the source `checkpoint.json`, `spool-manifest.json`, `spool/part-*.jsonl`, the source output directory (`objects.jsonl` included), `manifests/active.json` |
+| Not available | `--upload` (refused), `--sample` (the limit belongs to the spool; use `--expect-sample` to assert it), upload/publish code paths |
+| Restart | re-run the same command: the import record must still match the source checksums, output version and output directory; this version's shards/objects are reset before replaying from partition 1 |
+| Defaults | `--source-work-dir` = config `workDir`; `--work-dir` = `<source-work-dir>-<version>`; `--output-dir` = `<config outputDir>-<version>` |
+
+The isolation rules are enforced, not advisory: `--work-dir` may not be the source
+work directory or contain/be contained by it, and `--output-dir` may not be the
+config's output directory or sit inside/around it.
+
+Cost: the first import reads the spool once to verify SHA-256, then Pass 2 reads it
+again to merge — two sequential reads of the benchmark's **1.02 GB** Pass 1 spool
+(the full-corpus spool is a different, ~71 GB artifact). A restart checks lengths
+up front and leaves each partition's checksum to the merge, so it does not pay for
+the extra full read. Full procedure and the before/after audit commands:
+`docs/association.md` §7.
+
 ## Recommended sequence (approval gates included)
 
 1. `profile` both files and confirm the canonical mapping (adjust `columns` if needed).
@@ -579,7 +626,7 @@ volume fills, but it does not create space: an under-sized machine fails at hour
 | High rejected-row count | Check the encoding/delimiter for that file; inspect `workDir/rejected.jsonl` reasons. |
 | `Refusing to start: temporary space is insufficient` | Free space on the `workDir` volume, or lower `partitions`. |
 | `Stopping before the disk fills: … below the … floor` | The mid-run guard (512 MB free on `outputDir`), checked after every partition. Nothing written was lost and the checkpoint is still at `pass2-merge`: free space and re-run the same command to resume — the partial output is reset and replayed, not appended to. |
-| `workDir already holds a checkpoint for a different run: …` | The spool belongs to another run (different version, sample size, partitions or source paths). Re-run with `--no-resume`, or point `workDir` somewhere empty. Nothing was read or written before the stop. |
+| `workDir already holds a checkpoint for a different run: …` | The spool belongs to another run (different version, sample size, partitions or source paths). If that is correct and you want a **new output version from the same spool**, use `pass2-from-spool` (it never clears the spool — see "Rebuilding Pass 2 under a different version"). Otherwise re-run with `--no-resume` (which clears this work directory's spool) or point `workDir` somewhere empty. Nothing was read or written before the stop. |
 | `was written without a run identity; refusing to resume it` | A checkpoint from a build older than the run-identity change. Re-run with `--no-resume` once. |
 | A resumed run reports `source_missing_rows` (csv1=0, csv2=0) | Fixed: pass-1 counters are restored from the checkpoint, so a resumed run no longer fails validation over its own bookkeeping. If you see it on an older build, re-run with `--no-resume` once. |
 | `JSON Parse error: Unterminated string` during `pass2-merge` | Fixed: U+2028/U+2029 in a spool row were split by the old `readline` reader. See "The 1 M real-data failure" above. Records written by the old build still read correctly with the new reader, and `index:spool-doctor` reports any record it cannot parse with its partition, line and byte offset. |
