@@ -677,6 +677,12 @@ describe("the association audit, on a real generated index", () => {
     expect(report.reconciliation.contactCount.mismatched).toBe(0);
     expect(report.reconciliation.associations.mismatched).toBe(0);
     expect(report.reconciliation.facets.mismatched).toBe(0);
+    // Format v4 keeps facets in `details/`; the audit must merge them back, or
+    // "0 disagree" would describe a field it never read. Checked > 0 proves the
+    // reconciliation still compares real stored values.
+    expect(report.reconciliation.facets.checked).toBeGreaterThan(0);
+    // ...and the values came from the detail objects, not from the projections.
+    expect(report.detailsMerged).toBeGreaterThan(0);
     expect(report.reconciliation.ids.duplicated).toBe(0);
     expect(report.reconciliation.preserved).toBe(report.preserved.total);
     expect(report.preserved.missingClaimedName).toBe(0);

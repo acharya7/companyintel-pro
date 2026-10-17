@@ -90,6 +90,11 @@ if (!existsSync(manifestPath)) {
   process.exit(1);
 }
 
+const manifest = readJson(manifestPath);
+const directoryPath = join(dir, "indexes", version, "directory.json");
+const directory = existsSync(directoryPath) ? readJson(directoryPath) : null;
+const formatVersion = directory?.formatVersion ?? manifest.indexFormatVersion ?? null;
+
 /* Companies: payload is { firstRef, companies: Company[] }, so the global ref of
    record i is firstRef + i. Contacts are stored per company ref. */
 const companiesDir = join(dir, "companies", version);
@@ -99,6 +104,31 @@ if (existsSync(companiesDir)) {
     const payload = readJson(join(companiesDir, name));
     const firstRef = payload.firstRef ?? 0;
     (payload.companies ?? []).forEach((company, index) => companies.push({ ref: firstRef + index, company }));
+  }
+}
+
+/*
+ * Format v4 moved `facets` into `details/` with the rest of the record-only
+ * fields. The facet reconciliation below must keep checking real values, so the
+ * detail record is merged back before it runs — otherwise every company would
+ * have no facets, `facets.checked` would be 0, and the audit would report
+ * "0 disagree" for a field it never looked at.
+ */
+const companyDetailsDir = join(dir, "details", version, "companies");
+let detailsMerged = 0;
+if (typeof formatVersion === "number" && formatVersion >= 4 && existsSync(companyDetailsDir)) {
+  const byRef = new Map(companies.map((entry) => [entry.ref, entry]));
+  for (const name of readdirSync(companyDetailsDir).filter((file) => file.endsWith(".json.gz")).sort()) {
+    const payload = readJson(join(companyDetailsDir, name));
+    const firstRef = payload.firstRef ?? 0;
+    (payload.records ?? []).forEach((record, index) => {
+      if (!record) return;
+      const entry = byRef.get(firstRef + index);
+      if (!entry) return;
+      if (record.facets) entry.company.facets = record.facets;
+      if (record.attributes) entry.company.attributes = record.attributes;
+      detailsMerged += 1;
+    });
   }
 }
 
@@ -126,15 +156,12 @@ if (existsSync(unassignedDir)) {
   }
 }
 
-const manifest = readJson(manifestPath);
-const directoryPath = join(dir, "indexes", version, "directory.json");
-const directory = existsSync(directoryPath) ? readJson(directoryPath) : null;
-
 const report = {
   version,
   dir,
   checkedAt: new Date().toISOString(),
-  indexFormatVersion: directory?.formatVersion ?? manifest.indexFormatVersion ?? null,
+  indexFormatVersion: formatVersion,
+  detailsMerged,
   ...auditAssociations({ companies, contactsByRef, sampleLimit }),
   ...auditStoredAssociations({ companies, contactsByRef, unassigned, sampleLimit }),
   unassignedObjects,
