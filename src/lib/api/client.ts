@@ -9,12 +9,18 @@
  * switching to sample data.
  */
 
-import type { CompanyDetailResponse, CompanySearchResponse, ContactPageResponse, DatasetStatusResponse } from "@/shared/models";
+import type {
+  CompanyDetailResponse,
+  CompanySearchResponse,
+  ContactPageResponse,
+  DatasetStatusResponse,
+  UnassignedContactsResponse,
+} from "@/shared/models";
 import { SEARCH_LIMITS, buildContactCacheKey, buildSearchCacheKey } from "@/shared/search/engine";
 import { persistentCache, type PersistentCacheOptions } from "@/lib/cache/persistent-cache";
 import { LocalApiClient } from "./local";
 import { WorkerApiClient } from "./worker";
-import { API_CLIENT_METHODS, apiClientMethodNames, type ApiClient, type CompanySearchParams, type ContactQueryParams } from "./types";
+import { API_CLIENT_METHODS, apiClientMethodNames, type ApiClient, type CompanySearchParams, type ContactQueryParams, type UnassignedQueryParams } from "./types";
 
 interface ViteEnv {
   VITE_API_MODE?: string;
@@ -148,6 +154,12 @@ export function withPersistentCache(base: ApiClient): ApiClient {
         filters: params.filters as Record<string, unknown> | undefined,
       });
       return cached(key, datasetVersion, () => base.getCompanyContacts(companyId, params));
+    },
+
+    async getCompanyUnassigned(companyId: string, params: UnassignedQueryParams = {}): Promise<UnassignedContactsResponse> {
+      const datasetVersion = await resolveVersion().catch(() => "unknown");
+      const key = `unassigned|${datasetVersion}|${companyId}|${params.page ?? 1}|${params.pageSize ?? 25}|${(params.category ?? []).join(",")}`;
+      return cached(key, datasetVersion, () => base.getCompanyUnassigned(companyId, params));
     },
 
     async listContacts(params: ContactQueryParams = {}): Promise<ContactPageResponse> {

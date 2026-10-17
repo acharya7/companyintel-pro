@@ -28,20 +28,23 @@ import { cpus, freemem, totalmem } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { gzipSync } from "node:zlib";
 
-import type { Company, Contact, DatasetStats, DatasetVersionSummary, FacetBucket, IndexingCounters, SourceRef } from "../../../src/shared/models";
-import { NORMALIZER_VERSION } from "../../../src/shared/normalize";
+import type { AssociationCounts, Company, Contact, DatasetStats, DatasetVersionSummary, FacetBucket, IndexingCounters, SourceRef, UnassignedContact } from "../../../src/shared/models";
+import { associateContact, type AssociationCandidate, type AssociationRecord } from "../../../src/shared/association";
+import { NORMALIZER_VERSION, normalizeAttribute, normalizeDomain } from "../../../src/shared/normalize";
 import {
   INDEX_FORMAT_VERSION,
   SHARDING,
   folderFor,
   qualityByte,
+  unassignedPartitionKey,
   type CompanyPartitionPayload,
   type ContactPartitionPayload,
   type IndexDirectory,
   type Postings,
   type ShardPayload,
+  type UnassignedPartitionPayload,
 } from "../../../src/shared/search/index-format";
-import { contactId as contactIdFor, shardOf } from "../../../src/shared/hash";
+import { companyId as companyIdFor, contactId as contactIdFor, shardOf, stableHash } from "../../../src/shared/hash";
 import type { FileProfile } from "./csv";
 import {
   ALL_CANONICAL_FIELDS,
@@ -956,6 +959,27 @@ interface PartitionSink {
   hash: Hash;
 }
 
+/**
+ * One contact row waiting for its Stage B decision.
+ *
+ * The decision is deliberately deferred until the whole partition has been read:
+ * a contact can only be judged against *every* credible company in its name
+ * family (including ones that appear later in the file), which is the whole
+ * point of separating company resolution from contact association.
+ */
+interface PendingContact {
+  /** Company record the row's own company name resolved to — the claim. */
+  claimedRef: number;
+  /** Normalized name of the row's own claim (defines the candidate family). */
+  claimedName: string;
+  /** Company name exactly as the source row carried it. */
+  claimedCompanyName: string;
+  input: RawContactInput;
+  source: SourceRef;
+  /** True when the row's own employer identity is owned by its company record. */
+  identityClaimed: boolean;
+}
+
 interface SpoolRow {
   /** Every identifier key this row carries (strongest first). */
   keys: string[];
@@ -1460,12 +1484,26 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
          * refs per company. A Set makes the same decision in constant time.
          */
         sourceKeys: Set<string>;
-        contacts: Map<string, Contact>;
         ambiguous: boolean;
         strong: boolean;
         normalizedName: string;
       }
     >();
+    /**
+     * Every contact row of this partition, awaiting its association decision.
+     *
+     * Memory is the same as before — this is exactly the set of contact rows the
+     * merge already had to hold to deduplicate them — but the decision itself now
+     * happens after the last row of the partition has been read.
+     */
+    const pendingContacts: PendingContact[] = [];
+    /**
+     * Unresolved contacts already preserved in THIS partition, by claimed name and
+     * fingerprint. A per-partition set: everything that can be a duplicate of the
+     * same person is written to the same object, so the set is bounded by the
+     * partition rather than by the dataset.
+     */
+    const unresolvedSeen = new Set<string>();
 
     /*
      * Records are delimited by `\n` ONLY and parsed strictly (see jsonl.ts):
@@ -1493,7 +1531,6 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
             input: row.company,
             sources: [],
             sourceKeys: new Set(),
-            contacts: new Map(),
             ambiguous: decision.ambiguous,
             strong: row.strong,
             normalizedName: row.normalizedName,
@@ -1507,18 +1544,24 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
           group.sources.push(row.source);
         }
         if (row.contact) {
-          const provisional = buildContact({
+          /*
+           * Stage B is deliberately deferred to the end of the partition.
+           *
+           * Attaching the contact here — to the record its own row resolved to —
+           * was the defect this change removes: the row's company NAME was the
+           * only thing deciding the employer, so a person row naming a company
+           * that shares its name with five others was attached to whichever
+           * record happened to be resolved first, and the email domain, country
+           * and city that could distinguish them were never consulted.
+           */
+          pendingContacts.push({
+            claimedRef: decision.ref,
+            claimedName: row.normalizedName,
+            claimedCompanyName: row.company.name,
             input: row.contact,
-            company: placeholderCompany(row.bucket, row.company),
             source: row.source,
-            rowFingerprint: `${row.source.source}:${row.source.row}`,
+            identityClaimed: decision.identityClaimed,
           });
-          const fingerprint = contactFingerprint(provisional);
-          if (fingerprint && group.contacts.has(fingerprint)) {
-            counters.duplicateRowsResolved += 1;
-          } else {
-            group.contacts.set(fingerprint ?? `r:${row.source.source}:${row.source.row}`, provisional);
-          }
         }
 
         // Heartbeat: a partition is read and merged in one go, so without this a
@@ -1560,6 +1603,14 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       );
     }
 
+    /*
+     * Identifier-ownership conflicts observed while resolving this partition.
+     * A non-zero count is expected on real data (two records of one name family
+     * claiming the same domain); it is reported so a spike is visible, and each
+     * conflict is still recorded against the record that owned the key first.
+     */
+    counters.identifierConflicts = (counters.identifierConflicts ?? 0) + resolver.stats().conflicts;
+
     // Several keys can share one normalized name (e.g. two subsidiaries with
     // different domains). Those are kept as separate records and flagged, never
     // merged — exactly what the specification requires.
@@ -1567,6 +1618,126 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     for (const group of groups.values()) nameCounts.set(group.normalizedName, (nameCounts.get(group.normalizedName) ?? 0) + 1);
     for (const group of groups.values()) {
       if ((nameCounts.get(group.normalizedName) ?? 0) > 1) group.ambiguous = true;
+    }
+
+    /*
+     * ------------------------- Stage B: associate contacts -------------------------
+     *
+     * Every company record in this partition is now known, so a contact can be
+     * judged against every credible company of ITS name rather than only against
+     * the record its own row resolved to. See `src/shared/association.ts` for the
+     * evidence hierarchy and the four categories.
+     */
+    const candidates = new Map<number, AssociationCandidate>();
+    const refsByName = new Map<string, number[]>();
+    /** Canonical identity key per company ref — the id both objects and search use. */
+    const identityKeyByRef = new Map<number, string>();
+    /** True when that identity is an identifier this record actually owns. */
+    const identityIsStrongByRef = new Map<number, boolean>();
+    for (const group of groups.values()) {
+      const domain = normalizeDomain(group.input.domain ?? group.input.website);
+      const identity = groupIdentity(group.keys, group.normalizedName, (key) => resolver.refFor(key) === group.ref);
+      identityKeyByRef.set(group.ref, identity.key);
+      identityIsStrongByRef.set(group.ref, identity.strong);
+      candidates.set(group.ref, {
+        ref: group.ref,
+        id: companyIdFor(identity.key),
+        name: group.input.name,
+        normalizedName: group.normalizedName,
+        domain: domain ?? null,
+        linkedinUrl: normalizeAttribute(group.input.linkedinUrl) ?? null,
+        country: normalizeAttribute(group.input.country) ?? null,
+        state: normalizeAttribute(group.input.state) ?? null,
+        city: normalizeAttribute(group.input.city) ?? null,
+        // Identity this record OWNS. A contradicting row whose keys were all
+        // already taken owns none, so it must not be offered to Stage B as a
+        // credible employer — nor may its own count as one.
+        hasStrongIdentity: identity.strong,
+      });
+      const list = refsByName.get(group.normalizedName);
+      if (list) list.push(group.ref);
+      else refsByName.set(group.normalizedName, [group.ref]);
+    }
+
+    /** Attached contacts per company ref, keyed by their dedup fingerprint. */
+    const attached = new Map<number, Map<string, Contact>>();
+    /** Contacts preserved without an employer — never dropped, never mis-attached. */
+    const unresolvedContacts: UnassignedContact[] = [];
+
+    for (const pending of pendingContacts) {
+      const familyRefs = refsByName.get(pending.claimedName) ?? [];
+      const family = (familyRefs.includes(pending.claimedRef) ? familyRefs : [...familyRefs, pending.claimedRef])
+        .map((ref) => candidates.get(ref))
+        .filter((candidate): candidate is AssociationCandidate => Boolean(candidate));
+      /*
+       * Only records with an identity of their own compete for a contact. A
+       * name-only placeholder of the same name is not an employer: leaving it in
+       * would let a person be attached to a company record that carries nothing
+       * but the name — exactly the "presented as verified" failure the
+       * specification forbids. When EVERY member is name-only there is nothing
+       * better, so the placeholders are used (and the verdict stays `plausible`).
+       */
+      const credible = family.filter((candidate) => candidate.hasStrongIdentity);
+      const decision = associateContact({
+        candidates: credible.length ? credible : family,
+        contact: pending.input,
+        claimedRef: pending.claimedRef,
+        claimedIdentity: pending.identityClaimed,
+      });
+      const claimedCompanyId = candidates.get(pending.claimedRef)?.id ?? "";
+
+      if (decision.assignedRef === null) {
+        const contact = contactFromRow(pending, "", decision.record);
+        const preserved: UnassignedContact = {
+          ...contact,
+          association: decision.record,
+          claimedCompanyName: pending.claimedCompanyName,
+          claimedNormalizedName: pending.claimedName,
+        };
+        const fingerprint = unassignedFingerprint(preserved);
+        const key = fingerprint ?? `r:${pending.source.source}:${pending.source.row}`;
+        if (fingerprint && unresolvedSeen.has(`${pending.claimedName}\u0000${key}`)) {
+          counters.duplicateRowsResolved += 1;
+        } else {
+          if (fingerprint) unresolvedSeen.add(`${pending.claimedName}\u0000${key}`);
+          unresolvedContacts.push(preserved);
+          counters.uniqueContacts += 1;
+          counters.contactsUnresolved = (counters.contactsUnresolved ?? 0) + 1;
+          if (counters.perSource[pending.source.source]) counters.perSource[pending.source.source].contacts += 1;
+          recordCoverage(coverage, preserved);
+        }
+        continue;
+      }
+
+      const assignedCompanyId = candidates.get(decision.assignedRef)?.id ?? "";
+      const association = decision.moved && claimedCompanyId ? { ...decision.record, movedFrom: claimedCompanyId } : decision.record;
+      const contact = contactFromRow(pending, assignedCompanyId, association);
+
+      /*
+       * Duplicate detection happens AFTER the decision, not before it: two rows
+       * for the same person used to be deduplicated per claimed company, so the
+       * same individual could survive as two contacts once reassignment put them
+       * in the same place, or be merged with a different person who only shared a
+       * name. The fingerprint is company-scoped and is computed from the FINAL
+       * company id, which is what `buildContactId` uses as well.
+       */
+      const bucket = attached.get(decision.assignedRef) ?? new Map<string, Contact>();
+      const fingerprint = contactFingerprint(contact);
+      if (fingerprint && bucket.has(fingerprint)) {
+        counters.duplicateRowsResolved += 1;
+      } else {
+        bucket.set(fingerprint ?? `r:${pending.source.source}:${pending.source.row}`, contact);
+        attached.set(decision.assignedRef, bucket);
+        if (decision.moved) counters.contactsMoved = (counters.contactsMoved ?? 0) + 1;
+      }
+    }
+
+    if (unresolvedContacts.length) {
+      // Deterministic order, so a re-run writes byte-identical objects.
+      unresolvedContacts.sort((a, b) => a.claimedNormalizedName.localeCompare(b.claimedNormalizedName) || a.id.localeCompare(b.id));
+      const payload: UnassignedPartitionPayload = { partition: entry.partition, contacts: unresolvedContacts };
+      await writer.writeJson(unassignedPartitionKey(config.datasetVersion, entry.partition), payload);
+      counters.unassignedObjects = (counters.unassignedObjects ?? 0) + 1;
     }
 
     // Emit companies in a deterministic order so refs stay reproducible.
@@ -1578,8 +1749,11 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
         ref: globalRef,
         input: group.input,
         key: {
-          key: pickCanonicalKey(group.keys),
-          strong: group.strong,
+          // The canonical identity is `identityKeyByRef` — built from what this
+          // record OWNS plus the deterministic fallback — so two records can never
+          // end up sharing one id because they both listed the same stolen key.
+          key: identityKeyByRef.get(group.ref) ?? `n:${group.normalizedName}`,
+          strong: identityIsStrongByRef.get(group.ref) ?? false,
           normalizedName: group.normalizedName,
           display: group.input.name,
         },
@@ -1587,12 +1761,28 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
         ambiguous: group.ambiguous,
       });
       const facets = company.facets ?? { designations: [], departments: [], seniority: [], countries: [], cities: [], emailAvailable: 0, linkedinAvailable: 0 };
-      const contacts: Contact[] = [];
-      for (const contact of group.contacts.values()) {
-        const finalised: Contact = { ...contact, companyId: company.id };
-        finalised.id = buildContactId(company.id, finalised);
-        contacts.push(finalised);
+      const contacts: Contact[] = [...(attached.get(group.ref)?.values() ?? [])];
+      /**
+       * The trustworthy breakdown of this company's contacts, stored on the
+       * record so a profile can be honest about it without reading a single
+       * contact row. Recalculated from the FINAL associations, so it always adds
+       * up to `contactCount`.
+       */
+      const associations: AssociationCounts = { highConfidence: 0, plausible: 0, conflicting: 0, total: 0 };
+      for (const finalised of contacts) {
         accumulateFacets(facets, finalised);
+        const category = finalised.association?.category;
+        if (category === "high_confidence") {
+          associations.highConfidence += 1;
+          counters.contactsHighConfidence = (counters.contactsHighConfidence ?? 0) + 1;
+        } else if (category === "plausible") {
+          associations.plausible += 1;
+          counters.contactsPlausible = (counters.contactsPlausible ?? 0) + 1;
+        } else if (category === "conflicting") {
+          associations.conflicting += 1;
+          counters.contactsConflicting = (counters.contactsConflicting ?? 0) + 1;
+        }
+        associations.total += 1;
         counters.uniqueContacts += 1;
         if (counters.perSource[finalised.source.source]) counters.perSource[finalised.source.source].contacts += 1;
         if (contacts.length === 1) {
@@ -1603,13 +1793,11 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
         if (finalised.designation) contactStats.byDesignation.set(finalised.designation, (contactStats.byDesignation.get(finalised.designation) ?? 0) + 1);
         if (finalised.department) contactStats.byDepartment.set(finalised.department, (contactStats.byDepartment.get(finalised.department) ?? 0) + 1);
         if (finalised.seniority) contactStats.bySeniority.set(finalised.seniority, (contactStats.bySeniority.get(finalised.seniority) ?? 0) + 1);
-        if (finalised.email) coverage.email += 1;
-        if (finalised.linkedinUrl) coverage.linkedin += 1;
-        if (finalised.phone) coverage.phone += 1;
-        if (!finalised.email && !finalised.linkedinUrl && !finalised.phone) coverage.neither += 1;
+        recordCoverage(coverage, finalised);
       }
       company.contactCount = contacts.length;
       company.facets = finalizeFacets(facets);
+      company.associations = associations;
       if (group.ambiguous) counters.ambiguousCompanies += 1;
 
       /*
@@ -1731,7 +1919,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       etaSeconds,
       message:
         `pass 2: ${processedPartitions}/${totalPartitions} partitions · ${counters.uniqueCompanies.toLocaleString()} companies · ` +
-        `${counters.uniqueContacts.toLocaleString()} contacts · ${(elapsedMs / 1000).toFixed(1)}s elapsed · ` +
+        `${counters.uniqueContacts.toLocaleString()} contacts (${(counters.contactsUnresolved ?? 0).toLocaleString()} kept without an employer) · ${(elapsedMs / 1000).toFixed(1)}s elapsed · ` +
         `${companiesPerSecond === null ? "-" : companiesPerSecond.toLocaleString()} companies/s · ` +
         `ETA ${etaSeconds === null || etaSeconds === 0 ? "-" : `${Math.floor(etaSeconds / 60)}m${String(etaSeconds % 60).padStart(2, "0")}s`}` +
         ` · this partition ${(partitionMs / 1000).toFixed(1)}s` +
@@ -1819,9 +2007,10 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       if (object.key.startsWith("indexes/")) total.indexes += object.bytes;
       else if (object.key.startsWith("companies/")) total.companies += object.bytes;
       else if (object.key.startsWith("contacts/")) total.contacts += object.bytes;
+      else if (object.key.startsWith("unassigned/")) total.unassigned += object.bytes;
       return total;
     },
-    { indexes: 0, companies: 0, contacts: 0 },
+    { indexes: 0, companies: 0, contacts: 0, unassigned: 0 },
   );
 
   const directory: IndexDirectory = {
@@ -1837,10 +2026,17 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       ids: config.shards.ids,
       companyPartitions: companyPartitionIndex,
       contactPartitions: contactPartitionIndex,
+      // Recorded so the reader can locate an `unassigned/` object from a company
+      // record alone: the object key is that company's Pass 1 partition, and only
+      // the run that wrote the spool knows how many partitions there were.
+      spoolPartitions: config.partitions,
     },
     counts: { companies: counters.uniqueCompanies, contacts: counters.uniqueContacts, indexedAliases: 0 },
     sources: config.sources.map((source) => source.id),
-    bytes: { ...bytes, total: bytes.indexes + bytes.companies + bytes.contacts },
+    bytes: { ...bytes, total: bytes.indexes + bytes.companies + bytes.contacts + bytes.unassigned },
+    ...(counters.unassignedObjects
+      ? { unassigned: { objects: counters.unassignedObjects, contacts: counters.contactsUnresolved ?? 0 } }
+      : {}),
     fields: { company: ["name", "domain", "industry", "country", "city", "companySize", "revenue"], contact: ["fullName", "title", "email", "phone", "linkedinUrl", "country", "city"] },
   };
   await writer.writeJson(`indexes/${config.datasetVersion}/directory.json`, directory, false);
@@ -2065,14 +2261,82 @@ function trigrams(value: string): string[] {
   return out;
 }
 
-function placeholderCompany(key: string, input: RawCompanyInput): Company {
-  return {
-    id: key,
-    name: input.name,
-    normalizedName: input.name.toLowerCase(),
-    contactCount: 0,
-    sources: [],
-  };
+/**
+ * Canonical identity key of one resolved company record.
+ *
+ * Preference: an identifier the record actually owns (domain → LinkedIn → source
+ * id), then the name key when it owns that, and only when it owns NOTHING — a row
+ * whose every identifier was already owned elsewhere — a key derived from the
+ * evidence pattern (normalized name + key set).
+ *
+ * That last case matters twice: the record still needs a deterministic id, and it
+ * must not borrow the id of the company whose domain it was refused. Deriving it
+ * from the pattern keeps ids unique (a pattern can only occur in the partition of
+ * its own name) and identical between runs.
+ */
+function groupIdentity(
+  keys: Set<string>,
+  normalizedName: string,
+  isOwned: (key: string) => boolean,
+): { key: string; strong: boolean } {
+  const owned = [...keys].filter((key) => isOwned(key));
+  const ownedStrong = owned.filter((key) => !key.startsWith("n:"));
+  if (ownedStrong.length) return { key: pickCanonicalKey(ownedStrong), strong: true };
+  if (owned.length) return { key: pickCanonicalKey(owned), strong: false };
+  const signature = [...keys].sort().join("|");
+  return { key: `x:${normalizedName}:${stableHash(signature)}`, strong: false };
+}
+
+/**
+ * Final contact record for a Stage B decision.
+ *
+ * One code path for attached and preserved contacts, so the two can never diverge
+ * in the fields they copy. `companyId` is the empty string for a contact kept
+ * without an employer, and the id is derived from the fingerprint in that case
+ * (a company-scoped id would be a fabricated employer).
+ */
+function contactFromRow(pending: PendingContact, companyIdValue: string, association: AssociationRecord): Contact {
+  const provisional = buildContact({
+    input: pending.input,
+    company: {
+      id: companyIdValue,
+      name: pending.claimedCompanyName,
+      normalizedName: pending.claimedName,
+      contactCount: 0,
+      sources: [],
+    },
+    source: pending.source,
+    rowFingerprint: `${pending.source.source}:${pending.source.row}`,
+  });
+  const contact: Contact = { ...provisional, companyId: companyIdValue, association };
+  contact.id = companyIdValue ? buildContactId(companyIdValue, contact) : buildUnassignedContactId(contact);
+  return contact;
+}
+
+/**
+ * Identity of a preserved contact: email, then LinkedIn, then name + title within
+ * the claimed name. Two rows that agree are one contact; two people with the same
+ * name and different titles stay separate.
+ */
+function unassignedFingerprint(contact: Contact & { claimedNormalizedName: string }): string | null {
+  if (contact.email) return `e:${contact.email}`;
+  if (contact.linkedinUrl) return `l:${contact.linkedinUrl.replace(/^https?:\/\//, "")}`;
+  if (contact.fullName) return `n:${contact.claimedNormalizedName}|${contact.fullName.toLowerCase()}|${(contact.title ?? "").toLowerCase()}`;
+  return null;
+}
+
+/** Stable id for a contact that has no company. */
+function buildUnassignedContactId(contact: Contact): string {
+  const fingerprint = contact.email ?? contact.linkedinUrl ?? `${contact.fullName}|${contact.title ?? ""}|${contact.source.row}`;
+  return contactIdFor(`unassigned|${fingerprint}`);
+}
+
+/** Contact coverage counters, shared by attached and preserved contacts. */
+function recordCoverage(coverage: { email: number; linkedin: number; phone: number; neither: number }, contact: Contact): void {
+  if (contact.email) coverage.email += 1;
+  if (contact.linkedinUrl) coverage.linkedin += 1;
+  if (contact.phone) coverage.phone += 1;
+  if (!contact.email && !contact.linkedinUrl && !contact.phone) coverage.neither += 1;
 }
 
 /**

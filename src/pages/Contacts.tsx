@@ -13,6 +13,7 @@ import { Link } from "react-router";
 import { Building2, Copy, FileDown, Linkedin, Mail, Phone, Search, Star, Users, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ASSOCIATION_CATEGORY_HINTS, ASSOCIATION_CATEGORY_LABELS } from "@/shared/association";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
@@ -289,6 +290,15 @@ export default function Contacts() {
                           <TableCell>
                             <p className="font-medium">{contact.fullName}</p>
                             <p className="text-[11px] text-muted-foreground">{contact.title ?? "—"}</p>
+                            {contact.association && contact.association.category !== "high_confidence" ? (
+                              <Badge
+                                variant="outline"
+                                className="mt-1 border-chart-3/50 bg-chart-3/12 text-[10px] font-normal text-chart-3"
+                                title={ASSOCIATION_CATEGORY_HINTS[contact.association.category]}
+                              >
+                                {ASSOCIATION_CATEGORY_LABELS[contact.association.category]}
+                              </Badge>
+                            ) : null}
                           </TableCell>
                           <TableCell className="hidden max-w-[200px] truncate md:table-cell">
                             <Link to={`/companies/${contact.companyId}`} className="hover:text-primary">

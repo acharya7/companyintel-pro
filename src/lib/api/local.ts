@@ -26,8 +26,10 @@ import type {
   SavedLead,
   SavedSearch,
   SortOrder,
+  UnassignedContactsResponse,
   UserSettings,
 } from "@/shared/models";
+import type { AssociationCategory } from "@/shared/association";
 import { DEFAULT_SETTINGS } from "@/shared/models";
 import { LEAD_STATUSES } from "@/shared/models";
 import { leadId } from "@/shared/hash";
@@ -35,7 +37,7 @@ import { normalizeEmail } from "@/shared/normalize";
 import { searchCompanies } from "@/shared/search/engine";
 import { LocalCandidateSource } from "@/shared/search/local-index";
 import { EXPORT_COLUMN_HEADERS, exportFilename, toCsv, type CsvColumn } from "@/shared/csv";
-import { DEFAULT_PAGE_SIZE, MAX_EXPORT_ROWS, MAX_PAGE_SIZE } from "@/shared/api-contract";
+import { DEFAULT_PAGE_SIZE, MAX_EXPORT_ROWS, MAX_PAGE_SIZE, toContactFilters } from "@/shared/api-contract";
 import {
   SAMPLE_DATASET_LABEL,
   SAMPLE_DATASET_VERSION,
@@ -50,6 +52,7 @@ import type {
   HealthResponse,
   LeadListResponse,
   SaveLeadInput,
+  UnassignedQueryParams,
   UpdateLeadInput,
 } from "./types";
 import type { ExportRequestBody, SavedSearchRequest, SettingsRequest } from "@/shared/api-contract";
@@ -261,6 +264,37 @@ export class LocalApiClient implements ApiClient {
       ? params.companyIds.flatMap((id) => this.dataset.contactsByCompany.get(id) ?? [])
       : this.dataset.contacts;
     return this.paginateContacts(pool, params.companyId ?? null, params);
+  }
+
+  /**
+   * The preview's preserved contacts. Keyed directly by company id because the
+   * sample dataset is built in memory; production addresses them by the company's
+   * Pass 1 partition (see `unassignedPartitionKey`).
+   */
+  async getCompanyUnassigned(companyId: string, params: UnassignedQueryParams = {}): Promise<UnassignedContactsResponse> {
+    const company = this.companyById.get(companyId);
+    if (!company) throw new Error(`Company ${companyId} was not found in the active dataset.`);
+    const wanted = params.category?.length ? params.category : (["unresolved"] as AssociationCategory[]);
+    const matching = (this.dataset.unassignedByCompany.get(companyId) ?? []).filter((contact) =>
+      wanted.includes(contact.association.category),
+    );
+    const pageSize = Math.min(Math.max(params.pageSize ?? DEFAULT_PAGE_SIZE, 1), MAX_PAGE_SIZE);
+    const page = Math.max(params.page ?? 1, 1);
+    const start = (page - 1) * pageSize;
+    return {
+      companyId,
+      companyName: company.name,
+      contacts: matching.slice(start, start + pageSize),
+      page: {
+        page,
+        pageSize,
+        total: matching.length,
+        totalIsLowerBound: false,
+        hasMore: start + pageSize < matching.length,
+      },
+      datasetVersion: SAMPLE_DATASET_VERSION,
+      totals: { unresolved: matching.length, conflicting: company.associations?.conflicting ?? 0 },
+    };
   }
 
   private paginateContacts(
@@ -528,7 +562,7 @@ export class LocalApiClient implements ApiClient {
           ? this.dataset.contactsByCompany.get(job.companyId) ?? []
           : this.dataset.contacts;
       for (const contact of pool) {
-        if (!contactMatchesFilters(contact, job.filters)) continue;
+        if (!contactMatchesFilters(contact, toContactFilters(job.filters))) continue;
         if (rows.length >= MAX_EXPORT_ROWS) {
           truncated = true;
           break;

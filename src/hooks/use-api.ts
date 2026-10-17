@@ -11,6 +11,7 @@ import { useMutation, useQuery, useQueryClient, keepPreviousData } from "@tansta
 import { toast } from "sonner";
 import { createApiClient, apiMode, apiBaseUrl, configurePersistentCache, persistentCache, invalidateCacheForVersion } from "@/lib/api/client";
 import { datasetModeInfo } from "@/lib/api/types";
+import type { AssociationCategory } from "@/shared/association";
 import type { CompanyFilters, ContactFilters, CompanySortField, ContactSortField, LeadStatus, SortOrder } from "@/shared/models";
 import type { ExportRequestBody, SavedSearchRequest, SettingsRequest } from "@/shared/api-contract";
 
@@ -25,6 +26,7 @@ export const queryKeys = {
   search: (params: unknown) => ["company-search", params] as const,
   company: (id: string) => ["company", id] as const,
   companyContacts: (id: string, params: unknown) => ["company-contacts", id, params] as const,
+  companyUnassigned: (id: string, params: unknown) => ["company-unassigned", id, params] as const,
   contacts: (params: unknown) => ["contacts", params] as const,
   contact: (id: string) => ["contact", id] as const,
   leads: ["leads"] as const,
@@ -169,6 +171,26 @@ export function useCompanyContacts(
     queryKey: queryKeys.companyContacts(companyId ?? "", params),
     queryFn: () => api.getCompanyContacts(companyId!, params),
     enabled: Boolean(companyId),
+    placeholderData: keepPreviousData,
+    staleTime: 5 * 60_000,
+  });
+}
+
+/**
+ * Contacts preserved without an employer that claimed this company's name.
+ *
+ * Deliberately opt-in (`enabled`): a company profile must not pay for a second
+ * object read unless the user actually asks to review the uncertain rows.
+ */
+export function useCompanyUnassigned(
+  companyId: string | undefined,
+  params: { page: number; pageSize: number; category?: AssociationCategory[] },
+  enabled = true,
+) {
+  return useQuery({
+    queryKey: queryKeys.companyUnassigned(companyId ?? "", params),
+    queryFn: () => api.getCompanyUnassigned(companyId!, params),
+    enabled: Boolean(companyId) && enabled,
     placeholderData: keepPreviousData,
     staleTime: 5 * 60_000,
   });

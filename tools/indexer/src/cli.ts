@@ -396,6 +396,25 @@ async function cmdRun(config: IndexerConfig, flags: Record<string, string | bool
   console.log(`  unique contacts   ${result.counters.uniqueContacts.toLocaleString()}`);
   console.log(`  ambiguous kept apart ${result.counters.ambiguousCompanies.toLocaleString()}  (name collisions with conflicting strong evidence)`);
   console.log(`  missing company id   ${result.counters.recordsMissingCompanyId.toLocaleString()}`);
+  // Stage B's outcome, printed by the run itself so an operator sees the
+  // association split without opening the audit. A run resumed from an older
+  // checkpoint has no association counters, and then prints nothing rather than
+  // a row of zeros that would read like a real result.
+  const association = result.counters;
+  if (association.contactsHighConfidence !== undefined || association.contactsUnresolved !== undefined || association.contactsMoved !== undefined) {
+    console.log(
+      `  association       ${(association.contactsHighConfidence ?? 0).toLocaleString()} high confidence, ` +
+        `${(association.contactsPlausible ?? 0).toLocaleString()} plausible, ` +
+        `${(association.contactsConflicting ?? 0).toLocaleString()} conflicting, ` +
+        `${(association.contactsUnresolved ?? 0).toLocaleString()} preserved without an employer`,
+    );
+    console.log(
+      `  association moves ${(association.contactsMoved ?? 0).toLocaleString()} contact(s) attached to a different company of the same name than their row claimed`,
+    );
+    console.log(
+      `  claims refused    ${(association.identifierConflicts ?? 0).toLocaleString()}  (a later row tried to take an identifier another company already owns)`,
+    );
+  }
   console.log(`  objects written   ${result.objects.length.toLocaleString()}`);
   console.log(`  elapsed           ${(result.elapsedMs / 1000).toFixed(1)} s${result.resumed ? " (resumed: pass 1 skipped, spool reused)" : ""}`);
   // Measured, per stage. Pass 1 is one streaming loop (network read + CSV parse +

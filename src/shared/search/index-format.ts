@@ -9,6 +9,7 @@
  *   indexes/<version>/…   exact / prefix / token / trigram shards + directory
  *   companies/<version>/… canonical company metadata partitions
  *   contacts/<version>/…  contact partitions, one per company range
+ *   unassigned/<version>/…contacts preserved WITHOUT an employer (format v3)
  *   manifests/<version>/  manifest + validation report
  *   manifests/active.json pointer to the published version (single small object)
  *   app-data/             saved leads, saved searches, settings, exports
@@ -23,7 +24,27 @@
  *     can treat them as immutable.
  */
 
-export const INDEX_FORMAT_VERSION = 2;
+import { shardOf } from "../hash";
+
+export const INDEX_FORMAT_VERSION = 3;
+
+/**
+ * Formats this reader/writer still understands.
+ *
+ * 2 — every object a v2 index holds, with no association metadata. A v2 index
+ *     stays readable (and stays a valid dataset version): the reader treats a
+ *     missing category as "not classified", never as verified, and a missing
+ *     `unassigned/` prefix as "this index kept no unresolved contacts".
+ * 3 — v2 plus: `association` on each contact, `associations` counts on each
+ *     company, `unassigned/<version>/####.json.gz` objects, and
+ *     `shards.spoolPartitions` so the reader can locate them.
+ */
+export const SUPPORTED_INDEX_FORMAT_VERSIONS: readonly number[] = [2, 3];
+
+/** True when a directory can be read by this build. */
+export function isSupportedFormatVersion(value: unknown): boolean {
+  return typeof value === "number" && SUPPORTED_INDEX_FORMAT_VERSIONS.includes(value);
+}
 
 export const R2_PREFIX = {
   raw: "raw/",
@@ -31,6 +52,7 @@ export const R2_PREFIX = {
   indexes: "indexes/",
   companies: "companies/",
   contacts: "contacts/",
+  unassigned: "unassigned/",
   manifests: "manifests/",
   appData: "app-data/",
   backups: "backups/",
@@ -133,6 +155,31 @@ export function contactPartitionKey(version: string, partition: number): string 
   return `${R2_PREFIX.contacts}${version}/${String(partition).padStart(5, "0")}.json.gz`;
 }
 
+/**
+ * Object holding the contacts of one spool partition that could not be
+ * associated with any company (format v3).
+ *
+ * One object per spool partition and one writer per object, which is what makes
+ * the list deterministic and append-free: a contact that cannot be resolved is
+ * written exactly once, into the partition its claimed company name hashes to.
+ */
+export function unassignedPartitionKey(version: string, partition: number): string {
+  return `${R2_PREFIX.unassigned}${version}/${String(partition).padStart(5, "0")}.json.gz`;
+}
+
+/**
+ * Spool partition a normalized company name was hashed into.
+ *
+ * Must stay identical to the indexer's `partitionFor("n:" + name, partitions)`
+ * (`tools/indexer/src/mapping.ts`): the reader derives the object key from the
+ * company record alone, so a different hash function here would silently look
+ * for unresolved contacts in an object that was never written.
+ * `tests/indexer-association.test.ts` asserts the two agree.
+ */
+export function spoolPartitionOfNormalizedName(normalizedName: string, partitions: number): number {
+  return shardOf(`n:${normalizedName}`, partitions);
+}
+
 /** Partition that holds a given global document reference. */
 export function partitionOfRef(ref: number, perPartition = SHARDING.companiesPerPartition): number {
   return Math.floor(ref / perPartition);
@@ -204,9 +251,19 @@ export interface IndexDirectory {
     ids: number;
     companyPartitions: number;
     contactPartitions: number;
+    /**
+     * Spool partitions the Pass 1 run used (format v3). Required to locate an
+     * `unassigned/` object; absent on v2 indexes, which have none.
+     */
+    spoolPartitions?: number;
   };
   counts: {
     companies: number;
+    /**
+     * Distinct contacts PRESERVED (attached to a company + kept without one).
+     * Nothing a source row contributed is ever outside this number; `unassigned`
+     * says how much of it could not be attached.
+     */
     contacts: number;
     /** Doc refs available per shard are derivable; kept for diagnostics. */
     indexedAliases: number;
@@ -219,6 +276,18 @@ export interface IndexDirectory {
     companies: number;
     contacts: number;
     total: number;
+    /** Bytes of `unassigned/` objects (format v3; omitted when there are none). */
+    unassigned?: number;
+  };
+  /**
+   * Contacts preserved without an employer (format v3). Absent on a v2 index, or
+   * on a v3 index whose contacts were all resolvable. `counts.contacts` above is
+   * the total preserved, so `counts.contacts - unassigned.contacts` is the number
+   * actually attached to a company.
+   */
+  unassigned?: {
+    objects: number;
+    contacts: number;
   };
   /** Top terms per shard live in the shard payloads; df stats are global. */
   fields: {
@@ -275,6 +344,14 @@ export interface ContactPartitionPayload {
   firstRef: number;
   /** companyRef → contacts (sorted by company ref inside the object). */
   byCompany: Record<string, unknown[]>;
+}
+
+/** One spool partition's preserved contacts (see `unassignedPartitionKey`). */
+export interface UnassignedPartitionPayload {
+  /** Spool partition this object belongs to. */
+  partition: number;
+  /** Contacts with no assigned employer, each carrying its claimed name. */
+  contacts: unknown[];
 }
 
 /**

@@ -28,6 +28,7 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 
 import { ObjectCache, ReadMetrics, isCacheableKey, searchCacheFor } from "../worker/src/search-cache";
+import { INDEX_FORMAT_VERSION, isSupportedFormatVersion } from "../src/shared/search/index-format";
 import { R2Store } from "../worker/src/store";
 import { R2CandidateSource } from "../worker/src/search-source";
 import { searchCompanies } from "../src/shared/search/engine";
@@ -213,7 +214,7 @@ describe("R2Store read path with a cache", () => {
 /* -------------------- a real format-v2 index, end to end ------------------- */
 
 describe("search over a real format-v2 index", () => {
-  test("the fixture index is format v2 and search reads it without duplicate objects", async () => {
+  test("a v2 directory and a generated directory both search without duplicate objects", async () => {
     const bucket = new FakeR2Bucket();
     const { readdirSync, statSync } = await import("node:fs");
     const { relative, sep } = await import("node:path");
@@ -238,7 +239,7 @@ describe("search over a real format-v2 index", () => {
     const store = new R2Store(bucket, { cache, metrics });
     const directory = await store.getDirectory(fixture.version);
     expect(directory).not.toBeNull();
-    expect(directory!.formatVersion).toBe(2);
+    expect(directory!.formatVersion).toBe(INDEX_FORMAT_VERSION);
 
     const source = new R2CandidateSource(store, directory!);
     const exact = await searchCompanies(source, "Microsoft Corporation", { pageSize: 25, maxHydrate: 8 });
@@ -247,6 +248,21 @@ describe("search over a real format-v2 index", () => {
 
     const fuzzy = await searchCompanies(source, "Microsft", { pageSize: 25, maxHydrate: 8 });
     expect(fuzzy.hits[0]?.name).toBe("Microsoft Corporation");
+
+    /*
+     * Backward compatibility, checked on the same objects: a directory written by
+     * the format-v2 build (no `spoolPartitions`, no `unassigned` block, no
+     * association metadata) must still be readable and searchable. That is what
+     * keeps the already-published v1-bench-1m index usable after this change.
+     */
+    expect(isSupportedFormatVersion(2)).toBe(true);
+    const v2 = { ...directory!, formatVersion: 2, shards: { ...directory!.shards }, counts: { ...directory!.counts } } as typeof directory;
+    delete (v2.shards as { spoolPartitions?: number }).spoolPartitions;
+    delete (v2 as { unassigned?: unknown }).unassigned;
+    const v2Source = new R2CandidateSource(store, v2);
+    const v2Search = await searchCompanies(v2Source, "Microsoft Corporation", { pageSize: 25, maxHydrate: 8 });
+    expect(v2Search.hits[0]?.name).toBe("Microsoft Corporation");
+    expect(await store.getUnassignedContacts(fixture.version, 0)).toEqual([]);
 
     const keys = bucket.counters.readKeys;
     expect(keys.length).toBe(new Set(keys).size);

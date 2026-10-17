@@ -24,6 +24,7 @@ import {
   exportJobSchema,
   savedLeadSchema,
   savedSearchSchema,
+  unassignedContactsResponseSchema,
   userSettingsSchema,
 } from "@/shared/api-contract";
 import { filtersToQuery } from "@/shared/api-contract";
@@ -36,6 +37,7 @@ import type {
   HealthResponse,
   LeadListResponse,
   SaveLeadInput,
+  UnassignedQueryParams,
   UpdateLeadInput,
 } from "./types";
 import { cacheMetrics } from "@/lib/cache/persistent-cache";
@@ -205,6 +207,18 @@ export class WorkerApiClient implements ApiClient {
         sort: params.sort,
         order: params.order,
         ...(params.filters ?? {}),
+      },
+    });
+  }
+
+  getCompanyUnassigned(companyId: string, params: UnassignedQueryParams = {}) {
+    return this.request(`/api/companies/${encodeURIComponent(companyId)}/unassigned`, unassignedContactsResponseSchema, {
+      query: {
+        page: params.page,
+        pageSize: params.pageSize,
+        // Comma-separated is the wire form (`filtersToQuery` stringifies arrays
+        // the same way), and the server re-validates every name.
+        category: params.category?.length ? params.category.join(",") : undefined,
       },
     });
   }

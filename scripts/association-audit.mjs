@@ -11,8 +11,12 @@
  * evidence the index actually holds, which cannot be decided, and which are
  * contradicted by that evidence.
  *
+ * Format v3 (association categories, `unassigned/` objects) is read when present;
+ * a format-v2 index still audits, with every contact reported as `unclassified`
+ * and nothing reported as preserved — "no category" is never read as a category.
+ *
  * It reads only the objects a run already wrote — `companies/<version>`,
- * `contacts/<version>` and the version's manifest — through the same decode path
+ * `contacts/<version>`, `unassigned/<version>` and the version's manifest — through the same decode path
  * `scripts/sample-report.mjs` uses. It makes no R2 call, needs no credentials,
  * writes nothing, and never prints a contact name, email, phone or LinkedIn URL:
  * the sample it prints is company ids and names.
@@ -29,7 +33,7 @@ import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { gunzipSync } from "node:zlib";
 
-import { auditAssociations, auditRecommendations, formatAuditReport } from "./lib/association-audit.mjs";
+import { auditAssociations, auditRecommendations, auditStoredAssociations, formatAuditReport } from "./lib/association-audit.mjs";
 
 const argv = process.argv.slice(2);
 
@@ -109,13 +113,31 @@ if (existsSync(contactsDir)) {
   }
 }
 
+/* Preserved contacts (format v3). Absent on a v2 index, which is reported as
+   "none preserved" rather than as an error — a v2 index never kept them. */
+const unassignedDir = join(dir, "unassigned", version);
+const unassigned = [];
+let unassignedObjects = 0;
+if (existsSync(unassignedDir)) {
+  for (const name of readdirSync(unassignedDir).filter((file) => file.endsWith(".json.gz")).sort()) {
+    const payload = readJson(join(unassignedDir, name));
+    unassignedObjects += 1;
+    for (const contact of payload.contacts ?? []) unassigned.push(contact);
+  }
+}
+
 const manifest = readJson(manifestPath);
+const directoryPath = join(dir, "indexes", version, "directory.json");
+const directory = existsSync(directoryPath) ? readJson(directoryPath) : null;
 
 const report = {
   version,
   dir,
   checkedAt: new Date().toISOString(),
+  indexFormatVersion: directory?.formatVersion ?? manifest.indexFormatVersion ?? null,
   ...auditAssociations({ companies, contactsByRef, sampleLimit }),
+  ...auditStoredAssociations({ companies, contactsByRef, unassigned, sampleLimit }),
+  unassignedObjects,
   manifestCounters: manifest.counters ?? {},
 };
 report.recommendations = auditRecommendations(report);

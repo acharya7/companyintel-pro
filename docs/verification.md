@@ -681,6 +681,34 @@ uploaded, published or deployed, and no index/spool/checkpoint file was touched.
 | F. No new database introduced | Yes — R2 objects only, directory is derived data | `tests/leads-recovery.test.ts` | — | — |
 | G. Full execution plan with sources, mappings, resources, costs, validation | Drafted with explicit placeholders | `docs/execution-plan.md` | Real numbers unknown until sample runs | Approve after sending the Phase A outputs + sample timings |
 
+## Phase H — two-stage company ↔ contact association
+
+Scope: replace the immediate name-join attachment with Stage A (company identity) + Stage B
+(per-contact evidence), stop identifier ownership from being reassigned, preserve contacts whose
+employer cannot be established, and measure the result. Rules and procedures: `docs/association.md`.
+
+**All measurements below are synthetic.** This environment has no access to the Windows Pass 1
+spool, the 64 GB sources or the `v1-bench-1m` index, so nothing here is a real-data claim.
+
+| Item | Result | Evidence |
+| --- | --- | --- |
+| Identifier ownership cannot be reassigned | Confirmed fixed. `CompanyResolver.claim()` is first-owner-wins; a later row carrying an owned domain/LinkedIn/source id is refused, counted (`identifierConflicts`) and sampled. Replay never moves a key, in either input order. | `tests/indexer-association.test.ts` → "identifier ownership is never reassigned" (5 cases) |
+| A contradicting row is not treated as a verified company | Confirmed fixed. A record whose strong keys were all refused reports `identityClaimed: false` / `strong: false`, so Stage B never offers it as a credible employer. | same file, "a contradicting row creates its own record and claims nothing that is taken" |
+| Repeated contradicting rows stay bounded | Confirmed fixed: one record per evidence pattern (`bySignature`), 25 repeats → 0 new records. | same file, "a repeated contradicting pattern joins one record …" |
+| Contacts are associated on evidence, not on the name join | Implemented as `associateContact()` (pure, order-independent, no percentages) over four categories; 27 unit cases plus an end-to-end fixture where every outcome occurs once. | `tests/association.test.ts` (27), `tests/indexer-association.test.ts` |
+| A personal address is not corporate evidence; a domain mismatch does not relocate a contact; country never relocates on its own | Confirmed by unit tests; a foreign domain is recorded as `conflicting` on the company the row named, with the candidate ids kept. | `tests/association.test.ts` |
+| Ambiguous contacts are not shown as employees | `unresolved` contacts are written to `unassigned/<version>/…`, are not counted in `contactCount`, are absent from contact search, and appear only in the company profile's review panel. | `tests/indexer-association.test.ts` (preservation + Worker `/unassigned`), `tests/pages-render.test.tsx` |
+| No contact silently disappears; counts and facets reconcile | End-to-end fixture: `contactCount` sum, `associations` split and every facet equal what is stored; 0 duplicate ids; manifest `uniqueContacts` = attached + preserved. The audit recomputes all of this from the objects, not the counters. | `tests/indexer-association.test.ts` → "the association audit, on a real generated index" |
+| Deterministic output | Two builds of the same fixture are byte-for-byte identical except `createdAt`; a resumed/restarted pass 2 stays identical. | `tests/indexer-association.test.ts`, `tests/indexer-pass2-restart.test.ts` |
+| Format v2 stays readable; v3 is additive | `SUPPORTED_INDEX_FORMAT_VERSIONS = [2, 3]`; a missing category is "not classified", the association filter is inert on v2, and `unassigned` is optional in the directory. | `tests/worker-store.test.ts`, `tests/worker-r2-binding.test.ts`, `tests/association.test.ts` |
+| Audit reports both rule sets and the new counters | `bun run index:audit` prints stored categories, preserved contacts, moves, legacy-class → stored-category cross-tab and reconciliation; `unclassified` is never folded into `plausible`; no contact value is read into the report. | `tests/association-audit.test.ts` (25; includes the real generated index run) |
+| Quality gates | `bun run typecheck` 0 (4 projects), `bun test` **454 pass / 0 fail**, `bun run lint` 0 problems. Production build deliberately not run (not requested; the Worker bundle is unchanged in shape). | commands run in this phase |
+| Real benchmark before/after | **NOT RUN — blocked by design.** The comparison procedure, the fields to compare and the exact PowerShell is in `docs/association.md` §7; `v1-bench-1m` is never opened for writing. | — |
+
+Remaining unverified for this change: the real-data category distribution, the number of contacts
+reassigned on real data, and Worker CPU/memory for the `unassigned` read path (it is one extra
+small object per company-profile review request, and is cached like any immutable object).
+
 ## Remaining risk (unchanged by this phase)
 
 | Risk | Why it remains | Mitigation |

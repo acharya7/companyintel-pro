@@ -1,3 +1,4 @@
+import type { AssociationCategory } from "@/shared/association";
 import type {
   ActivityEntry,
   CompanyDetailResponse,
@@ -17,6 +18,7 @@ import type {
   SavedLead,
   SavedSearch,
   SortOrder,
+  UnassignedContactsResponse,
   UserSettings,
 } from "@/shared/models";
 import type { ExportRequestBody, SavedSearchRequest, SettingsRequest } from "@/shared/api-contract";
@@ -40,6 +42,13 @@ export interface ContactQueryParams {
   sort?: ContactSortField;
   order?: SortOrder;
   filters?: ContactFilters;
+}
+
+export interface UnassignedQueryParams {
+  page?: number;
+  pageSize?: number;
+  /** Categories to include; defaults to `unresolved` on the server. */
+  category?: AssociationCategory[];
 }
 
 export interface SaveLeadInput {
@@ -95,6 +104,14 @@ export interface ApiClient {
   searchCompanies(params: CompanySearchParams): Promise<CompanySearchResponse>;
   getCompany(id: string): Promise<CompanyDetailResponse>;
   getCompanyContacts(companyId: string, params?: ContactQueryParams): Promise<ContactPageResponse>;
+  /**
+   * Contacts preserved WITHOUT an employer that claimed this company's name.
+   *
+   * Separate from `getCompanyContacts` on purpose: these rows are not employees
+   * of the company, they are the ones the indexer refused to attach, and a
+   * company profile only reads them when the user asks to review them.
+   */
+  getCompanyUnassigned(companyId: string, params?: UnassignedQueryParams): Promise<UnassignedContactsResponse>;
   listContacts(params?: ContactQueryParams): Promise<ContactPageResponse>;
   getContact(id: string): Promise<{ contact: Contact; companyName: string | null; companyId: string | null }>;
 
@@ -139,6 +156,7 @@ export const API_CLIENT_METHODS = [
   "searchCompanies",
   "getCompany",
   "getCompanyContacts",
+  "getCompanyUnassigned",
   "listContacts",
   "getContact",
   "listLeads",

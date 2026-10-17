@@ -13,7 +13,13 @@
  * counts and marks them as sample-only.
  */
 
-import type { Company, Contact, ContactFilters, FacetBucket } from "@/shared/models";
+import type { AssociationCounts, Company, Contact, ContactFilters, FacetBucket, UnassignedContact } from "@/shared/models";
+import {
+  associationMatchesFilter,
+  associateContact,
+  type AssociationCandidate,
+  type AssociationRecord,
+} from "@/shared/association";
 import { companyId, contactId } from "@/shared/hash";
 import { normalizeName, nameVariants } from "@/shared/normalize";
 
@@ -160,9 +166,45 @@ export interface SampleDataset {
   companies: Company[];
   contacts: Contact[];
   contactsByCompany: Map<string, Contact[]>;
+  /**
+   * Contacts the preview keeps WITHOUT an employer, keyed by the company id whose
+   * name they claimed. Present so the "review the uncertain ones" interface has
+   * something real to render in the demo — production fills this from
+   * `unassigned/<version>/…` objects.
+   */
+  unassignedByCompany: Map<string, UnassignedContact[]>;
   /** Which logical source file a record came from (`csv1` / `csv2`). */
   sources: string[];
 }
+
+/**
+ * Association verdict for one synthetic contact.
+ *
+ * Computed with the SAME function the indexer uses (`associateContact`), against
+ * a single candidate, because a synthetic company row carries its own domain —
+ * exactly the shape of the real `csv1` records. Producing these labels by hand
+ * would let the demo disagree with the pipeline about what "verified" means.
+ */
+function sampleAssociation(company: Company, claimedRef = 0): AssociationRecord {
+  const candidate: AssociationCandidate = {
+    ref: claimedRef,
+    id: company.id,
+    name: company.name,
+    normalizedName: company.normalizedName,
+    domain: company.domain ?? null,
+    linkedinUrl: company.linkedinUrl ?? null,
+    country: company.country ?? null,
+    state: company.state ?? null,
+    city: company.city ?? null,
+    hasStrongIdentity: Boolean(company.domain ?? company.linkedinUrl),
+  };
+  return associateContact({ contact: {}, claimedRef, claimedIdentity: true, candidates: [candidate] }).record;
+}
+
+/** Deliberately unresolved sample contacts, for the review flow. */
+const UNRESOLVED_PER_FAMILY = 2;
+/** How many shared-name families get preserved contacts (keeps the demo small). */
+const UNRESOLVED_FAMILIES = 4;
 
 function buildRandomName(rng: () => number): string {
   const stem = STEMS[Math.floor(rng() * STEMS.length)];
@@ -266,18 +308,76 @@ export function buildSampleDataset(companyTarget = 800): SampleDataset {
         city,
         source: { source: company.sources[0].source, row: ++rowCounter },
       };
+      contact.association = sampleAssociation(company);
       list.push(contact);
     }
     contacts.push(...list);
     contactsByCompany.set(company.id, list);
     company.contactCount = list.length;
+    const counts: AssociationCounts = { highConfidence: 0, plausible: 0, conflicting: 0, total: 0 };
+    for (const contact of list) {
+      if (contact.association?.category === "high_confidence") counts.highConfidence += 1;
+      else if (contact.association?.category === "plausible") counts.plausible += 1;
+      else if (contact.association?.category === "conflicting") counts.conflicting += 1;
+      counts.total += 1;
+    }
+    company.associations = counts;
   });
+
+  /*
+   * 4. A few contacts whose employer genuinely cannot be resolved: their company
+   *    name is shared by another record and they carry no distinguishing evidence.
+   *    They are preserved under the name they claimed, exactly as the indexer
+   *    writes them in `unassigned/`.
+   */
+  const unassignedByCompany = new Map<string, UnassignedContact[]>();
+  const families = new Map<string, Company[]>();
+  for (const company of companies) {
+    const list = families.get(company.normalizedName);
+    if (list) list.push(company);
+    else families.set(company.normalizedName, [company]);
+  }
+  const shared = [...families.values()].filter((list) => list.length > 1).slice(0, UNRESOLVED_FAMILIES);
+  for (const [familyIndex, family] of shared.entries()) {
+    const company = family[0];
+    const preserved: UnassignedContact[] = [];
+    for (let i = 0; i < UNRESOLVED_PER_FAMILY; i += 1) {
+      const first = FIRST_NAMES[Math.floor(rng() * FIRST_NAMES.length)];
+      const last = LAST_NAMES[Math.floor(rng() * LAST_NAMES.length)];
+      const role = TITLES[Math.floor(rng() * TITLES.length)];
+      const contactIdValue = contactId(`unassigned|${familyIndex}|${i}`);
+      preserved.push({
+        id: contactIdValue,
+        companyId: "",
+        fullName: `${first} ${last}`,
+        firstName: first,
+        lastName: last,
+        title: role.title,
+        designation: role.designation,
+        seniority: role.seniority,
+        department: role.department,
+        country: company.country,
+        city: company.city,
+        source: { source: company.sources[0].source, row: ++rowCounter },
+        claimedCompanyName: company.name,
+        claimedNormalizedName: company.normalizedName,
+        association: {
+          category: "unresolved",
+          reason: "several_candidates_remain",
+          evidence: { name: "shared", domain: "absent", country: "absent", rowIdentity: false, candidates: family.length },
+          candidateCompanyIds: family.map((member) => member.id),
+        },
+      });
+    }
+    unassignedByCompany.set(company.id, preserved);
+  }
 
   return {
     version: SAMPLE_DATASET_VERSION,
     companies,
     contacts,
     contactsByCompany,
+    unassignedByCompany,
     sources: ["csv1", "csv2"],
   };
 }
@@ -327,5 +427,8 @@ export function contactMatchesFilters(contact: Contact, filters?: ContactFilters
   if (filters.city && contact.city !== filters.city) return false;
   if (filters.hasEmail && !contact.email) return false;
   if (filters.hasLinkedin && !contact.linkedinUrl) return false;
+  // One shared rule with the Worker (see `associationMatchesFilter`), so the
+  // preview and production cannot disagree about which contacts are trusted.
+  if (!associationMatchesFilter(contact.association?.category, filters.association)) return false;
   return true;
 }

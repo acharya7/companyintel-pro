@@ -15,6 +15,7 @@
  *   GET    /api/companies/search            ?q&page&pageSize&sort&order&fuzzy&filters
  *   GET    /api/companies/:id
  *   GET    /api/companies/:id/contacts      ?page&pageSize&sort&order&filters
+ *   GET    /api/companies/:id/unassigned    ?page&pageSize&category   (contacts kept without an employer)
  *   GET    /api/contacts/:id
  *   GET    /api/contacts                    ?page&pageSize&companyIds&filters
  *   GET    /api/leads
@@ -35,6 +36,9 @@
  */
 
 import { z } from "zod";
+
+import { ASSOCIATION_CATEGORIES, type AssociationCategory, type AssociationReason } from "./association";
+import type { ContactFilters } from "./models";
 
 /* -------------------------------------------------------------------------- */
 /* Shared enums                                                               */
@@ -82,8 +86,72 @@ export const contactFiltersSchema = z
     city: z.string().max(120).optional(),
     hasEmail: booleanish.optional(),
     hasLinkedin: booleanish.optional(),
+    /**
+     * Comma-separated association categories (`high_confidence,plausible`). A
+     * query string carries no arrays, and a single repeated-key form would need
+     * `extractFilters` to invent one, so the list travels as text and is parsed
+     * by `parseAssociationFilter` (which ignores unknown names rather than
+     * failing a whole page request over a typo).
+     */
+    association: z.string().max(160).optional(),
   })
   .strict();
+
+/** The four association categories, as the API accepts and returns them. */
+export const associationCategorySchema = z.enum(["high_confidence", "plausible", "unresolved", "conflicting"]);
+
+/**
+ * Every reason the indexer can record, as literals.
+ *
+ * Declared here (not as a free-form string) so a reason the model knows about
+ * cannot silently fail response validation — the exhaustiveness assertion below
+ * fails to compile instead.
+ */
+export const associationReasonSchema = z.enum([
+  "row_carries_employer_identity",
+  "email_domain_matches_assigned_company",
+  "email_domain_matches_other_company_of_same_name",
+  "email_domain_outside_name_family",
+  "email_domain_conflicts_with_row_identity",
+  "unique_name",
+  "country_supports_assigned_company",
+  "country_identifies_company",
+  "country_points_to_other_company_of_same_name",
+  "single_strong_candidate",
+  "several_candidates_remain",
+  "no_credible_candidate",
+]);
+
+/** `true` only while the list above names every `AssociationReason`. */
+export type AssociationReasonsAreExhaustive =
+  [
+    Exclude<AssociationReason, z.infer<typeof associationReasonSchema>>,
+    Exclude<z.infer<typeof associationReasonSchema>, AssociationReason>,
+  ] extends [never, never]
+    ? true
+    : {
+        missing: Exclude<AssociationReason, z.infer<typeof associationReasonSchema>>;
+        extra: Exclude<z.infer<typeof associationReasonSchema>, AssociationReason>;
+      };
+
+export const ASSOCIATION_REASONS_ARE_EXHAUSTIVE: AssociationReasonsAreExhaustive = true;
+
+/** Wire contact filter object → the model's filter shape. */
+export function toContactFilters(filters?: z.infer<typeof contactFiltersSchema>): ContactFilters | undefined {
+  if (!filters) return undefined;
+  const association = parseAssociationFilter(filters.association);
+  return association ? { ...filters, association } : { ...filters, association: undefined };
+}
+
+/** Parse a comma-separated category filter; unknown names are ignored. */
+export function parseAssociationFilter(value: unknown): AssociationCategory[] | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const parts = String(value)
+    .split(",")
+    .map((part) => part.trim())
+    .filter((part): part is AssociationCategory => (ASSOCIATION_CATEGORIES as readonly string[]).includes(part));
+  return parts.length ? [...new Set(parts)] : undefined;
+}
 
 /* -------------------------------------------------------------------------- */
 /* Bounded pagination                                                         */
@@ -206,6 +274,31 @@ export const activityRequestSchema = z.object({
 
 const sourceRefSchema = z.object({ source: z.string(), row: z.number().int().nonnegative() });
 
+/**
+ * Association shapes are declared before any schema that embeds them: a zod
+ * schema is built at module-evaluation time, so referencing a `const` declared
+ * further down would be a temporal-dead-zone crash rather than a lazy lookup.
+ */
+export const associationCountsSchema = z.object({
+  highConfidence: z.number().int().nonnegative(),
+  plausible: z.number().int().nonnegative(),
+  conflicting: z.number().int().nonnegative(),
+  total: z.number().int().nonnegative(),
+});
+
+export const associationRecordSchema = z.object({
+  category: associationCategorySchema,
+  reason: associationReasonSchema,
+  evidence: z.object({
+    name: z.enum(["unique", "shared"]),
+    domain: z.enum(["match", "sibling", "outside_family", "public_provider", "absent", "ambiguous"]),
+    country: z.enum(["selects", "supports", "differ", "ambiguous", "absent"]),
+    rowIdentity: z.boolean(),
+    candidates: z.number().int().nonnegative(),
+  }),
+  candidateCompanyIds: z.array(z.string()).max(50).optional(),
+});
+
 export const companySchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -224,6 +317,7 @@ export const companySchema = z.object({
   contactCount: z.number().int().nonnegative(),
   sources: z.array(sourceRefSchema),
   ambiguous: z.boolean().optional(),
+  associations: associationCountsSchema.optional(),
 });
 
 export const contactSchema = z.object({
@@ -243,6 +337,14 @@ export const contactSchema = z.object({
   state: z.string().optional(),
   city: z.string().optional(),
   source: sourceRefSchema,
+  association: associationRecordSchema.optional(),
+});
+
+/** A contact preserved without an employer, plus the name it claimed. */
+export const unassignedContactSchema = contactSchema.extend({
+  claimedCompanyName: z.string(),
+  claimedNormalizedName: z.string(),
+  association: associationRecordSchema,
 });
 
 export const pageInfoSchema = z.object({
@@ -332,6 +434,16 @@ export const contactPageResponseSchema = z.object({
   contacts: z.array(contactSchema),
   page: pageInfoSchema,
   datasetVersion: z.string(),
+  associations: associationCountsSchema.nullable().optional(),
+});
+
+export const unassignedContactsResponseSchema = z.object({
+  companyId: z.string(),
+  companyName: z.string().nullable(),
+  contacts: z.array(unassignedContactSchema),
+  page: pageInfoSchema,
+  datasetVersion: z.string(),
+  totals: z.object({ unresolved: z.number().int().nonnegative(), conflicting: z.number().int().nonnegative() }),
 });
 
 export const contactDetailResponseSchema = z.object({

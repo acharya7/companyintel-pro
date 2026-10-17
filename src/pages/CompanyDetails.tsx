@@ -43,11 +43,17 @@ import {
   downloadExportFile,
   useCompany,
   useCompanyContacts,
+  useCompanyUnassigned,
   useCreateExport,
   useDatasetStatus,
   useSaveLead,
   recordActivity,
 } from "@/hooks/use-api";
+import {
+  ASSOCIATION_CATEGORY_HINTS,
+  ASSOCIATION_CATEGORY_LABELS,
+  type AssociationCategory,
+} from "@/shared/association";
 import { formatNumber, formatPercent } from "@/lib/format";
 import { rememberCompany } from "@/lib/recent";
 import type { ContactFilters, ContactSortField, SortOrder } from "@/shared/models";
@@ -65,8 +71,21 @@ export default function CompanyDetails() {
   const [order, setOrder] = useState<SortOrder>("asc");
   const [filters, setFilters] = useState<ContactFilters>({});
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [reviewUnassigned, setReviewUnassigned] = useState(false);
 
   const contacts = useCompanyContacts(companyId, { page, pageSize, sort, order, filters });
+  // Fetched only after the user asks to review the uncertain rows, so a company
+  // profile never pays for a second object read it does not show.
+  const unassigned = useCompanyUnassigned(companyId, { page: 1, pageSize: 25 }, reviewUnassigned);
+
+  function toggleAssociation(category: AssociationCategory) {
+    setFilters((current) => {
+      const list = current.association ?? [];
+      const next = list.includes(category) ? list.filter((item) => item !== category) : [...list, category];
+      return { ...current, association: next.length ? next : undefined };
+    });
+    setPage(1);
+  }
 
   useEffect(() => {
     if (company.data) {
@@ -207,6 +226,15 @@ export default function CompanyDetails() {
         />
       </div>
 
+      {record.associations ? (
+        <p className="text-xs text-muted-foreground">
+          Association evidence: <span className="text-foreground">{formatNumber(record.associations.highConfidence)}</span> verified ·{" "}
+          <span className="text-foreground">{formatNumber(record.associations.plausible)}</span> possible ·{" "}
+          <span className="text-foreground">{formatNumber(record.associations.conflicting)}</span> disputed.{" "}
+          {ASSOCIATION_CATEGORY_HINTS.high_confidence}
+        </p>
+      ) : null}
+
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
         <Section
           title="Company information"
@@ -312,6 +340,26 @@ export default function CompanyDetails() {
               />
             </div>
           )}
+
+          <div className="mt-5 space-y-2 border-t border-border/60 pt-4">
+            <p className="text-xs font-medium">Association evidence</p>
+            <div className="flex flex-wrap gap-1.5">
+              {(["high_confidence", "plausible", "conflicting"] as AssociationCategory[]).map((category) => (
+                <Button
+                  key={category}
+                  variant={filters.association?.includes(category) ? "secondary" : "outline"}
+                  size="sm"
+                  title={ASSOCIATION_CATEGORY_HINTS[category]}
+                  onClick={() => toggleAssociation(category)}
+                >
+                  {ASSOCIATION_CATEGORY_LABELS[category]}
+                </Button>
+              ))}
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              No selection shows every attached contact. Disputed rows are never shown as verified.
+            </p>
+          </div>
 
           <div className="mt-5 space-y-3 border-t border-border/60 pt-4">
             <div className="flex items-center justify-between gap-3">
@@ -447,6 +495,15 @@ export default function CompanyDetails() {
                         <p className="text-[11px] text-muted-foreground">
                           {[contact.seniority, contact.designation].filter(Boolean).join(" · ") || "—"}
                         </p>
+                        {contact.association && contact.association.category !== "high_confidence" ? (
+                          <Badge
+                            variant="outline"
+                            className="mt-1 border-chart-3/50 bg-chart-3/12 text-[10px] font-normal text-chart-3"
+                            title={ASSOCIATION_CATEGORY_HINTS[contact.association.category]}
+                          >
+                            {ASSOCIATION_CATEGORY_LABELS[contact.association.category]}
+                          </Badge>
+                        ) : null}
                       </TableCell>
                       <TableCell className="hidden max-w-[240px] truncate md:table-cell">{contact.title ?? "—"}</TableCell>
                       <TableCell className="hidden lg:table-cell">{contact.department ?? "—"}</TableCell>
@@ -561,6 +618,71 @@ export default function CompanyDetails() {
                   setPage(1);
                 }}
               />
+            </div>
+          </div>
+        )}
+      </Section>
+
+      <Section
+        title="Contacts kept without a resolved employer"
+        description="Rows that named this company but carried no evidence strong enough to attach them. Preserved for review — never presented as employees."
+        actions={
+          <Button variant="outline" size="sm" className="gap-2" onClick={() => setReviewUnassigned((value) => !value)}>
+            <Users className="size-3.5" />
+            {reviewUnassigned ? "Hide" : "Review"}
+          </Button>
+        }
+      >
+        {!reviewUnassigned ? (
+          <p className="text-xs text-muted-foreground">
+            Nothing is loaded until you ask: reviewing these rows reads one extra object for this company's name family.
+          </p>
+        ) : unassigned.isLoading ? (
+          <LoadingBlock label="Reading preserved contacts" rows={4} />
+        ) : unassigned.error ? (
+          <ErrorBlock error={unassigned.error as Error} onRetry={() => unassigned.refetch()} />
+        ) : (unassigned.data?.contacts.length ?? 0) === 0 ? (
+          <EmptyState
+            icon={<Users className="size-5" />}
+            title="Nothing unresolved for this company"
+            description="Every contact that named this company could be associated with a specific company record."
+          />
+        ) : (
+          <div className="space-y-3">
+            <p className="text-xs text-muted-foreground">
+              {formatNumber(unassigned.data!.totals.unresolved)} contact(s) name this company but could belong to any of its namesakes. Shown with
+              their claimed company name and the candidates that remained.
+            </p>
+            <div className="overflow-hidden rounded-lg border border-border/70">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Contact</TableHead>
+                    <TableHead className="hidden md:table-cell">Title</TableHead>
+                    <TableHead className="hidden md:table-cell">Claimed company name</TableHead>
+                    <TableHead className="hidden lg:table-cell">Location</TableHead>
+                    <TableHead className="text-right">Status</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {unassigned.data!.contacts.map((contact) => (
+                    <TableRow key={contact.id}>
+                      <TableCell className="font-medium">{contact.fullName}</TableCell>
+                      <TableCell className="hidden md:table-cell">{contact.title ?? "—"}</TableCell>
+                      <TableCell className="hidden max-w-[220px] truncate md:table-cell">{contact.claimedCompanyName}</TableCell>
+                      <TableCell className="hidden lg:table-cell">{[contact.city, contact.country].filter(Boolean).join(", ") || "—"}</TableCell>
+                      <TableCell className="text-right">
+                        <Badge variant="outline" className="text-[10px] font-normal">
+                          {ASSOCIATION_CATEGORY_LABELS[contact.association.category]}
+                          {contact.association.candidateCompanyIds?.length
+                            ? ` · ${contact.association.candidateCompanyIds.length} candidates`
+                            : ""}
+                        </Badge>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
             </div>
           </div>
         )}

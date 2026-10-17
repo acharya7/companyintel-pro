@@ -49,7 +49,10 @@ Browser ──► Worker (Access-verified) ──► bounded R2 reads ───�
 `contactCount`, `sources[]`, `ambiguous?`, `facets`.
 
 `Contact`: `id`, `companyId`, `fullName`, first/last name, title, designation, seniority,
-department, email, phone, `linkedinUrl`, location, `source {source,row}`.
+department, email, phone, `linkedinUrl`, location, `source {source,row}`, `association?`
+(`category`, `reason`, `evidence`, candidate ids, `movedFrom`). `UnassignedContact` is a contact
+with `companyId: ""` plus the `claimedCompanyName` / `claimedNormalizedName` it was preserved
+under. A company also carries `associations {highConfidence, plausible, conflicting, total}`.
 
 `facets` on each company (designation/department/seniority/country/city buckets plus
 `emailAvailable` / `linkedinAvailable`) are precomputed at index time so the Company Details
@@ -67,9 +70,20 @@ Strong evidence only, in priority order:
 A row's identifiers are **unioned**; rows merge when exactly one existing record matches any
 of them. Two rows carrying *contradictory* strong identifiers are never merged. Same-name
 companies with different domains stay separate records and are flagged `ambiguous` so the UI
-can say so instead of silently combining them. Contact dedup uses email → LinkedIn →
-(name + company + title); two people with the same name at the same company keep distinct
-records when their titles differ.
+can say so instead of silently combining them. Identifier ownership is **first-owner-wins and
+never reassigned**: a later row that carries a domain already owned by another record has its
+claim refused (counted and sampled), so file order can no longer change which company a domain
+points at. Source-provided ids are scoped to their file (`s:<source>:<id>`).
+
+Company resolution and contact association are two separate stages: resolution answers "which
+company is this row about", and a second stage asks "does this person work there", per contact,
+against every credible company of the same normalized name, based on the row's identity, the
+email domain, and country. Its verdict is one of `high_confidence` / `plausible` / `unresolved` /
+`conflicting`; an unresolved contact is preserved in `unassigned/` under the name it claimed
+rather than attached to a guess. Contact dedup uses email → LinkedIn → (name + company + title),
+computed **after** the association decision and scoped to the final company, so reassignment
+cannot merge two different people or duplicate one person; two people with the same name at the
+same company keep distinct records when their titles differ. Full rules: `docs/association.md`.
 
 ## Search
 
@@ -181,8 +195,10 @@ after the first sweep. Two consequences worth keeping in view:
   cannot fill its page either way. Only knowing the match count before reading removes that
   cost, which is a format question, not a tuning one (see `docs/search-quality.md` §9).
 
-Alternatives evaluated for the next format version (v3) but **not** adopted yet, because v2
-stays until a 1 M-record run can measure them:
+Format v3 was taken by the association work (`docs/association.md`): it adds `association` to
+contacts, `associations` to companies and the `unassigned/` object class. The *search* alternatives
+below were evaluated for a later format version and are **not** adopted, because each needs a 1 M
+run to measure it:
 
 | candidate design | why it is not in v2 |
 | --- | --- |
@@ -207,11 +223,17 @@ staging/<version>/   unpublished intermediate output
 indexes/<version>/   exact|prefix|token|trigram|ids shards + directory.json
 companies/<version>/ canonical company partitions (gzip JSON)
 contacts/<version>/  contact partitions grouped by company (gzip JSON)
+unassigned/<version>/ contacts preserved WITHOUT an employer (format v3)
 manifests/<version>/ manifest.json, validation.json, progress.json, stats.json
 manifests/active.json  the ONE mutable pointer object
 app-data/            leads/, saved-searches.json, settings.json, activity.json, exports/
 backups/app-data/    snapshots written before lead mutations
 ```
+
+`unassigned/` is one object per Pass 1 spool partition, keyed by the hash of the *claimed*
+company name, so a company profile can find its review list from the company record alone — no
+listing and no scan. Format v2 indexes have no such prefix and stay readable; see
+`docs/association.md` §6 for the full v2 → v3 delta and the compatibility rules.
 
 Every search object is immutable and version-addressed, so browser and edge caches can treat
 it as immutable for a year. Rollback = re-point `manifests/active.json`.

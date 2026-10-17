@@ -88,7 +88,7 @@ This workspace itself **cannot** run the full job: the sandbox has 1 vCPU, 1.64 
 | --- | --- | --- |
 | preflight | Checks both input paths, sizes, free disk, free memory, CPU cores; estimates work space, output size and duration | — |
 | pass 1 | Streams both CSVs, detects headers per file, maps each file's own schema to the canonical model, and spools rows into `partitions` hash buckets keyed by the strongest identifier | `workDir/spool/part-####.jsonl` |
-| pass 2 | One partition at a time: resolves identity, deduplicates contacts, builds facets, writes index postings, company partitions and contact partitions | `workDir/spool/`, then `outputDir/` |
+| pass 2 | One partition at a time: **Stage A** resolves company identity (first-owner-wins identifiers), then **Stage B** associates each contact with a company on evidence and classifies it, then deduplicates, builds facets, and writes index postings, company partitions, contact partitions and `unassigned/` objects | `workDir/spool/`, then `outputDir/` |
 | validating | Re-reads generated objects, verifies checksums/counts, records `validation.json` | — |
 | uploading | Uploads each object with retries, skipping objects already present (idempotent, resumable) | — |
 | publishing | Flips `manifests/active.json` to the new version — **only** for a validated version | — |
@@ -100,6 +100,11 @@ being silently dropped.
 
 Interrupted runs resume: `workDir/checkpoint.json` records the completed stage, and a re-run
 skips finished passes (`--no-resume` to start over).
+
+Pass 2 also prints the association outcome (`N high confidence, M plausible, K conflicting, U
+preserved without an employer`, reassignments, refused identifier claims). The rules, the
+categories, and how to re-run association on an existing spool under a new experimental version
+are in `docs/association.md` — the spool is never rewritten, so no re-ingestion is needed.
 
 ## Commands
 

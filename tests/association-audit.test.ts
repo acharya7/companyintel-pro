@@ -29,8 +29,10 @@ import { join } from "node:path";
 
 import {
   ASSOCIATION_CLASSES,
+  STORED_CATEGORIES,
   auditAssociations,
   auditRecommendations,
+  auditStoredAssociations,
   buildFamilies,
   classifyAssociation,
   emailDomain,
@@ -290,6 +292,148 @@ describe("aggregate audit", () => {
     expect(text).toContain("read-only report");
     expect(text).toContain("confirmed");
     expect(text).toContain("conflict");
+    expect(text).not.toContain("@");
+  });
+});
+
+describe("stored categories, preserved contacts and reconciliation", () => {
+  const association = (category: string, extra: Record<string, unknown> = {}) => ({
+    category,
+    reason:
+      category === "high_confidence"
+        ? "email_domain_matches_assigned_company"
+        : category === "conflicting"
+          ? "email_domain_outside_name_family"
+          : category === "unresolved"
+            ? "several_candidates_remain"
+            : "unique_name",
+    evidence: { name: "shared", domain: "absent", country: "absent", rowIdentity: false, candidates: 2 },
+    ...extra,
+  });
+
+  const facetsFor = (contacts: Array<Record<string, unknown>>) => {
+    const bucket = (pick: (contact: Record<string, unknown>) => unknown) => {
+      const counts = new Map<string, number>();
+      for (const contact of contacts) {
+        const value = pick(contact);
+        if (typeof value === "string" && value) counts.set(value, (counts.get(value) ?? 0) + 1);
+      }
+      return [...counts.entries()].map(([value, count]) => ({ value, count })).sort((a, b) => b.count - a.count);
+    };
+    return {
+      designations: bucket((contact) => contact.designation),
+      departments: bucket((contact) => contact.department),
+      seniority: bucket((contact) => contact.seniority),
+      countries: bucket((contact) => contact.country),
+      cities: bucket((contact) => contact.city),
+      emailAvailable: contacts.filter((contact) => contact.email).length,
+      linkedinAvailable: contacts.filter((contact) => contact.linkedinUrl).length,
+    };
+  };
+
+  const attached = [
+    contact({ id: "p_high", email: "a@delta.example", country: "United States", designation: "VP", city: "Austin", association: association("high_confidence") }),
+    contact({ id: "p_plausible", country: "United States", designation: "Analyst", city: "Austin", association: association("plausible") }),
+    contact({ id: "p_conflict", email: "b@elsewhere.example", designation: "Analyst", association: association("conflicting", { movedFrom: "c_de" }) }),
+  ];
+  const records = [
+    {
+      ref: 0,
+      company: company({
+        id: "c_us",
+        normalizedName: "delta",
+        domain: "delta.example",
+        contactCount: 3,
+        associations: { highConfidence: 1, plausible: 1, conflicting: 1, total: 3 },
+        facets: facetsFor(attached),
+      }),
+    },
+  ];
+  const preserved = [
+    { ...contact({ id: "p_kept" }), claimedCompanyName: "Delta Systems", claimedNormalizedName: "delta", association: association("unresolved") },
+  ];
+
+  test("counts stored categories without folding unclassified into plausible", () => {
+    const mixed = [...attached, contact({ id: "p_v2" })];
+    const report = auditAssociations({
+      companies: [{ ref: 0, company: company({ id: "c_us", normalizedName: "delta", domain: "delta.example", contactCount: 4 }) }],
+      contactsByRef: new Map([[0, mixed]]),
+    });
+    expect(report.associations.stored.byCategory.high_confidence).toBe(1);
+    expect(report.associations.stored.byCategory.plausible).toBe(1);
+    expect(report.associations.stored.byCategory.conflicting).toBe(1);
+    expect(report.associations.stored.unclassified).toBe(1);
+    expect(report.associations.stored.moved).toBe(1);
+    // The legacy classes are still computed independently of the stored ones.
+    expect(report.associations.total).toBe(4);
+    expect(report.associations.crossTab.length).toBeGreaterThan(0);
+    const total = report.associations.crossTab.reduce((sum: number, row: { contacts: number }) => sum + row.contacts, 0);
+    expect(total).toBe(4);
+  });
+
+  test("reports preserved contacts separately, with the name they claimed", () => {
+    const report = auditStoredAssociations({ companies: records, contactsByRef: new Map([[0, attached]]), unassigned: preserved });
+    expect(report.preserved.total).toBe(1);
+    expect(report.preserved.byCategory.unresolved).toBe(1);
+    expect(report.preserved.missingClaimedName).toBe(0);
+    expect(report.preserved.byReason[0][0]).toBe("several_candidates_remain");
+    expect(STORED_CATEGORIES).toContain("unresolved");
+  });
+
+  test("reconciles contact counts, association splits, facets and ids exactly", () => {
+    const report = auditStoredAssociations({ companies: records, contactsByRef: new Map([[0, attached]]), unassigned: preserved });
+    expect(report.reconciliation.contactCount.mismatched).toBe(0);
+    expect(report.reconciliation.contactCount.recorded).toBe(3);
+    expect(report.reconciliation.contactCount.actual).toBe(3);
+    expect(report.reconciliation.associations.mismatched).toBe(0);
+    expect(report.reconciliation.facets.checked).toBe(1);
+    expect(report.reconciliation.facets.mismatched).toBe(0);
+    expect(report.reconciliation.ids.total).toBe(4);
+    expect(report.reconciliation.ids.distinct).toBe(4);
+    expect(report.reconciliation.ids.duplicated).toBe(0);
+  });
+
+  test("reports a wrong count, a wrong split, a wrong facet and a duplicated id as findings", () => {
+    const broken = [
+      {
+        ref: 0,
+        company: company({
+          id: "c_us",
+          normalizedName: "delta",
+          contactCount: 9,
+          associations: { highConfidence: 3, plausible: 0, conflicting: 0, total: 3 },
+          facets: { ...facetsFor(attached), cities: [{ value: "Austin", count: 7 }] },
+        }),
+      },
+    ];
+    const duplicated = [...attached, attached[0]];
+    const report = auditStoredAssociations({
+      companies: broken,
+      contactsByRef: new Map([[0, duplicated]]),
+      unassigned: [{ ...preserved[0], id: "p_high" }],
+    });
+    expect(report.reconciliation.contactCount.mismatched).toBe(1);
+    expect(report.reconciliation.contactCount.sample[0].recorded).toBe(9);
+    expect(report.reconciliation.contactCount.sample[0].actual).toBe(4);
+    expect(report.reconciliation.associations.mismatched).toBe(1);
+    expect(report.reconciliation.facets.mismatched).toBe(1);
+    expect(report.reconciliation.facets.byField.city).toBe(1);
+    expect(report.reconciliation.ids.duplicated).toBe(2);
+    const base = auditAssociations({ companies: broken, contactsByRef: new Map([[0, duplicated]]) });
+    const recommendations = auditRecommendations({ ...base, ...report });
+    expect(recommendations.some((line: string) => line.includes("disagree with the contacts stored"))).toBe(true);
+    expect(recommendations.some((line: string) => line.includes("occur more than once"))).toBe(true);
+  });
+
+  test("the human report shows preserved contacts and reconciliation without contact values", () => {
+    const base = auditAssociations({ companies: records, contactsByRef: new Map([[0, attached]]) });
+    const stored = auditStoredAssociations({ companies: records, contactsByRef: new Map([[0, attached]]), unassigned: preserved });
+    const report = { ...base, ...stored, version: "v", dir: "/tmp", checkedAt: "now", indexFormatVersion: 3, recommendations: [] };
+    const text = formatAuditReport(report);
+    expect(text).toContain("Preserved contacts");
+    expect(text).toContain("Reconciliation");
+    expect(text).toContain("Stored categories");
+    expect(text).toContain("unclassified");
     expect(text).not.toContain("@");
   });
 });

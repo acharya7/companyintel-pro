@@ -12,8 +12,8 @@
  * conflict to the caller instead of silently overwriting.
  */
 
-import type { Company, Contact, DatasetStats, DatasetVersionSummary, SavedLead, SavedSearch, UserSettings, ActivityEntry } from "../../src/shared/models";
-import { R2_PREFIX, leadShardKey, statsKey, activeManifestKey, companyPartitionKey, contactPartitionKey, exportMetaKey, exportObjectKey, indexDirectoryKey, indexShardKey, manifestKey, partitionOfRef, contactPartitionOfRef, savedSearchesKey, settingsKey, activityKey, validationKey, progressKey, type IndexDirectory, type ShardPayload, type IndexKind, type CompanyPartitionPayload, type ContactPartitionPayload } from "../../src/shared/search/index-format";
+import type { Company, Contact, DatasetStats, DatasetVersionSummary, SavedLead, SavedSearch, UnassignedContact, UserSettings, ActivityEntry } from "../../src/shared/models";
+import { R2_PREFIX, leadShardKey, statsKey, activeManifestKey, companyPartitionKey, contactPartitionKey, exportMetaKey, exportObjectKey, indexDirectoryKey, indexShardKey, manifestKey, partitionOfRef, contactPartitionOfRef, savedSearchesKey, settingsKey, activityKey, unassignedPartitionKey, validationKey, progressKey, type IndexDirectory, type ShardPayload, type IndexKind, type CompanyPartitionPayload, type ContactPartitionPayload, type UnassignedPartitionPayload } from "../../src/shared/search/index-format";
 import { SHARDING, contactsFor, snapshotKey } from "../../src/shared/search/index-format";
 import { shardOf } from "../../src/shared/hash";
 import { isCacheableKey, type ObjectCache, type ReadMetrics } from "./search-cache";
@@ -297,6 +297,20 @@ export class R2Store {
     // `contactsFor` does the own-property lookup: a parsed payload must never
     // answer from `Object.prototype`.
     return (contactsFor(payload, ref) as Contact[] | undefined) ?? [];
+  }
+
+  /**
+   * Contacts preserved WITHOUT an employer for one spool partition.
+   *
+   * One bounded object read, addressed by the company's own Pass 1 partition, so
+   * reviewing unresolved contacts costs exactly one GET and never a listing. A
+   * format-v2 index has no such objects (the prefix, the partition count and the
+   * categories did not exist), and an empty result is the correct answer for it.
+   */
+  async getUnassignedContacts(version: string, partition: number): Promise<UnassignedContact[]> {
+    const payload = await this.getJson<UnassignedPartitionPayload>(unassignedPartitionKey(version, partition));
+    if (!payload) return [];
+    return (payload.contacts as UnassignedContact[] | undefined) ?? [];
   }
 
   /* ----------------------------- app data --------------------------------- */

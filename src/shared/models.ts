@@ -12,6 +12,8 @@
  * Worker bundles this file, so it must stay runtime-neutral.
  */
 
+import type { AssociationCategory, AssociationRecord } from "./association";
+
 /** Where a record came from. Keeps every derived row traceable to its source. */
 export interface SourceRef {
   /** Logical source id, e.g. `csv1` / `csv2` (never a local absolute path). */
@@ -55,11 +57,28 @@ export interface Company {
   /** True when identity evidence was ambiguous and the record was kept separate. */
   ambiguous?: boolean;
   /**
+   * How this company's attached contacts split by association category.
+   *
+   * Written by the indexer after Stage B decided every contact, so a company
+   * profile can say "412 contacts, 380 with verified evidence" without reading a
+   * single contact row. Absent on format-v2 indexes, which predate the split.
+   */
+  associations?: AssociationCounts;
+  /**
    * Pre-computed contact attribute counts, written by the indexer.
    * Lets the company detail page build its filter sidebar from one stored
    * object instead of reading every contact row for the company.
    */
   facets?: CompanyFacets;
+}
+
+/** Attached-contact split by association category (see `association.ts`). */
+export interface AssociationCounts {
+  highConfidence: number;
+  plausible: number;
+  conflicting: number;
+  /** Attached contacts in total (`highConfidence + plausible + conflicting`). */
+  total: number;
 }
 
 export interface CompanyFacets {
@@ -91,6 +110,29 @@ export interface Contact {
   state?: string;
   city?: string;
   source: SourceRef;
+  /**
+   * Why this contact is attached to `companyId`, with the evidence behind it.
+   *
+   * Absent on format-v2 indexes (built before Stage B existed); the interface
+   * treats a missing category as "not classified" rather than as verified.
+   */
+  association?: AssociationRecord;
+}
+
+/**
+ * A contact whose employer could not be resolved, preserved under the name it
+ * claimed (Section 6: contacts must not disappear because they are uncertain).
+ *
+ * `companyId` is the empty string and the contact is not attached to any
+ * company record: it is reachable through the company profile whose name it
+ * claimed, and through the association audit.
+ */
+export interface UnassignedContact extends Contact {
+  /** Company name exactly as the source row carried it. */
+  claimedCompanyName: string;
+  /** Normalized form of that name — the key the review endpoint looks up. */
+  claimedNormalizedName: string;
+  association: AssociationRecord;
 }
 
 /** Contact fields that can be filtered server-side (must match index metadata). */
@@ -102,6 +144,8 @@ export interface ContactFilters {
   city?: string;
   hasEmail?: boolean;
   hasLinkedin?: boolean;
+  /** Association categories to include; empty/absent means every category. */
+  association?: AssociationCategory[];
 }
 
 /** Company search filters (applied on indexed attributes only). */
@@ -245,6 +289,27 @@ export interface ContactPageResponse {
   contacts: Contact[];
   page: PageInfo;
   datasetVersion: string;
+  /**
+   * Attached-contact split by category, when the dataset records it. Lets the
+   * page say "of 412 contacts, 380 have verified evidence" next to the list.
+   */
+  associations?: AssociationCounts | null;
+}
+
+/**
+ * Contacts preserved without an employer, looked up by the name they claimed.
+ *
+ * `candidateCompanyIds` on each contact lists the companies that remained
+ * possible, so a reviewer can follow the ambiguity instead of guessing.
+ */
+export interface UnassignedContactsResponse {
+  companyId: string;
+  companyName: string | null;
+  contacts: UnassignedContact[];
+  page: PageInfo;
+  datasetVersion: string;
+  /** Counts across the whole name family, not just this page. */
+  totals: { unresolved: number; conflicting: number };
 }
 
 export interface ContactDetailResponse {
@@ -304,6 +369,20 @@ export interface IndexingCounters {
   duplicateCompaniesResolved: number;
   ambiguousCompanies: number;
   recordsMissingCompanyId: number;
+  /** Contacts attached to a company with independent evidence. */
+  contactsHighConfidence?: number;
+  /** Contacts attached to a company on evidence that favours but does not verify it. */
+  contactsPlausible?: number;
+  /** Contacts attached to the company they claimed, with contradicting evidence. */
+  contactsConflicting?: number;
+  /** Contacts preserved without an employer (`unassigned/…` objects). */
+  contactsUnresolved?: number;
+  /** Contacts attached to a different company of the same name than they claimed. */
+  contactsMoved?: number;
+  /** Identifier keys a later row tried to claim while another company owned them. */
+  identifierConflicts?: number;
+  /** `unassigned/…` objects written (0 when every contact was resolvable). */
+  unassignedObjects?: number;
   /** Per-source breakdown, keyed by source id (`csv1`, `csv2`). */
   perSource: Record<string, { rowsRead: number; rowsRejected: number; companies: number; contacts: number }>;
 }

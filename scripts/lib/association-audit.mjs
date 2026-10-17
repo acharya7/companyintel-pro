@@ -60,6 +60,38 @@ export const DOMAIN_EVIDENCE = ["match", "mismatch", "absent"];
 const MAX_FAMILY_MEMBERS = 12;
 
 /**
+ * The categories a format-v3 index stores on each contact (see
+ * `src/shared/association.ts`). A format-v2 index stores none of them, which the
+ * audit reports as `unclassified` rather than assuming the best case.
+ */
+export const STORED_CATEGORIES = ["high_confidence", "plausible", "unresolved", "conflicting"];
+
+/**
+ * Which kind of evidence a stored `reason` rests on.
+ *
+ * Section 11 asks for "domain evidence" and "source identifiers" separately; the
+ * index stores one `reason` per contact, so this table is the single place the
+ * mapping lives. `record_identity` means the source row itself carried the
+ * employer's identifier (domain, website, LinkedIn page or scoped organization
+ * id) — the strongest thing the index can know, but still record-provided rather
+ * than independently verified employment.
+ */
+export const REASON_BASIS = {
+  row_carries_employer_identity: "record_identity",
+  email_domain_matches_assigned_company: "domain",
+  email_domain_matches_other_company_of_same_name: "domain",
+  email_domain_outside_name_family: "domain_contradiction",
+  email_domain_conflicts_with_row_identity: "domain_contradiction",
+  unique_name: "name",
+  country_supports_assigned_company: "country",
+  country_identifies_company: "country",
+  country_points_to_other_company_of_same_name: "country_contradiction",
+  single_strong_candidate: "name",
+  several_candidates_remain: "name",
+  no_credible_candidate: "name",
+};
+
+/**
  * Registrable-ish label of a domain? No — the host itself is what we compare.
  * Kept tiny and local so the audit has no dependency on the Worker code.
  */
@@ -253,6 +285,10 @@ export function auditAssociations({ companies, contactsByRef, sampleLimit = 25 }
   const problemCompanies = new Map();
   const familiesWithProblems = new Set();
   const sharedNameFamilies = new Set();
+  /** What the index itself recorded, when it recorded anything (format v3). */
+  const stored = { byCategory: { high_confidence: 0, plausible: 0, conflicting: 0 }, unclassified: 0, moved: 0 };
+  /** Legacy class → stored category, so the before/after comparison is measurable. */
+  const crossTab = new Map();
 
   for (const [name, list] of families) {
     totals.families += 1;
@@ -285,6 +321,15 @@ export function auditAssociations({ companies, contactsByRef, sampleLimit = 25 }
 
       const result = classifyAssociation({ company, contact, family });
       byClass[result.klass] += 1;
+
+      // Stored category, when the index has one. A v2 contact has none, and is
+      // counted as `unclassified` — never folded into "plausible".
+      const storedCategory = contact.association?.category ?? "unclassified";
+      if (storedCategory === "unclassified") stored.unclassified += 1;
+      else if (storedCategory in stored.byCategory) stored.byCategory[storedCategory] += 1;
+      if (contact.association?.movedFrom) stored.moved += 1;
+      const cell = `${result.klass}|${storedCategory}`;
+      crossTab.set(cell, (crossTab.get(cell) ?? 0) + 1);
       byReason.set(result.reason, (byReason.get(result.reason) ?? 0) + 1);
       evidence.name[result.evidence.name] += 1;
       evidence.domain[result.evidence.domain] += 1;
@@ -331,6 +376,24 @@ export function auditAssociations({ companies, contactsByRef, sampleLimit = 25 }
         byClass.confirmed + byClass.plausible + byClass.unresolved + byClass.conflict === 0
           ? 0
           : byClass.confirmed / (byClass.confirmed + byClass.plausible + byClass.unresolved + byClass.conflict),
+      /**
+       * What the index stored (format v3). `unclassified` is every contact from a
+       * format-v2 index, or a v3 contact written before Stage B ran — reported, not
+       * hidden, so "no category" can never be read as a category.
+       */
+      stored,
+      /**
+       * Legacy class → stored category, contact by contact. The left column is the
+       * read-only audit's own definition of the same evidence; the right column is
+       * what Stage B decided. Disagreements are where the two rule sets differ, and
+       * they are meant to be visible rather than reconciled by relabelling.
+       */
+      crossTab: [...crossTab.entries()]
+        .map(([cell, count]) => {
+          const [legacy, storedCategory] = cell.split("|");
+          return { legacy, stored: storedCategory, contacts: count };
+        })
+        .sort((left, right) => left.legacy.localeCompare(right.legacy) || left.stored.localeCompare(right.stored)),
     },
     risk: {
       companiesWithProblems: problems.length,
@@ -345,6 +408,197 @@ export function auditAssociations({ companies, contactsByRef, sampleLimit = 25 }
       "Contact country is weak evidence: a person may work for a company in another country. It is used here only to separate members of a same-name family, where it is the only evidence available.",
       "This is a read-only report. It does not reassign contacts, modify index objects or rebuild pass 1.",
     ],
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Preserved contacts and reconciliation (format v3)                          */
+/* -------------------------------------------------------------------------- */
+
+/** Count of one facet field, recomputed from the stored contacts. */
+function facetCounts(contacts, pick) {
+  const counts = new Map();
+  for (const contact of contacts) {
+    const value = pick(contact);
+    if (value) counts.set(value, (counts.get(value) ?? 0) + 1);
+  }
+  return counts;
+}
+
+/**
+ * Is a stored facet list the exact top-N of the recomputed counts?
+ *
+ * `finalizeFacets` keeps the 40 largest buckets, so a company with more than 40
+ * distinct cities is expected to store only some of them. The check therefore
+ * verifies every stored bucket's count, and only demands completeness when the
+ * recomputed field fits inside the stored list.
+ */
+function facetMatches(stored, actual, topN = 40) {
+  const list = Array.isArray(stored) ? stored : [];
+  const seen = new Set();
+  let smallestStored = Infinity;
+  for (const bucket of list) {
+    if (!bucket || typeof bucket.value !== "string") return false;
+    if (seen.has(bucket.value)) return false;
+    seen.add(bucket.value);
+    if ((actual.get(bucket.value) ?? 0) !== bucket.count) return false;
+    smallestStored = Math.min(smallestStored, bucket.count);
+  }
+  if (actual.size <= topN) return actual.size === seen.size;
+  // More distinct values than the stored list can hold: anything whose count beats
+  // a stored bucket should have been kept instead.
+  for (const [value, count] of actual) {
+    if (seen.has(value)) continue;
+    if (count > smallestStored) return false;
+  }
+  return list.length === topN;
+}
+
+/**
+ * Summarize preserved contacts and reconcile company records against the
+ * contacts actually stored.
+ *
+ * Section 11 asks for this in both directions: the manifest says what the run
+ * thought it wrote, the objects say what is on disk. A disagreement is reported
+ * as a finding ("unexpected contact loss" / "unexpected duplication"), never
+ * smoothed over by recomputing the counter from the objects under audit.
+ */
+export function auditStoredAssociations({ companies, contactsByRef, unassigned = [], sampleLimit = 10 }) {
+  const preserved = {
+    total: 0,
+    byCategory: { unresolved: 0, conflicting: 0 },
+    byReason: new Map(),
+    /** Preserved rows that lost the company name they claimed (should be zero). */
+    missingClaimedName: 0,
+  };
+  const occurrences = new Map();
+  const note = (id) => {
+    if (typeof id === "string" && id) occurrences.set(id, (occurrences.get(id) ?? 0) + 1);
+  };
+
+  for (const contact of unassigned) {
+    preserved.total += 1;
+    const category = contact.association?.category;
+    if (category === "unresolved" || category === "conflicting") preserved.byCategory[category] += 1;
+    const reason = contact.association?.reason ?? "unknown";
+    preserved.byReason.set(reason, (preserved.byReason.get(reason) ?? 0) + 1);
+    if (!contact.claimedCompanyName) preserved.missingClaimedName += 1;
+    note(contact.id);
+  }
+
+  const count = { recorded: 0, actual: 0, mismatched: 0, sample: [] };
+  const associations = { recorded: 0, actual: 0, mismatched: 0, sample: [] };
+  const facets = {
+    checked: 0,
+    mismatched: 0,
+    byField: { designation: 0, department: 0, seniority: 0, country: 0, city: 0, emailAvailable: 0, linkedinAvailable: 0 },
+    sample: [],
+  };
+  let attached = 0;
+
+  for (const { ref, company } of companies) {
+    const contacts = contactsByRef.get(ref) ?? [];
+    attached += contacts.length;
+    for (const contact of contacts) note(contact.id);
+
+    count.recorded += company.contactCount ?? 0;
+    count.actual += contacts.length;
+    if ((company.contactCount ?? 0) !== contacts.length) {
+      count.mismatched += 1;
+      if (count.sample.length < sampleLimit) {
+        count.sample.push({ companyId: company.id, name: company.name, recorded: company.contactCount ?? 0, actual: contacts.length });
+      }
+    }
+
+    if (company.associations) {
+      const recorded =
+        (company.associations.highConfidence ?? 0) + (company.associations.plausible ?? 0) + (company.associations.conflicting ?? 0);
+      let high = 0;
+      let plausible = 0;
+      let conflicting = 0;
+      for (const contact of contacts) {
+        const category = contact.association?.category;
+        if (category === "high_confidence") high += 1;
+        else if (category === "plausible") plausible += 1;
+        else if (category === "conflicting") conflicting += 1;
+      }
+      const actual = high + plausible + conflicting;
+      associations.recorded += recorded;
+      associations.actual += actual;
+      const agrees =
+        recorded === actual &&
+        (company.associations.highConfidence ?? 0) === high &&
+        (company.associations.plausible ?? 0) === plausible &&
+        (company.associations.conflicting ?? 0) === conflicting;
+      if (!agrees) {
+        associations.mismatched += 1;
+        if (associations.sample.length < sampleLimit) {
+          associations.sample.push({
+            companyId: company.id,
+            name: company.name,
+            recorded: {
+              high: company.associations.highConfidence ?? 0,
+              plausible: company.associations.plausible ?? 0,
+              conflicting: company.associations.conflicting ?? 0,
+            },
+            actual: { high, plausible, conflicting },
+          });
+        }
+      }
+    }
+
+    if (company.facets) {
+      facets.checked += 1;
+      const fields = [
+        ["designation", company.facets.designations, facetCounts(contacts, (contact) => contact.designation)],
+        ["department", company.facets.departments, facetCounts(contacts, (contact) => contact.department)],
+        ["seniority", company.facets.seniority, facetCounts(contacts, (contact) => contact.seniority)],
+        ["country", company.facets.countries, facetCounts(contacts, (contact) => contact.country)],
+        ["city", company.facets.cities, facetCounts(contacts, (contact) => contact.city)],
+      ];
+      const wrong = [];
+      for (const [field, stored, actual] of fields) {
+        if (!facetMatches(stored, actual)) {
+          facets.byField[field] += 1;
+          wrong.push(field);
+        }
+      }
+      const email = contacts.filter((contact) => contact.email).length;
+      const linkedin = contacts.filter((contact) => contact.linkedinUrl).length;
+      if ((company.facets.emailAvailable ?? 0) !== email) {
+        facets.byField.emailAvailable += 1;
+        wrong.push("emailAvailable");
+      }
+      if ((company.facets.linkedinAvailable ?? 0) !== linkedin) {
+        facets.byField.linkedinAvailable += 1;
+        wrong.push("linkedinAvailable");
+      }
+      if (wrong.length) {
+        facets.mismatched += 1;
+        if (facets.sample.length < sampleLimit) facets.sample.push({ companyId: company.id, name: company.name, fields: wrong });
+      }
+    }
+  }
+
+  let duplicated = 0;
+  const duplicateSample = [];
+  for (const [id, times] of occurrences) {
+    if (times < 2) continue;
+    duplicated += times - 1;
+    if (duplicateSample.length < sampleLimit) duplicateSample.push(id);
+  }
+
+  return {
+    preserved: { ...preserved, byReason: [...preserved.byReason.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)) },
+    reconciliation: {
+      companies: companies.length,
+      attached,
+      preserved: unassigned.length,
+      contactCount: count,
+      associations,
+      facets,
+      ids: { total: attached + unassigned.length, distinct: occurrences.size, duplicated, sample: duplicateSample },
+    },
   };
 }
 
@@ -391,6 +645,51 @@ export function auditRecommendations(report) {
       "No association is independently confirmed (not one contact's email domain matches its company's), so the audit's classes rest entirely on name uniqueness and country evidence. Treat the classes as a risk ranking, not a correctness proof.",
     );
   }
+
+  const stored = report.associations?.stored;
+  if (stored) {
+    const classified = stored.byCategory.high_confidence + stored.byCategory.plausible + stored.byCategory.conflicting;
+    if (classified === 0 && stored.unclassified > 0) {
+      out.push(
+        `None of the ${plural(stored.unclassified, "contact")} in this index carries a stored association category: it is a format-v2 index. Rebuild it under a NEW version (e.g. \`--version ${report.version}-assoc\`) to get Stage B categories — do not overwrite this one.`,
+      );
+    }
+    if (classified > 0 && stored.moved === 0 && byClass.conflict > 0) {
+      out.push(
+        `No contact was reassigned even though the legacy audit flags ${plural(byClass.conflict, "contradicted association")}. Check that the rebuild ran with the current association rules before comparing the two.`,
+      );
+    }
+  }
+
+  if (report.preserved && report.preserved.missingClaimedName > 0) {
+    out.push(
+      `${plural(report.preserved.missingClaimedName, "preserved contact is", "preserved contacts are")} missing the company name they claimed, so they cannot be reviewed. This is a defect, not an evidence problem.`,
+    );
+  }
+
+  const reconciliation = report.reconciliation;
+  if (reconciliation) {
+    if (reconciliation.contactCount.mismatched > 0) {
+      out.push(
+        `${plural(reconciliation.contactCount.mismatched, "company")} disagree with the contacts stored for it (contactCount sum ${num(reconciliation.contactCount.recorded)} vs ${num(reconciliation.contactCount.actual)} on disk). Fix the count before publishing: a wrong count is what a reviewer sees first.`,
+      );
+    }
+    if (reconciliation.associations.mismatched > 0) {
+      out.push(
+        `${plural(reconciliation.associations.mismatched, "company")} disagree with their stored association split (high/plausible/conflicting), so the profile would misstate how many contacts are trusted.`,
+      );
+    }
+    if (reconciliation.facets.mismatched > 0) {
+      out.push(
+        `${plural(reconciliation.facets.mismatched, "company")} have facet counts that do not match their stored contacts, so filtering by designation/country/linkedin would return the wrong rows.`,
+      );
+    }
+    if (reconciliation.ids.duplicated > 0) {
+      out.push(
+        `${plural(reconciliation.ids.duplicated, "contact id")} occur more than once across companies and preserved objects. Deduplication must collapse them before publishing.`,
+      );
+    }
+  }
   return out;
 }
 
@@ -416,7 +715,7 @@ export function formatAuditReport(report) {
   const e = report.evidence;
 
   say("CompanyIntel association audit (read-only; existing index objects only)");
-  say(`version ${report.version}   directory ${report.dir}`);
+  say(`version ${report.version}   format ${report.indexFormatVersion ?? "unknown"}   directory ${report.dir}`);
   say(`measured at ${report.checkedAt} — company-level identifiers and counts only; no contact value is read or printed`);
   say("");
   say("Scope");
@@ -446,6 +745,60 @@ export function formatAuditReport(report) {
   say("");
   say("By reason");
   for (const [reason, count] of a.byReason) say(`  ${pad(reason, 62)} ${num(count)}`);
+  if (a.stored) {
+    say("");
+    say("Stored categories (what the index itself recorded; format v3 only)");
+    say(`  high_confidence   ${num(a.stored.byCategory.high_confidence)}  independent evidence on the source record or in the email domain`);
+    say(`  plausible         ${num(a.stored.byCategory.plausible)}  one company is favoured, not verified`);
+    say(`  conflicting       ${num(a.stored.byCategory.conflicting)}  attached, disputed, never shown as verified`);
+    say(`  unclassified      ${num(a.stored.unclassified)}  no category stored (format-v2 contact, or written before Stage B)`);
+    say(`  moved between companies of the same name  ${num(a.stored.moved)}`);
+  }
+
+  if (a.crossTab?.length) {
+    say("");
+    say("Before/after: legacy audit class → stored category (same evidence, two rule sets)");
+    for (const row of a.crossTab) say(`  ${pad(row.legacy, 12)} → ${pad(row.stored, 16)} ${num(row.contacts)}`);
+  }
+
+  if (report.preserved) {
+    say("");
+    say("Preserved contacts (kept without an employer rather than attached by guess)");
+    say(`  preserved total          ${num(report.preserved.total)}`);
+    say(`  unresolved               ${num(report.preserved.byCategory.unresolved)}`);
+    say(`  conflicting              ${num(report.preserved.byCategory.conflicting)}`);
+    say(`  lost the name they claimed ${num(report.preserved.missingClaimedName)}  (must be 0)`);
+    for (const [reason, count] of report.preserved.byReason) say(`  ${pad(reason, 62)} ${num(count)}`);
+  }
+
+  if (report.reconciliation) {
+    const r = report.reconciliation;
+    say("");
+    say("Reconciliation (stored objects, not the run's own counters)");
+    say(`  companies                ${num(r.companies)}`);
+    say(`  contacts attached        ${num(r.attached)}`);
+    say(`  contacts preserved       ${num(r.preserved)}`);
+    say(`  contactCount sum         ${num(r.contactCount.recorded)} recorded, ${num(r.contactCount.actual)} on disk, ${num(r.contactCount.mismatched)} companies disagree`);
+    say(`  association-count sum    ${num(r.associations.recorded)} recorded, ${num(r.associations.actual)} on disk, ${num(r.associations.mismatched)} companies disagree`);
+    say(`  facets checked           ${num(r.facets.checked)} companies, ${num(r.facets.mismatched)} disagree`);
+    say(
+      `  facet fields wrong       designations ${num(r.facets.byField.designation)}, departments ${num(r.facets.byField.department)}, ` +
+        `seniority ${num(r.facets.byField.seniority)}, countries ${num(r.facets.byField.country)}, cities ${num(r.facets.byField.city)}, ` +
+        `email ${num(r.facets.byField.emailAvailable)}, linkedin ${num(r.facets.byField.linkedinAvailable)}`,
+    );
+    say(`  contact ids              ${num(r.ids.total)} stored, ${num(r.ids.distinct)} distinct, ${num(r.ids.duplicated)} unexpected duplicate(s)`);
+    if (r.contactCount.sample.length) {
+      say("  contactCount disagreements (company id + name only)");
+      for (const row of r.contactCount.sample) {
+        say(`    ${pad(row.companyId, 22)} ${pad(row.name, 34)} recorded ${String(row.recorded).padStart(4)}  on disk ${String(row.actual).padStart(4)}`);
+      }
+    }
+    if (r.facets.sample.length) {
+      say("  facet disagreements (company id + fields only)");
+      for (const row of r.facets.sample) say(`    ${pad(row.companyId, 22)} ${pad(row.name, 34)} ${row.fields.join(", ")}`);
+    }
+  }
+
   say("");
   say(`Companies with at least one conflict or unresolved association: ${num(report.risk.companiesWithProblems)}`);
   say(`  of those, in a shared-name family: ${num(report.risk.sharedNameFamiliesWithProblems)} of ${num(report.risk.sharedNameFamilies)} families`);

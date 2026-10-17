@@ -7,6 +7,9 @@
  * only:
  *
  *   1. a source-provided company id             (strong, within one file)
+ *      — scoped to its own source (`s:<source>:<id>`), never compared across
+ *      files, because two unrelated datasets number their organizations
+ *      independently and a bare id would merge them
  *   2. a canonical LinkedIn company URL         (strong, cross-file)
  *   3. a normalized verified domain             (strong, cross-file)
  *   4. the normalized company name              (weak: used only when no strong
@@ -213,7 +216,42 @@ export interface ResolutionDecision {
   created: boolean;
   /** True when a strong-evidence conflict forced a separate record. */
   ambiguous: boolean;
+  /**
+   * True when at least one of this row's non-name identifiers is owned by the
+   * returned record — i.e. the record the row resolved to really does carry the
+   * employer identity the row itself provided.
+   *
+   * Stage B needs this distinction: a row that names its own employer (a domain,
+   * a source organization id, a company LinkedIn page) is evidence about THAT
+   * row, whereas a row that only contributed a name is not. A row whose strong
+   * keys were all already owned elsewhere reports `false`, so the association
+   * decision cannot treat a stolen claim as its own evidence.
+   */
+  identityClaimed: boolean;
 }
+
+/** One strong identifier two different company records both laid claim to. */
+export interface ResolverKeyConflict {
+  /** The identifier itself (`d:`, `l:` or `s:` prefixed — never `n:`, see `claim`). */
+  key: string;
+  /** Ref that owned it first — the owner never changes. */
+  ownerRef: number;
+  /** Ref of the record whose row tried to claim it afterwards. */
+  claimantRef: number;
+}
+
+/** Bounded resolver diagnostics, reported by the run and the audit. */
+export interface ResolverStats {
+  entities: number;
+  keys: number;
+  /** Total refused claims (may exceed the stored sample). */
+  conflicts: number;
+  /** Fingerprint-style samples of refused claims, ids only, never a value. */
+  samples: ResolverKeyConflict[];
+}
+
+/** How many refused claims the resolver keeps for reporting. */
+export const RESOLVER_CONFLICT_SAMPLE_LIMIT = 32;
 
 /**
  * Resolve a company row against the identities already seen in this partition.
@@ -241,12 +279,40 @@ interface IdentityEntry {
  *
  * One resolver handles a single hash partition, so the identity maps stay small
  * enough to live in memory no matter how large the full dataset is.
+ *
+ * ## Identifier ownership is immutable (Section 3 / Section 4, rule 7)
+ *
+ * Registration used to be `this.index.set(key, entry)` for every key of every
+ * row. Nothing checked who already owned the key, so a later row could *steal* an
+ * identifier from the record that carried it: after that point every row holding
+ * the key resolved to the new record, so which company a domain pointed at
+ * depended on the order of the input file (and a real domain could change owner
+ * between one company and another). Claims are now first-owner-wins: a key that
+ * is already owned is never reassigned, the refused claim is counted and sampled
+ * for the run report, and the resolver reports whether the row's own identity
+ * actually ended up owned by the record it resolved to.
+ *
+ * ## Bounded records for self-contradicting rows
+ *
+ * When a row's keys point at two different records, a separate record is created
+ * for that evidence pattern (as before) and remembered by signature, so every
+ * later row with the same pattern joins it. Without the signature, a row whose
+ * keys are all owned elsewhere would create a fresh record on every occurrence —
+ * an unbounded number of empty companies on a real file.
  */
 export class CompanyResolver {
   private readonly index = new Map<string, IdentityEntry>();
   private readonly byName = new Map<string, number[]>();
   private readonly byRef = new Map<number, IdentityEntry>();
+  /**
+   * Evidence pattern → record, for rows whose identifiers contradict each other.
+   * The signature is the normalized name plus the row's sorted strong keys, so it
+   * describes the *evidence*, never a position in the file.
+   */
+  private readonly bySignature = new Map<string, number>();
   private nextRef = 0;
+  private conflictCount = 0;
+  private readonly conflictSamples: ResolverKeyConflict[] = [];
 
   get size(): number {
     return this.nextRef;
@@ -258,6 +324,11 @@ export class CompanyResolver {
 
   entry(ref: number): IdentityEntry | undefined {
     return this.byRef.get(ref);
+  }
+
+  /** Diagnostics for the run counters and the association audit. */
+  stats(): ResolverStats {
+    return { entities: this.byRef.size, keys: this.index.size, conflicts: this.conflictCount, samples: [...this.conflictSamples] };
   }
 
   resolve(keys: CompanyKeys): ResolutionDecision {
@@ -273,14 +344,14 @@ export class CompanyResolver {
     if (matches.size === 1 && (!keys.strong || strongMatch)) {
       const [ref] = [...matches];
       this.register(keys, ref, false);
-      return { ref, created: false, ambiguous: this.byRef.get(ref)?.ambiguous ?? false };
+      return { ref, created: false, ambiguous: this.byRef.get(ref)?.ambiguous ?? false, identityClaimed: this.ownsIdentity(keys, ref) };
     }
 
     if (!keys.strong && matches.size === 0 && sameNameRefs.length === 1) {
       const candidate = this.byRef.get(sameNameRefs[0]);
       if (candidate && !candidate.strong) {
         this.register(keys, candidate.ref, false);
-        return { ref: candidate.ref, created: false, ambiguous: candidate.ambiguous };
+        return { ref: candidate.ref, created: false, ambiguous: candidate.ambiguous, identityClaimed: false };
       }
     }
 
@@ -296,33 +367,105 @@ export class CompanyResolver {
         if (entry) entry.ambiguous = true;
       }
     }
+
+    const signature = evidenceSignature(keys);
+    const known = contradictory ? this.bySignature.get(signature) : undefined;
+    if (known !== undefined) {
+      const entry = this.byRef.get(known);
+      for (const ref of sameNameRefs) {
+        const other = this.byRef.get(ref);
+        if (other) other.ambiguous = true;
+      }
+      if (entry) entry.ambiguous = true;
+      this.register(keys, known, true);
+      return { ref: known, created: false, ambiguous: true, identityClaimed: this.ownsIdentity(keys, known) };
+    }
+
     const ref = this.nextRef;
     this.nextRef += 1;
+    if (contradictory) this.bySignature.set(signature, ref);
     this.register(keys, ref, contradictory);
-    return { ref, created: true, ambiguous: contradictory };
+    return { ref, created: true, ambiguous: contradictory, identityClaimed: this.ownsIdentity(keys, ref) };
+  }
+
+  /**
+   * True when the row's own strong identity is owned by `ref`.
+   *
+   * Only meaningful after the row has been registered: a key that was refused
+   * (owned by another record) must never be reported as this record's evidence.
+   */
+  private ownsIdentity(keys: CompanyKeys, ref: number): boolean {
+    return keys.all.some((key) => !key.startsWith("n:") && this.index.get(key)?.ref === ref);
   }
 
   private register(keys: CompanyKeys, ref: number, ambiguous: boolean): void {
     const existing = this.byRef.get(ref);
     const entry: IdentityEntry = existing ?? {
       ref,
-      strong: keys.strong,
+      // Pending: `strong` is set below from what this record actually OWNS, not
+      // from what the row carried. A row whose every identifier was already owned
+      // elsewhere owns no identity, and a record with no identity must never be
+      // treated as one (that is how a contradicting row used to look verified).
+      strong: false,
       normalizedName: keys.normalizedName,
       ambiguous,
     };
     if (ambiguous) entry.ambiguous = true;
-    if (keys.strong) entry.strong = true;
     this.byRef.set(ref, entry);
-    for (const key of keys.all) this.index.set(key, entry);
+    for (const key of keys.all) this.claim(key, entry);
+    if (this.ownsIdentity(keys, ref)) entry.strong = true;
     const list = this.byName.get(keys.normalizedName) ?? [];
     if (!list.includes(ref)) list.push(ref);
     this.byName.set(keys.normalizedName, list);
+  }
+
+  /**
+   * Claim one identifier for `entry`, or record that someone else already owns it.
+   *
+   * The owner never changes. That is the whole fix: ownership is a fact about the
+   * first record that carried the identifier, not about whichever row happened to
+   * be read last.
+   */
+  private claim(key: string, entry: IdentityEntry): boolean {
+    const owner = this.index.get(key);
+    if (owner) {
+      /*
+       * Only a STRONG key refused for another record is a conflict.
+       *
+       * `n:<normalized name>` is shared by every company of that name on purpose —
+       * that is what a name family is — so counting each later namesake's name key
+       * as a refused claim would drown the signal in tens of thousands of entries
+       * that mean nothing (`identifierConflicts` is the number an operator reads to
+       * spot a domain changing hands). Ownership is still first-owner-wins for the
+       * name key; it is simply not reported as a conflict.
+       */
+      if (owner.ref !== entry.ref && !key.startsWith("n:")) {
+        this.conflictCount += 1;
+        if (this.conflictSamples.length < RESOLVER_CONFLICT_SAMPLE_LIMIT) {
+          this.conflictSamples.push({ key, ownerRef: owner.ref, claimantRef: entry.ref });
+        }
+      }
+      return false;
+    }
+    this.index.set(key, entry);
+    return true;
   }
 
   /** Ref that owns a given identifier, if any. */
   refFor(key: string): number | undefined {
     return this.index.get(key)?.ref;
   }
+
+  /** Every refused claim so far (bounded sample plus the total). */
+  conflicts(): ResolverStats {
+    return this.stats();
+  }
+}
+
+/** Evidence pattern of a row: its normalized name plus its sorted strong keys. */
+function evidenceSignature(keys: CompanyKeys): string {
+  const strong = keys.all.filter((key) => !key.startsWith("n:")).sort();
+  return `${keys.normalizedName}\u0000${strong.join("\u0001")}`;
 }
 
 /* -------------------------------------------------------------------------- */

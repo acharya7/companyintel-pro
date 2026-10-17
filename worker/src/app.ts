@@ -17,22 +17,29 @@ import {
   contactFiltersSchema,
   datasetActivateRequestSchema,
   exportRequestSchema,
+  parseAssociationFilter,
   savedSearchRequestSchema,
   saveLeadRequestSchema,
   settingsRequestSchema,
+  toContactFilters,
   updateLeadRequestSchema,
 } from "../../src/shared/api-contract";
+import { associationMatchesFilter, type AssociationCategory } from "../../src/shared/association";
+import { spoolPartitionOfNormalizedName, type IndexDirectory } from "../../src/shared/search/index-format";
 import { DEFAULT_SETTINGS, LEAD_STATUSES } from "../../src/shared/models";
 import type {
   ActivityEntry,
   CompanySearchHit,
   Contact,
+  ContactFilters,
   DatasetSourcesResponse,
   DatasetStatusResponse,
   DatasetValidationResponse,
   ExportJob,
   SavedLead,
   SavedSearch,
+  UnassignedContact,
+  UnassignedContactsResponse,
   UserSettings,
 } from "../../src/shared/models";
 import { EXPORT_COLUMN_HEADERS, exportFilename, toCsv, type CsvColumn } from "../../src/shared/csv";
@@ -161,7 +168,8 @@ interface DatasetContext {
   store: R2Store;
   version: string;
   source: R2CandidateSource;
-  directoryReady: boolean;
+  /** The version's directory — the single source of truth for shard counts. */
+  directory: IndexDirectory;
 }
 
 async function requireDataset(store: R2Store): Promise<DatasetContext> {
@@ -173,7 +181,7 @@ async function requireDataset(store: R2Store): Promise<DatasetContext> {
   if (!directory) {
     throw new HttpError(503, "dataset_unavailable", `Index directory for version ${pointer.version} is missing or unreadable.`);
   }
-  return { store, version: pointer.version, source: new R2CandidateSource(store, directory), directoryReady: true };
+  return { store, version: pointer.version, source: new R2CandidateSource(store, directory), directory };
 }
 
 /** Convenience wrapper for route handlers. */
@@ -232,7 +240,7 @@ function sortContacts(contacts: Contact[], sort: string, order: "asc" | "desc"):
   });
 }
 
-function filterContacts(contacts: Contact[], filters?: z.infer<typeof contactFiltersSchema>): Contact[] {
+function filterContacts(contacts: Contact[], filters?: ContactFilters): Contact[] {
   if (!filters) return contacts;
   return contacts.filter((contact) => {
     if (filters.designation && contact.designation !== filters.designation) return false;
@@ -242,6 +250,9 @@ function filterContacts(contacts: Contact[], filters?: z.infer<typeof contactFil
     if (filters.city && contact.city !== filters.city) return false;
     if (filters.hasEmail && !contact.email) return false;
     if (filters.hasLinkedin && !contact.linkedinUrl) return false;
+    // Association category: the trusted view (high-confidence + plausible) is
+    // expressed as a filter, never as a silent omission of disputed rows.
+    if (!associationMatchesFilter(contact.association?.category, filters.association)) return false;
     return true;
   });
 }
@@ -511,13 +522,66 @@ app.get("/api/companies/:id/contacts", async (c) => {
   const pageSize = Math.min(100, Math.max(1, Number(query.pageSize ?? 25)));
   const sort = query.sort ?? "name";
   const order = query.order === "desc" ? "desc" : "asc";
-  const filters = contactFiltersSchema.optional().parse(extractFilters(query));
+  const filters = toContactFilters(contactFiltersSchema.optional().parse(extractFilters(query)));
 
   const ref = await dataset.source.refForCompanyId(c.req.param("id"));
   if (ref === null) throw new HttpError(404, "not_found", `Company ${c.req.param("id")} is not in dataset ${dataset.version}.`);
   const contacts = sortContacts(filterContacts(await dataset.store.getContactsByCompanyRef(dataset.version, ref), filters), sort, order);
   const { slice, page: pageInfo } = paginate(contacts, page, pageSize);
   return c.json({ companyId: c.req.param("id"), contacts: slice, page: pageInfo, datasetVersion: dataset.version });
+});
+
+/**
+ * Contacts preserved WITHOUT an employer that claimed this company's name.
+ *
+ * Deliberately its own endpoint, not part of the company profile: a company page
+ * must stay cheap, and these rows are the ones the indexer refused to attach, so
+ * they belong behind an explicit "review the uncertain ones" action. One bounded
+ * object read (the company's own Pass 1 partition); format-v2 indexes answer with
+ * an empty list rather than an error.
+ */
+app.get("/api/companies/:id/unassigned", async (c) => {
+  const dataset = await datasetFor(c);
+  const query = Object.fromEntries(new URL(c.req.url).searchParams.entries());
+  const page = Math.max(1, Number(query.page ?? 1));
+  const pageSize = Math.min(100, Math.max(1, Number(query.pageSize ?? 25)));
+  // Default to the unattached ones; `?category=conflicting` reviews the ones the
+  // index attached to their claim but flagged.
+  const wanted = parseAssociationFilter(query.category) ?? (["unresolved"] as AssociationCategory[]);
+
+  const ref = await dataset.source.refForCompanyId(c.req.param("id"));
+  if (ref === null) throw new HttpError(404, "not_found", `Company ${c.req.param("id")} is not in dataset ${dataset.version}.`);
+  const company = await dataset.store.getCompanyByRef(dataset.version, ref);
+  if (!company) throw new HttpError(404, "not_found", `Company record ${c.req.param("id")} could not be read.`);
+
+  const preserved: UnassignedContact[] = [];
+  const partitions = dataset.directory.shards.spoolPartitions;
+  if (partitions && partitions > 0) {
+    const partition = spoolPartitionOfNormalizedName(company.normalizedName, partitions);
+    for (const contact of await dataset.store.getUnassignedContacts(dataset.version, partition)) {
+      if (!wanted.includes(contact.association.category)) continue;
+      // Keep it only when this company is what the contact claimed, or when it was
+      // one of the candidates the decision could not choose between.
+      const claimed = contact.claimedNormalizedName === company.normalizedName;
+      if (!claimed && !contact.association.candidateCompanyIds?.includes(company.id)) continue;
+      preserved.push(contact);
+    }
+  }
+
+  const sorted = [...preserved].sort((a, b) => a.fullName.localeCompare(b.fullName) || a.id.localeCompare(b.id));
+  const { slice, page: pageInfo } = paginate(sorted, page, pageSize);
+  const response: UnassignedContactsResponse = {
+    companyId: company.id,
+    companyName: company.name,
+    contacts: slice,
+    page: pageInfo,
+    datasetVersion: dataset.version,
+    totals: {
+      unresolved: sorted.filter((contact) => contact.association.category === "unresolved").length,
+      conflicting: company.associations?.conflicting ?? 0,
+    },
+  };
+  return c.json(response);
 });
 
 app.get("/api/contacts", async (c) => {
@@ -537,7 +601,7 @@ app.get("/api/contacts", async (c) => {
   if (companyIds.length > MAX_CONTACT_COMPANIES) {
     throw new HttpError(400, "invalid_request", `At most ${MAX_CONTACT_COMPANIES} companies per contact request.`);
   }
-  const filters = contactFiltersSchema.optional().parse(extractFilters(query));
+  const filters = toContactFilters(contactFiltersSchema.optional().parse(extractFilters(query)));
   const collected: Contact[] = [];
   for (const companyId of companyIds) {
     const ref = await dataset.source.refForCompanyId(companyId);
@@ -794,7 +858,7 @@ app.post("/api/exports", async (c) => {
         const ref = await dataset.source.refForCompanyId(companyId);
         if (ref === null) continue;
         const company = await store.getCompanyByRef(dataset.version, ref);
-        const contacts = filterContacts(await store.getContactsByCompanyRef(dataset.version, ref), body.filters);
+        const contacts = filterContacts(await store.getContactsByCompanyRef(dataset.version, ref), toContactFilters(body.filters));
         for (const contact of contacts) {
           if (rows.length >= MAX_EXPORT_ROWS) {
             truncated = true;
