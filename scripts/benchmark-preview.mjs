@@ -6,8 +6,8 @@
  * open from each. Each request is made twice: the first is cold for this isolate,
  * the second shows what the isolate cache keeps.
  *
- *   bun .measure-preview.mjs before
- *   bun .measure-preview.mjs after
+ *   bun scripts/benchmark-preview.mjs before
+ *   bun scripts/benchmark-preview.mjs after
  */
 const label = process.argv[2] ?? "run";
 const base = "http://127.0.0.1:5173";
