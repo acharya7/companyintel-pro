@@ -206,8 +206,20 @@ export const STORAGE = {
    * estimate uses the TOP of that range rather than its middle.
    */
   outputBytesPerRow: 200,
-  /** Fixed cost of a run's bookkeeping: checkpoint, spool manifest, rejected rows. */
+  /**
+   * Bookkeeping cost of a run: checkpoint, spool manifest, rejected rows, objects.jsonl.
+   *
+   * Ceiling for a full-corpus run (the three files that scale with rows are all small —
+   * the rejected list is the largest, and the measured full run's total was well under
+   * this). It is a CEILING, not a flat term: `estimateWorkingSet` scales it down with the
+   * number of rows, because a 3 MB fixture run does not need 256 MB of headroom and must
+   * not be refused for lack of it on a volume that is merely busy.
+   */
   fixedOverheadBytes: 256 * 1024 * 1024,
+  /** Per-row share of that bookkeeping, so the estimate tracks the run's real size. */
+  overheadBytesPerRow: 8,
+  /** Floor for the bookkeeping term, so a tiny run still budgets a few MB. */
+  minimumOverheadBytes: 4 * 1024 * 1024,
   /** Applied to the sum before comparing with free space. */
   safetyMargin: 1.25,
 } as const;
@@ -456,6 +468,8 @@ export function estimateWorkingSet(
   let spoolBytes = 0;
   let outputBytes = 0;
   let rawCachePeakBytes = 0;
+  /** Rows the estimate is based on; `null` as soon as one source's total is unknown. */
+  let totalRows: number | null = 0;
 
   for (const source of measured) {
     const bytes = source.bytes ?? 0;
@@ -465,6 +479,8 @@ export function estimateWorkingSet(
     // bytes-based estimate below rather than pretending the source is empty.
     const rows = options.sampleLimit ?? (source.bytes === null ? null : Math.round(bytes / STORAGE.averageSourceBytesPerRow));
     perSource.push({ id: source.id, mode, bytes, rows });
+    if (rows === null) totalRows = null;
+    else if (totalRows !== null) totalRows += rows;
 
     if (rows === null) {
       // Unknown size: fall back to the input bytes with the same headroom the
@@ -487,12 +503,23 @@ export function estimateWorkingSet(
     }
   }
 
-  const sum = spoolBytes + rawCachePeakBytes + outputBytes + STORAGE.fixedOverheadBytes;
+  /*
+   * Scale the bookkeeping term with the run.
+   *
+   * `rows` is the same figure the other terms are computed from (a sample's row count,
+   * an import's recorded rows, or the whole corpus derived from object sizes), so the
+   * overhead tracks it: 4 MB for a fixture, 256 MB for a full 100 M-row corpus.
+   */
+  const overheadBytes =
+    totalRows === null
+      ? STORAGE.fixedOverheadBytes
+      : Math.min(STORAGE.fixedOverheadBytes, Math.max(STORAGE.minimumOverheadBytes, totalRows * STORAGE.overheadBytesPerRow));
+  const sum = spoolBytes + rawCachePeakBytes + outputBytes + overheadBytes;
   return {
     spoolBytes,
     rawCachePeakBytes,
     outputBytes,
-    overheadBytes: STORAGE.fixedOverheadBytes,
+    overheadBytes,
     safetyMargin: STORAGE.safetyMargin,
     totalBytes: Math.ceil(sum * STORAGE.safetyMargin),
     perSource,

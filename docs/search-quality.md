@@ -127,8 +127,15 @@ until the domain is indexed — a v3 candidate, listed in §9.
 still short, (b) the previous sweep was cut short by the partition cap
 (`hydrationBudgetHit()`), and (c) there are candidates left to hydrate. It stops when the
 page fills, when the cap stops it, when the source says more reads could not have found
-anything, or at `SEARCH_LIMITS.maxHydrate` (64 partitions ≈ 1.6 MB). Partitions already read
-are memoised, so a rung is spent only on partitions the previous rung could not reach.
+anything, **when a rung hydrated more records and ranked none of them**, or at
+`SEARCH_LIMITS.maxHydrate` (64 partitions). Partitions already read are memoised, so a rung
+is spent only on partitions the previous rung could not reach.
+
+The yield rule is what keeps "bounded hydration" true of the whole search rather than of its
+first pass. Doubling the budget is a bet that the deeper candidates can fill the page; when a
+rung qualifies nothing, a third rung re-reads more partitions for the same answer. The engine
+records the stop as `retrieval.ladderStopped = "no_new_hits"` (and `bun run search:explain`
+prints it).
 
 Measured on the real-data sample (`bun scripts/benchmark-hydration.mjs --version v1-dry5-250
 --repeat 2`), 8 query classes, 82 company partitions:
@@ -158,6 +165,33 @@ Read this table honestly:
   becomes a single 64-partition sweep (~1.6 MB, `top-25 = 90/90` here).
 - The unbounded "reference" is a *reference for what this index can return*, not proof of
   complete coverage of the source data.
+
+### What the yield rule costs and saves
+
+Same index and same engine, two strategies per query — the ladder as it runs, and `fixed 64`,
+which is where the ladder used to end (the rungs it could take, with nothing to stop it).
+`company-intel-data` @ `dev-r2-20k-fields-20261017`: 20,259 companies, 82 partitions,
+~1.2 MB per partition, measured through `R2Store` + `R2CandidateSource`:
+
+| query | strategy | rungs | partitions | objects / bytes | rows | ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| `qualtrics` | ladder | 2 | 32 | 43 / **39.7 MB** | 1 | 2,933 |
+| `qualtrics` | fixed 64 | 1 | 64 | 75 / **78.6 MB** | 1 | 3,972 |
+| `global technology` | ladder | 3 | 64 | 81 / 79.0 MB | 2 | 4,730 |
+| `global technology` | fixed 64 | 1 | 64 | 81 / 79.0 MB | 2 | 4,368 |
+
+- Where the rule fires it halves the bytes and saves a second of CPU for **the same row set**
+  (`lost 0` against the unbounded reference on both queries). `qualtrics` has one genuine match
+  and 1,600 trigram candidates; the second rung read 16 more partitions, ranked nothing, and
+  ended the ladder at 32 instead of walking to 64.
+- Where every rung ranks new rows (`global technology`) it does not fire, and the ladder costs
+  what the fixed budget costs — which is the point: the rule cannot cut a page that could
+  still fill.
+
+The numbers scale with partition size, not with the corpus: a full index has the same 250
+companies per partition, so the per-search cost above is the per-search cost of the real
+dataset on a comparable machine. `bun scripts/benchmark-hydration.mjs` is the repeatable form
+of this table on a local index.
 
 Completeness is reported, never implied: `page.totalIsLowerBound` is set when retrieval was
 budget-bounded, when the early-stop barrier fired, when the candidate list was truncated, or
@@ -303,9 +337,11 @@ Two rules keep it honest:
    the partition cap can both leave a better-ranked candidate unread; `totalIsLowerBound` and
    the short-page notice say so. Removing this entirely needs per-partition max-score metadata
    (v3) or the compaction side index.
-3. **Sparse queries pay for the ladder.** A query whose true match count is below the page size
-   (an exact name with four matches) takes the rungs and cannot fill its page either way. On
-   the sample that is ~1.6 MB and 84 objects for 2–4 rows; only pre-computed counts avoid it.
+3. **Sparse queries pay for one unproductive rung.** A query whose true match count is below
+   the page size (an exact name with four matches) still takes the second rung, because the
+   engine cannot know the rung will rank nothing until it has read it. The yield rule makes
+   that the *last* rung — measured above at 39.7 MB instead of 78.6 MB — but it cannot make it
+   free; only pre-computed counts avoid it.
 4. **The 1 M index was not measured here.** Everything in §5–§7 is the 20 K real-data sample.
    The commands below produce the 1 M numbers.
 5. **The association audit cannot see source provenance** and does not attempt to. A future
@@ -377,7 +413,7 @@ make any of them pass — the labelled relevance set still reports precision@1 1
 | 2 | Prefix, token and fuzzy matching | `tests/search.test.ts` → "short queries use bounded prefix lookup and stay strict", "fuzzy matching can be switched off"; `tests/search-ranking.test.ts` → "legitimate typo tolerance and partial queries are unchanged" |
 | 3 | Candidate-budget truncation | `tests/search-ranking.test.ts` → "the CPU budget truncates the weakest evidence, keeps the strongest, and reports the count" |
 | 4 | Hydration-budget exhaustion | `tests/search-ranking.test.ts` → "a partition budget that cuts the answer short is reported, not hidden"; `tests/search-funnel.test.ts` → "reads at most SHARDING.maxHydrate partitions per search, across every batch" |
-| 5 | Adaptive retries | `tests/search-funnel.test.ts` → "the adaptive pass only runs when the partition budget was the limit", "a page cut short by the partition budget is refilled by the adaptive pass"; `tests/search-ranking.test.ts` → "the adaptive ladder reaches further than a single retry, and stops when the page fills" |
+| 5 | Adaptive retries | `tests/search-funnel.test.ts` → "the adaptive pass only runs when the partition budget was the limit", "a page cut short by the partition budget is refilled by the adaptive pass", "the ladder stops at the first rung that ranks nothing new", "a rung that ranks new rows keeps the ladder climbing"; `tests/search-ranking.test.ts` → "the adaptive ladder reaches further than a single retry, and stops when the page fills" |
 | 6 | No duplicate R2 reads within a search | `tests/search-ranking.test.ts` → "no object is read twice for one search, and every read is counted"; `tests/search-funnel.test.ts` → "never hydrates a profile partition twice for one search"; `bench:hydration` → `dup 0` for every strategy and query |
 | 7 | Pagination correctness | `tests/search-ranking.test.ts` → "pages never overlap, stay in order, and stop when the data does", "a page beyond the data returns an empty slice and hasMore false" |
 | 8 | Relevant result ordering across partitions | `tests/search-ranking.test.ts` → "a candidate in a later partition is not out-ranked by an earlier one" (its fixture crosses a partition boundary) |

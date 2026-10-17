@@ -97,18 +97,34 @@ bun run index:upload
 bun run index:validate
 bun run index:publish
 
-# ONE COMMAND for the whole pipeline (preflight → index → validate → resumable upload →
-# re-verify → optional activation). Resumable at every stage; never passes --no-resume and
-# never activates without --activate.
+# ONE COMMAND for the whole pipeline: dependencies → source version → cost estimate →
+# resume state → preflight → Pass 1 → Pass 2 → local validation → coverage label →
+# resumable upload → read-every-object-back verification from R2 → optional activation.
+# Resumable at every stage; never passes --no-resume, never deletes a spool, and never
+# activates anything R2 has not confirmed (the uploaded manifest + validation report
+# must both be present and passing).
 bun run index:full:preflight -- --version v1-full-<date>       # check only
 bun run index:full -- --version v1-full-<date> --yes           # the material run
 bun run index:full -- --version v1-full-<date> --activate --yes --upload-only
+
+# Windows, double-clickable:
+#   index-full.cmd                     build, upload, verify, stop
+#   index-full.cmd --activate          also make it the active dataset
+#   index-full.cmd --resume <id>       continue an interrupted run
+#   index-full.cmd --preflight-only    check auth, sources, disk, RAM only
+
+# Smoke test the pipeline without a 64 GB run (labelled PARTIAL; --activate is refused):
+bun run index:full -- --version dev-smoke-<date> --sample 2000 --no-upload --yes
 ```
 
-Every record carries **every column of its source row**: the canonical mapping covers the fields the
-application searches and ranks on, and the remaining columns are captured verbatim as `attributes`
-(visible in the company and person detail screens). A 51-column company row and a 39-column contact
-row are therefore fully readable, not reduced to a dozen fields — see `docs/indexing.md`
+Every record carries **every column of its source row, in full**: the canonical mapping covers the
+fields the application searches and ranks on, and all 51 company / 39 contact columns are captured
+verbatim as `attributes` (visible in the company and person detail screens). There is no character
+cap and no column cap — the corpus' longest values (a 3,539-character
+`organization_all_possible_domains`, a 3,011-character `organization_short_description`) arrive
+whole, and long text is collapsed in the UI with a “Show all N characters” control rather than
+shortened in storage. Search results stay lightweight: the full row is returned only by the
+detail endpoints — see `docs/indexing.md`
 ("What a record carries: every source column").
 
 Search covers **companies and people** from one box (`/companies`, source selector
@@ -165,10 +181,11 @@ The equivalent S3-key path remains available: `bun scripts/verify-raw.mjs[--json
 | Area | Status |
 | --- | --- |
 | Frontend, Worker, indexer, probe typechecks | **IMPLEMENTED AND TESTED** — `bun run check` → 5/5 PASS |
-| Test suite (510 tests, 0 fail) | **IMPLEMENTED AND TESTED** — normalization, prototype-chain safety, relevance, CSV parsing, indexer pipeline + R2 streaming sources, R2 store, Access security, end-to-end index build + Worker route handlers, the bounded hydration funnel (including checkpoint provenance), the read-only probe, the newline-safe JSONL codec (U+2028/U+2029, truncation, chunk boundaries, CRLF), spool-manifest integrity, the read-only spool doctor, the isolated Pass 2 rebuild from an existing spool (identity separation, isolation, corruption, byte-identical originals, mid-merge restart), the two-stage association rules (order-independence, no-claim rows, preservation, dedupe, reconciliation), the synthetic scenario corpus, the contact name index + global person search (exact, partial, typo, nonsense, preserved contacts, a version without the contact index) and the captured source columns (mapped columns excluded, empty cells omitted, value and column bounds, record round-trip) |
+| Test suite (538 tests, 0 fail) + one-command full-index automation | **IMPLEMENTED AND TESTED** — normalization, prototype-chain safety, relevance, CSV parsing, indexer pipeline + R2 streaming sources, R2 store, Access security, end-to-end index build + Worker route handlers, the bounded hydration funnel (including checkpoint provenance), the read-only probe, the newline-safe JSONL codec (U+2028/U+2029, truncation, chunk boundaries, CRLF), spool-manifest integrity, the read-only spool doctor, the isolated Pass 2 rebuild from an existing spool (identity separation, isolation, corruption, byte-identical originals, mid-merge restart), the two-stage association rules (order-independence, no-claim rows, preservation, dedupe, reconciliation), the synthetic scenario corpus, the contact name index + global person search (exact, partial, typo, nonsense, preserved contacts, a version without the contact index) and the captured source columns (mapped columns excluded, empty cells omitted, value and column bounds, record round-trip) |
 | Global contact (person) search | **IMPLEMENTED AND VERIFIED ON REAL R2 DATA** — the indexer writes `contactToken`/`contactPrefix`/`contactTrigram` shards; `GET /api/contacts/search` ranks by name and answers with the employer evidence. Verified live against the 20 K real-data development version: "malini umapathi" → the preserved contact, "malni umapathii" (two typos) → the same person, "umapathi" → 11 matches, a nonsense query → nothing plus the exact empty-state sentence. A version without a contact index answers `400` with the reason, never an empty result |
-| Every source field is accessible | **IMPLEMENTED AND VERIFIED ON REAL R2 DATA** — the 20 K development version was rebuilt with unmapped source columns captured verbatim (`attributes`); a real company record carries 21 additional columns and a real contact 19, and both detail screens render them with copy buttons and clickable URLs |
-| Freebuff preview over the real bucket | **WORKING** — `vite dev` mounts the production Hono Worker at `/api/*` with the R2 bucket substituted for the binding (`tools/dev-api/`), serving the active development version `dev-r2-20k-full-20261017` (20,259 companies / 19,414 contacts, 491 uploaded objects, all present and content-verified on R2). The published pointer `manifests/active.json` is never written by the preview |
+| Every source field is accessible, in full | **IMPLEMENTED AND VERIFIED ON REAL R2 DATA** — all source columns are captured verbatim, mapped ones included (the canonical value is normalised, the raw one is not), with no character or column cap. Verified live on the active version `dev-r2-20k-fields-20261017`: a real company record returns 72 columns (Tesla, longest value 756 chars) and a merged record 106 (Microsoft, six values over 400 chars, none truncated); real contacts return up to 29 columns. Duplicate headers become `header#2` instead of overwriting, and a company built from both files unions their columns (a real conflict is kept as `<header> (source <id>)`) |
+| Full-index automation (one command) | **IMPLEMENTED AND TESTED** — `bun run index:full` / `index-full.cmd` runs the 20 stages in order, is resumable at every one, uploads manifests LAST (so a half-uploaded version can never look activatable), verifies every object back from R2 (`validate --remote`) in bounded batches, and refuses to activate a partial or unverified version. Coverage is labelled from the run's own checkpoint: a `--sample` run is PARTIAL and activation is rejected before anything is built. Tested end to end by `tests/full-index-pipeline.test.ts` (real script, real child process) plus `tests/publish-verification.test.ts` and `tests/upload-activation-order.test.ts` |
+| Freebuff preview over the real bucket | **WORKING** — `vite dev` mounts the production Hono Worker at `/api/*` with the R2 bucket substituted for the binding (`tools/dev-api/`), serving `dev-r2-20k-fields-20261017` (20,259 companies / 19,414 contacts, 491 uploaded objects, all present and content-verified on R2; 72–106 columns per company record). The served version is resolved per request: the newest activation of {this process, R2's `manifests/active.json`} wins, so publishing a verified index is picked up within seconds without restarting the dev server. The preview itself never writes the published pointer, and it refuses to write any index object |
 | Build and bundles | **IMPLEMENTED AND TESTED** — `bun run build` exits 0 and the `dist/` scan finds no server identifier; `wrangler deploy --dry-run` bundles the Worker (737 KiB) and the probe (39 KiB) with the expected bindings and `workers_dev = false` |
 | Worker → R2 access path | **IMPLEMENTED AND TESTED** — `tests/worker-r2-binding.test.ts` proves the Worker reaches R2 only through the `COMPANY_DATA` binding, never with S3 secrets, and that the bucket is not published |
 | Read-only R2 probe (native binding, no keys) | **IMPLEMENTED AND TESTED locally** — `tests/r2-probe.test.ts`, `tests/r2-probe-schema.test.ts`, `tests/verify-r2-remote-script.test.ts` cover routing, bound clamping, the production refusal, 405 on writes, no write/delete call existing anywhere in the probe, 1 KB/6 MB read budgets, missing-object handling, the schema report and the runner's 0/1/2 exit codes. **Not run against your account** |
@@ -182,7 +199,7 @@ The equivalent S3-key path remains available: `bun scripts/verify-raw.mjs[--json
 | Real data in R2 (`raw/`) | **VERIFIED** — `raw/file1.csv` 10,223,471,749 B and `raw/file2.csv` 54,038,527,871 B listed, HEADed and read with signed ranged GETs; schemas profiled per file; no published dataset. Results: `docs/verification.md` → Phase A |
 | Browser-rendered UI | **BLOCKED here** — no browser in this sandbox; manual checklist in `docs/verification.md` → Phase C |
 | Cloudflare deployment + Access policy | **NOT STARTED** — manual steps are in `docs/deployment.md`, awaiting your go-ahead. `workers_dev = false` is already set in `wrangler.toml`, so add your custom-domain route before deploying |
-| Full 60 GB indexing | **BLOCKED (by design)** — requires your explicit approval after the sample benchmarks |
+| Full 64.26 GB indexing | **READY, NOT RUN HERE** — the one command (`index-full.cmd`, or `bun run index:full -- --version v1-full-<date> --yes`) is implemented and tested end to end: resumable stages, coverage gate, bounded remote verification, activation that R2 must confirm. This environment has ~0.4 GB free against a ~182 GB requirement (132 GB with `rawCacheDir: null`), so the run belongs on the machine that holds the corpus |
 | Cost/performance figures | **MEASURED against the real-data sample index** on a 1-vCPU sandbox: 0.02–0.24 s and ≤ 2.07 MB per query locally, which is above a Workers Free CPU budget — see `docs/verification.md` → Phase E and `docs/cost.md` |
 
 ## Manual actions required from you

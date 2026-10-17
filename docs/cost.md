@@ -53,7 +53,14 @@ The **adaptive hydration ladder** (16 → 32 → 64, see docs/architecture.md an
 shape: a broad query whose page cannot fill from 16 partitions (measured on the real-data
 sample: 421 KB at fixed 16 → 1.15 MB mean for the ladder, unchanged for exact/short queries;
 90 rows instead of 70 across the sample's 8 query classes). The per-query ceiling is still 64
-partitions ≈ 1.6 MB, so even the worst case stays inside the operation and byte budgets below.
+partitions, so even the worst case stays inside the operation and byte budgets below.
+
+The ladder stops at the first rung that hydrates more records and ranks none of them
+(`retrieval.ladderStopped = "no_new_hits"`), so a query with one genuine match does not walk
+to the ceiling. Measured on the 20 K dev index (`dev-r2-20k-fields-20261017`, 82 partitions):
+`qualtrics` now reads 32 partitions / 39.7 MB instead of 64 / 78.6 MB for the same single row,
+while a broad query whose every rung ranks new rows (`global technology`) still reads 64
+partitions / 79 MB, exactly as the fixed budget does. See `docs/search-quality.md` §5.
 
 **Measured reads per query, cold and warm** (real-data sample, real read path —
 `bun run bench:real -- --version <version>`):

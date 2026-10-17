@@ -175,8 +175,23 @@ is one file rather than a scrollback. Interrupting it is safe: re-running the sa
 from the checkpoint (Pass 1), from the merge checkpoint (Pass 2), or with the remaining objects
 (upload skips anything already present at the right size).
 
-On a machine with little free space the default 512 MB free-space floor can refuse a run whose
-output is a few tens of MB; `--disk-floor <mb>` lowers that margin explicitly (`run` accepts it too):
+### Free-space guards scale with the run
+
+The merge stops if the output volume drops below a floor, and the preflight refuses to start when
+free space is below its estimate. Both terms used to be flat — a 512 MB floor and a 256 MB
+bookkeeping charge — which is correct for a run whose output is gigabytes and *wrong* for a small
+one: a 3 MB fixture run was refused on a volume with 300 MB free, i.e. a busy-but-healthy disk could
+fail a build that needed 1 % of the reserve.
+
+Both now scale with the run, and an explicit flag still overrides either:
+
+* the bookkeeping term is `rows × 8 B`, floored at 4 MB and capped at the measured full-corpus
+  ceiling (256 MB), so the full run is budgeted exactly as before;
+* the mid-run floor is the smaller of 512 MB and that run's own estimated output × 1.5, with a 16 MB
+  absolute minimum, unless `--disk-floor <mb>` is given.
+
+On a machine with little free space `--disk-floor <mb>` lowers the margin explicitly (`run` accepts it
+too):
 
 ```bash
 bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.dev-full.json \
@@ -579,6 +594,57 @@ an extrapolation. It is deliberately a manual command — a benchmark that runs
 itself on a developer machine (or in CI) would download gigabytes without being
 asked to.
 
+### The one command that runs the whole sequence
+
+`bun run index:full` (or the double-clickable `index-full.cmd` on Windows) performs every stage in
+order and stops at the first problem:
+
+| # | Stage | What it proves |
+| --- | --- | --- |
+| 1 | dependencies | Bun on PATH, `node_modules` present, the indexer's own files exist |
+| 2 | source version | the git commit (and whether the tree is dirty) is recorded in the report; an archive is reported as such |
+| 3 | cost expectation | R2 storage/Class A/Class B arithmetic at Cloudflare's published prices |
+| 4 | resume state | the checkpoint's stage, version, sample limit and spooled partitions, before anything is read |
+| 5 | preflight | credentials, source objects, TSV schema mapping, disk and RAM |
+| 6 | index | Pass 1 spool + Pass 2 merge (both resumable) + local validation of every object |
+| 7 | coverage gate | `sample` in the checkpoint ⇒ PARTIAL, and `--activate` is refused |
+| 8 | upload | per-object, skipping anything already present with the same size, manifest LAST |
+| 9 | remote verification | `validate --remote` in bounded batches: every object read back from R2 and compared by content |
+| 10 | activation (optional) | `publish`, which re-checks the uploaded manifest + validation report before flipping the pointer |
+| 11 | summary | counters, object count, bytes, cost line, coverage label, and `index-reports/full-index-<id>.json` |
+
+Why the details matter:
+
+* **Manifests upload last.** `publish` and the Dataset page treat
+  `manifests/<version>/manifest.json` as the marker of a complete version, so it is written only after
+  every partition and shard. A killed upload therefore leaves a version that no one can activate by
+  accident.
+* **Verification reads content, not writes.** `validate` alone re-hashes the *local* files against
+  their own record; `validate --remote` reads each object back from R2 and compares it after gzip
+  normalisation (R2 decodes `content-encoding: gzip` at the edge, so a stored-byte hash cannot be
+  compared over HTTPS). `--offset`/`--limit` bound one call, and `--verify-batch <n>` bounds the
+  pipeline's batches.
+* **Activation asks R2, not the local directory.** `publish` requires the uploaded manifest to exist,
+  to name the same version, and to record a passed validation, and the uploaded validation report to
+  agree. It works from a different machine, or after the output directory has been cleaned up, and it
+  cannot point the application at a version that is not there.
+* **The previous version is the rollback target.** The pointer records `previousVersion`, so the
+  Dataset page can put the old version back in one click. Publishing an unchanged version does not
+  lose it.
+* **`--no-upload`** builds and validates locally and prints the same summary (this is what the tests
+  exercise); **`--sample <n>`** is a labelled smoke test of the pipeline and can never be activated.
+
+A pipeline smoke test that is safe to run anywhere (it is what `tests/full-index-pipeline.test.ts`
+runs, and it needs no credentials):
+
+```bash
+bun scripts/full-index.mjs --config tools/indexer/indexer.dev-smoke.json \
+  --version dev-smoke-$(date +%Y-%m-%d) --sample 2000 --no-upload --yes
+```
+
+It prints `Coverage: PARTIAL`, refuses activation, and writes its JSON summary — a complete
+exercise of stages 1–7 and 11 against real R2 sources.
+
 ### Collecting the benchmark numbers
 
 Every number the specification asks for is printed by the run itself, so nothing
@@ -688,7 +754,7 @@ volume fills, but it does not create space: an under-sized machine fails at hour
 | Columns mapped to the wrong canonical field | Add a `columns` override for that source (`{"companyname": "Org Name"}`). |
 | High rejected-row count | Check the encoding/delimiter for that file; inspect `workDir/rejected.jsonl` reasons. |
 | `Refusing to start: temporary space is insufficient` | Free space on the `workDir` volume, or lower `partitions`. |
-| `Stopping before the disk fills: … below the … floor` | The mid-run guard (512 MB free on `outputDir`), checked after every partition. Nothing written was lost and the checkpoint is still at `pass2-merge`: free space and re-run the same command to resume — the partial output is reset and replayed, not appended to. |
+| `Stopping before the disk fills: … below the … floor` | The mid-run free-space guard on `outputDir`, checked after every partition. The floor is the smaller of 512 MB and this run's own estimated output × 1.5 (16 MB minimum); pass `--disk-floor <mb>` to set it yourself. Nothing written was lost and the checkpoint is still at `pass2-merge`: free space and re-run the same command to resume — the partial output is reset and replayed, not appended to. |
 | `workDir already holds a checkpoint for a different run: …` | The spool belongs to another run (different version, sample size, partitions or source paths). If that is correct and you want a **new output version from the same spool**, use `pass2-from-spool` (it never clears the spool — see "Rebuilding Pass 2 under a different version"). Otherwise re-run with `--no-resume` (which clears this work directory's spool) or point `workDir` somewhere empty. Nothing was read or written before the stop. |
 | `was written without a run identity; refusing to resume it` | A checkpoint from a build older than the run-identity change. Re-run with `--no-resume` once. |
 | A resumed run reports `source_missing_rows` (csv1=0, csv2=0) | Fixed: pass-1 counters are restored from the checkpoint, so a resumed run no longer fails validation over its own bookkeeping. If you see it on an older build, re-run with `--no-resume` once. |

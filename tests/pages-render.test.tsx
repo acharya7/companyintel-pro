@@ -25,6 +25,7 @@ import Dashboard from "../src/pages/Dashboard";
 import DatasetManagement from "../src/pages/DatasetManagement";
 import CompanySearch from "../src/pages/CompanySearch";
 import ContactDetails from "../src/pages/ContactDetails";
+import CompanyDetails from "../src/pages/CompanyDetails";
 import { Pager } from "../src/components/common";
 import { queryKeys } from "../src/hooks/use-api";
 import type { Contact, DatasetStatusResponse, UserSettings } from "../src/shared/models";
@@ -111,7 +112,13 @@ const settings: UserSettings = {
 /* --------------------------------- helpers -------------------------------- */
 
 async function makeClient(
-  seed: { datasetStatus?: DatasetStatusResponse; error?: string; contact?: { contact: Contact; companyName: string | null; companyId: string | null } } = {},
+  seed: {
+    datasetStatus?: DatasetStatusResponse;
+    error?: string;
+    contact?: { contact: Contact; companyName: string | null; companyId: string | null };
+    company?: { company: unknown };
+    companyContacts?: { id: string; value: unknown };
+  } = {},
 ) {
   const client = new QueryClient({
     defaultOptions: {
@@ -142,6 +149,15 @@ async function makeClient(
     client.setQueryData(queryKeys.settings, settings);
   }
   if (seed.contact) client.setQueryData(queryKeys.contact(seed.contact.contact.id), seed.contact);
+  if (seed.company) {
+    const record = seed.company.company as { id: string };
+    client.setQueryData(queryKeys.company(record.id), {
+      company: seed.company.company,
+      facets: null,
+      datasetVersion: "v1",
+    });
+  }
+  if (seed.companyContacts) client.setQueryData(queryKeys.companyContacts(seed.companyContacts.id, {}), seed.companyContacts.value);
   return client;
 }
 
@@ -221,6 +237,39 @@ describe("pages render without a missing API method", () => {
     expect(html).toContain("microsoft");
     // The no-dataset explanation must NOT appear when a dataset is being served.
     expect(html).not.toContain("No dataset indexed");
+  });
+
+  test("Company detail renders a long source value collapsed, with a control to expand it", async () => {
+    const description = `${"Segment of a real company description. ".repeat(20)}END-OF-VALUE`;
+    const company = {
+      id: "c_0123456789abcdef",
+      name: "Example Corporation",
+      normalizedName: "example",
+      contactCount: 3,
+      sources: [{ source: "csv1", row: 2 }],
+      attributes: {
+        organization_short_description: description,
+        organization_public_symbol: "EXM",
+      },
+    };
+    const client = await makeClient({ datasetStatus: realDataset, company: { company } });
+    const html = renderToString(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/companies/c_0123456789abcdef"]}>
+          <Routes>
+            <Route path="/companies/:companyId" element={<CompanyDetails />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    // The value is delivered whole and declared as a column of the record…
+    expect(html).toContain("organization_short_description");
+    expect(html).toContain("organization_public_symbol");
+    expect(html).toContain("EXM");
+    // …but rendered collapsed, with the real character count and a way to expand it.
+    expect(html).toContain("Show all");
+    expect(html).toContain(`${description.length} characters`);
+    expect(html).not.toContain("END-OF-VALUE");
   });
 
   test("Contact profile renders every captured field and the employer evidence", async () => {

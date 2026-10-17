@@ -126,10 +126,14 @@ the budget is spent across the engine's hydration batches — so a search reads 
    but only when the previous sweep was cut short *by that budget*. The source reports
    `hydrationBudgetHit()`, which is the difference between "more budget would find more
    companies" and "there are no more companies to find"; without it, a sparse query (an exact
-   name with four matches) would pay for a round of reads that cannot find anything. It stops
-   when the page fills, when the cap stops it, when the source says more reads cannot help, or
-   at `SEARCH_LIMITS.maxHydrate` (64), so a search can never read more than
-   `64 × ~25 KB ≈ 1.6 MB`.
+   name with four matches) would pay for a round of reads that cannot find anything. It also
+   stops at the first rung that hydrates more records and ranks none of them
+   (`retrieval.ladderStopped = "no_new_hits"`) — without that rule the ladder always ended at
+   the ceiling, which is where the unbounded cost came back. It stops when the page fills,
+   when the cap stops it, when the source says more reads cannot help, at a rung that ranks
+   nothing new, or at `SEARCH_LIMITS.maxHydrate` (64). A search therefore reads at most 64
+   profile partitions — ~1.2 MB each on the 20 K index with captured attributes, measured at
+   39.7 MB for a sparse query that stops after 32.
 5. **Whole-name gating** (`retrieval.fuzzyDeferred` / `fuzzyRecovered`). When the exact and
    prefix stages already produced at least a page of candidates, the token and trigram
    *retrieval* stages are skipped — up to 24 shard reads saved for the most common query

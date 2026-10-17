@@ -333,6 +333,15 @@ export async function searchCompanies(
     fuzzyDeferred: false,
     /** True when those skipped stages had to be run after all (a short page). */
     fuzzyRecovered: false,
+    /**
+     * Why the hydration ladder stopped early, when it did.
+     *
+     * `"no_new_hits"` means a rung with a larger partition budget qualified no
+     * additional row, so a further rung would have read more partitions for the
+     * same answer. Reported so an operator can tell a bounded search from a
+     * mis-tuned one instead of inferring it from the byte count.
+     */
+    ladderStopped: undefined as "no_new_hits" | undefined,
   };
 
   /** Candidates that must be found before another page row is known to exist. */
@@ -577,8 +586,28 @@ export async function searchCompanies(
       if (hydrated >= budgetedRefs().length) break;
       const next = Math.min(retrieval.hydrateBudget * ADAPTIVE_HYDRATE_FACTOR, SEARCH_LIMITS.maxHydrate);
       if (next <= retrieval.hydrateBudget) break;
+      const rankedBefore = scored.length;
       await sweep(next);
       budgetLimited = source.hydrationBudgetHit?.() ?? false;
+      /*
+       * A rung that RANKS nothing is the end of the ladder.
+       *
+       * Doubling the partition budget is a bet: it is worth the extra reads only if
+       * the deeper candidates can actually fill the page. When a rung hydrates more
+       * records and qualifies none of them, a third rung re-reads yet more partitions
+       * for the same answer — measured on the real 20 K index: a search for a common
+       * name walked 16 → 32 → 64 partitions (64 MB of JSON) and returned the four
+       * exact hits it had after the FIRST rung. This is the load-bearing rule for
+       * `maxHydrate`: without it the ladder always ends at the ceiling, and the
+       * "bounded hydration" claim is true only of the first pass.
+       *
+       * Completeness is still reported honestly: `budgetLimited` remains true, so the
+       * API still shows the total as a floor ("of 40+") rather than a total.
+       */
+      if (scored.length === rankedBefore) {
+        retrieval.ladderStopped = "no_new_hits";
+        break;
+      }
     }
   }
 

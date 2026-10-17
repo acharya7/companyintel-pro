@@ -705,6 +705,17 @@ describe("preflight resource estimates match what a real run consumes", () => {
     expect(estimate.totalBytes).toBeGreaterThan(70_960_000_000);
   });
 
+  test("the bookkeeping term scales with the run instead of being a flat 256 MB", () => {
+    const tiny = estimateWorkingSet(modeB, MEASURED, { sampleLimit: 1_000 });
+    // A thousand rows do not need a quarter of a gigabyte of headroom. A flat term is
+    // what made a 3 MB fixture run refuse to finish on a volume that was merely busy.
+    expect(tiny.overheadBytes).toBe(STORAGE.minimumOverheadBytes);
+
+    const full = estimateWorkingSet(modeB, MEASURED, {});
+    // The full corpus is ~100 M rows, so the term is capped at the measured ceiling.
+    expect(full.overheadBytes).toBe(STORAGE.fixedOverheadBytes);
+  });
+
   test("a local-file run has no staging term, and the sample bounds the spool", () => {
     const local: IndexerConfig = { ...modeB, sources: [{ id: "csv1", path: "/tmp/does-not-exist.csv" }], rawCacheDir: null };
     const estimate = estimateWorkingSet(local, [{ id: "csv1", bytes: 10_223_471_749 }], { sampleLimit: 1_000_000 });
@@ -733,7 +744,13 @@ describe("preflight resource estimates match what a real run consumes", () => {
       // warning appears depends on the machine — the arithmetic must not).
       expect(report.estimatedWorkBytes).toBe(report.estimate.totalBytes);
       expect(report.estimatedOutputBytes).toBe(report.estimate.outputBytes);
-      const terms = STORAGE.spoolBytesPerRow * 1_000_000 + STORAGE.outputBytesPerRow * 1_000_000 + STORAGE.fixedOverheadBytes;
+      // The bookkeeping term scales with the run's row count and is capped by the
+      // full-corpus ceiling, so the itemised total is computed the same way here.
+      const overhead = Math.min(
+        STORAGE.fixedOverheadBytes,
+        Math.max(STORAGE.minimumOverheadBytes, 1_000_000 * STORAGE.overheadBytesPerRow),
+      );
+      const terms = STORAGE.spoolBytesPerRow * 1_000_000 + STORAGE.outputBytesPerRow * 1_000_000 + overhead;
       expect(report.estimatedWorkBytes).toBe(Math.ceil(terms * STORAGE.safetyMargin));
     } finally {
       await rm(dir, { recursive: true, force: true });

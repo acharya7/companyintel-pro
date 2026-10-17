@@ -130,6 +130,35 @@ class SyntheticIndex implements ShardReader {
   }
 }
 
+/**
+ * An index whose exact postings are broader than the stored names: the query's
+ * exact term is also recorded against refs whose companies do not match it at
+ * all (an alias, a former name, or a term dropped from the profile). Hydration
+ * is the only stage that can tell, which is exactly what the ladder's yield rule
+ * has to survive.
+ */
+class OverreachIndex extends SyntheticIndex {
+  constructor(
+    companies: Company[],
+    private readonly overreachTerm: string,
+    private readonly overreachRefs: number[],
+  ) {
+    super(companies);
+  }
+
+  override async getShard(version: string, kind: IndexKind, shard: number): Promise<ShardPayload | null> {
+    const payload = await super.getShard(version, kind, shard);
+    if (kind !== "exact" || !payload || shardOf(this.overreachTerm, SHARDS.exact) !== shard) return payload;
+    const postings = payload.terms[this.overreachTerm] ?? { refs: [], q: [] };
+    for (const ref of this.overreachRefs) {
+      postings.refs.push(ref);
+      postings.q!.push(qualityByte(0, 8));
+    }
+    payload.terms[this.overreachTerm] = postings;
+    return payload;
+  }
+}
+
 function directory(companies: number): IndexDirectory {
   return {
     formatVersion: 2,
@@ -221,6 +250,58 @@ describe("bounded R2 hydration", () => {
     expect(response.page.totalIsLowerBound).toBe(true);
     expect(response.retrieval.scored).toBeLessThan(200);
     expect(index.partitionsRead.length).toBeLessThanOrEqual(SHARDING.maxHydrate);
+  });
+
+  test("the ladder stops at the first rung that ranks nothing new", async () => {
+    // 40 companies genuinely match and sit in the first partition. The index also
+    // records the query's exact term against 1,000 companies that do not match it
+    // at all, so every rung the ladder can take hydrates more records and ranks
+    // none of them. A third rung would read more partitions for the same answer.
+    const companies: Company[] = [];
+    for (let index = 0; index < 40; index += 1) {
+      companies.push({ ...makeCompany(index, "Alpha Corporation"), contactCount: 400 });
+    }
+    for (let index = 40; index < 1040; index += 1) companies.push(makeCompany(index, `Zeta Holdings ${index}`));
+    const overreach = Array.from({ length: 1000 }, (_, offset) => offset + 40);
+    const index = new OverreachIndex(companies, "alpha corporation", overreach);
+
+    const response = await searchCompanies(new R2CandidateSource(index, directory(companies.length)), "alpha corporation", {
+      pageSize: 100,
+      maxHydrate: 1,
+      adaptiveHydrateSteps: 3,
+    });
+
+    expect(response.hits.length).toBeGreaterThan(0);
+    // Every returned row came from the first rung: the rung that read 250
+    // non-matching companies contributed nothing, which is why it ended the ladder.
+    expect(response.hits.every((hit) => hit.name === "Alpha Corporation")).toBe(true);
+    expect(response.retrieval.ladderStopped).toBe("no_new_hits");
+    // One productive rung plus the rung that proved nothing was left: the same
+    // rows, without walking on to the ceiling for them.
+    expect(index.partitionsRead.length).toBe(2);
+
+    // The same search without the ladder reads the same rows from the first rung.
+    const fixed = new OverreachIndex(companies, "alpha corporation", overreach);
+    const direct = await searchCompanies(new R2CandidateSource(fixed, directory(companies.length)), "alpha corporation", {
+      pageSize: 100,
+      maxHydrate: 1,
+      adaptiveHydration: false,
+    });
+    expect(direct.hits.map((hit) => hit.id)).toEqual(response.hits.map((hit) => hit.id));
+    expect(direct.retrieval.ladderStopped).toBeUndefined();
+  });
+
+  test("a rung that ranks new rows keeps the ladder climbing", async () => {
+    // Every partition holds genuine matches, so each rung adds rows and the only
+    // stop is the ceiling — the rule must not cut a page that could still fill.
+    const index = new SyntheticIndex(manyCompanies(1200));
+    await searchCompanies(new R2CandidateSource(index, directory(1200)), "alpha", {
+      pageSize: 200,
+      maxHydrate: 1,
+      adaptiveHydrateSteps: 2,
+    });
+
+    expect(index.partitionsRead.length).toBe(4);
   });
 
   test("hydration is capped by the batch it is asked for, not by the whole candidate list", async () => {

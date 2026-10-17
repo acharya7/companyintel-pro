@@ -140,6 +140,7 @@ console.log("What the search itself did (same query, same engine, same budgets)"
 console.log(`  exact ${r.exact}  prefix ${r.prefix}  token ${r.token}  trigram ${r.trigram}  scored ${r.scored}`);
 console.log(`  candidates ${r.candidates}  truncated ${r.truncated}  hydrationPasses ${r.hydrationPasses}  hydrateBudget ${r.hydrateBudget}`);
 console.log(`  budgetLimited ${r.budgetLimited}  fuzzyDeferred ${r.fuzzyDeferred}  fuzzyRecovered ${r.fuzzyRecovered}`);
+if (r.ladderStopped) console.log(`  ladder stopped at ${r.hydrateBudget} partitions: a rung ranked nothing new`);
 console.log(`  total ${explained.engine.page.total}${explained.engine.page.totalIsLowerBound ? " (lower bound)" : ""}  hasMore ${explained.engine.page.hasMore}  took ${explained.engine.tookMs} ms`);
 if (explained.engine.notice) console.log(`  notice: ${explained.engine.notice}`);
 console.log(`  R2 objects read ${bucket.counters.gets}  bytes ${bytes.toLocaleString()}`);
