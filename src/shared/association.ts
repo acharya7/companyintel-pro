@@ -54,10 +54,12 @@
  *     company of the same name.
  *
  * Moving a contact is only allowed when independent evidence names a different
- * *specific* company: an email-domain match (`email_domain_matches_other_company_of_same_name`)
- * or the family containing exactly one credible entity. Country evidence is used
- * to *flag*, never to relocate: it is a weaker signal and a wrong relocation is
- * worse than a flagged one.
+ * *specific* company than the one the row identified: an email-domain match
+ * (`email_domain_matches_other_company_of_same_name`) or the family containing
+ * exactly one credible entity. Country evidence is used to *flag*, never to
+ * relocate: it is a weaker signal and a wrong relocation is worse than a flagged
+ * one. A row that identified no employer at all (`NO_CLAIM_REF`) has nothing to
+ * move away from, so it is identified by its own evidence instead.
  *
  * ## Privacy and purity
  *
@@ -190,7 +192,18 @@ export interface AssociationContactInput {
 
 export interface AssociateInput {
   contact: AssociationContactInput;
-  /** The company record the row's own company name resolved to (the claim). */
+  /**
+   * The company record the row's own company name resolved to (the claim), or
+   * `NO_CLAIM_REF` when the row carried no employer identifier at all.
+   *
+   * A row whose only company field is a NAME has no employer claim to defend: the
+   * resolver's ref is merely the record that owns the shared name key, i.e. the
+   * first company of that name in the input. Judging the contact against that
+   * arbitrary member made the same row "plausible" in one file order and
+   * "conflicting" in another (and attached it to a company its evidence never
+   * named). Callers therefore pass this sentinel, which is never a candidate, and
+   * Stage B decides from the contact's own evidence instead.
+   */
   claimedRef: number;
   /**
    * True when the source row itself carried a company identifier (domain,
@@ -225,6 +238,15 @@ export interface AssociationDecision {
   candidateCompanyIds?: string[];
   record: AssociationRecord;
 }
+
+/**
+ * `claimedRef` value for a contact row that carried no employer identity.
+ *
+ * Negative so it can never collide with a document ref. Stage B treats it as "no
+ * claim": the row's company name is a name, not an employer, and only the
+ * contact's own evidence (email domain, country, family size) may attach it.
+ */
+export const NO_CLAIM_REF = -1;
 
 /* -------------------------------------------------------------------------- */
 /* Email-domain evidence                                                      */
@@ -321,14 +343,32 @@ export function emailDomainOf(email: string | null | undefined): string | null {
 /**
  * True when two hosts are the same domain or one is a parent of the other.
  *
- * Used for the "sibling" tier only: `mail.acme.com` under `acme.com` is a branch
- * of the same company far more often than it is a different company, and the
- * tier is only consulted when no exact host match exists.
+ * This is a symmetric "same organisation domain family" question, used by the
+ * read-only audit. It is deliberately NOT what decides a branch match below: for
+ * an employer decision the direction matters (see `isBranchOf`).
  */
 export function sameDomain(a: string | null | undefined, b: string | null | undefined): boolean {
   if (!a || !b) return false;
   if (a === b) return true;
   return a.endsWith(`.${b}`) || b.endsWith(`.${a}`);
+}
+
+/**
+ * True when `host` is `parent` or a host UNDER it — a branch mailbox of that
+ * company, not its parent.
+ *
+ * DIRECTION IS THE WHOLE POINT. `mail.acme.com` under the company domain
+ * `acme.com` is a branch of that company, so it is supporting evidence. The
+ * reverse is not: a person at `acme.com` is not thereby an employee of a company
+ * whose recorded domain is `logistics.acme.com` — they may well work at the
+ * parent group. The symmetric `sameDomain` used to be applied here, which marked
+ * exactly that case `high_confidence` at the subsidiary. A group/parent domain is
+ * now "outside the family" and is reported as a conflict (or stays unresolved),
+ * never as verified employment.
+ */
+export function isBranchOf(host: string | null | undefined, parent: string | null | undefined): boolean {
+  if (!host || !parent) return false;
+  return host === parent || host.endsWith(`.${parent}`);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -444,13 +484,14 @@ export function associateContact(input: AssociateInput): AssociationDecision {
    */
 
   if (domainSelector) {
-    // `moved` means "attached somewhere other than the company this row's name
-    // resolved to", which is exactly what a reviewer needs to know — regardless of
-    // whether that company was itself identified by the row.
-    const moving = domainSelector.ref !== input.claimedRef;
+    // `moved` means "attached somewhere other than the employer this row claimed".
+    // A name-only row (no claim) is being identified, not reassigned, so it has no
+    // move to record — inventing one would attribute the person to a company their
+    // own row never named.
+    const moving = Boolean(claimed) && domainSelector.ref !== input.claimedRef;
     return decide(
       "high_confidence",
-      domainSelector.ref === input.claimedRef ? "email_domain_matches_assigned_company" : "email_domain_matches_other_company_of_same_name",
+      !claimed || domainSelector.ref === input.claimedRef ? "email_domain_matches_assigned_company" : "email_domain_matches_other_company_of_same_name",
       domainSelector.ref,
       moving,
       [domainSelector.id],
@@ -459,12 +500,12 @@ export function associateContact(input: AssociateInput): AssociationDecision {
 
   /*
    * 3. A corporate domain that matches nobody in the family: evidence away from
-   *    the company the contact is attached to. This is the same contradiction the
-   *    read-only audit reports (`email_domain_contradicts_assigned_company`); it
-   *    is not weakened here just because the row's own claim carried no identity,
-   *    and it is not turned into a relocation either (a contractor or subsidiary
-   *    domain is not proof of a different employer, so the contact keeps its claim
-   *    and the disagreement is recorded).
+   *    the employer the row identified. This is the same contradiction the
+   *    read-only audit reports (`email_domain_contradicts_assigned_company`); it is
+   *    not turned into a relocation either (a contractor or subsidiary domain is
+   *    not proof of a different employer, so the contact keeps its claim and the
+   *    disagreement is recorded). A row with no employer identity at all has no
+   *    claim to accuse, so this branch cannot fire for it.
    */
 
   if (claimed && corporateDomain && domainVerdict === "outside_family") {
@@ -483,8 +524,8 @@ export function associateContact(input: AssociateInput): AssociationDecision {
    *    Country never overrides a record-provided identity, and on its own it never
    *    relocates a person (people work away from headquarters). Two roles are left:
    *    it can flag a credible claim as disputed, or it can identify the employer
-   *    when the claim is a name-only placeholder — where the alternative is not a
-   *    different employer but limbo.
+   *    when the row carried no employer identity at all (`NO_CLAIM_REF`) — where
+   *    the alternative is not a different employer but limbo.
    */
 
   if (countryVerdict === "selects" && !claimIsCredible) {
@@ -507,8 +548,14 @@ export function associateContact(input: AssociateInput): AssociationDecision {
   }
 
   if (credible.length === 0) {
-    // Every member is a name-only record: there is no credible entity to choose.
-    return decide("plausible", "no_credible_candidate", claimed?.ref ?? input.claimedRef);
+    // Every member is a name-only record: there is no credible entity to choose,
+    // but the family itself is still the best available answer (and stays
+    // plausible, never verified). The fallback must be a real candidate — the
+    // no-claim sentinel is not attachable.
+    const fallback = claimed ?? candidates[0] ?? null;
+    return fallback
+      ? decide("plausible", "no_credible_candidate", fallback.ref)
+      : decide("unresolved", "no_credible_candidate", null);
   }
 
   // Several credible members and nothing that separates them.
@@ -522,7 +569,8 @@ function domainTiers(domain: string, candidates: AssociationCandidate[]): { exac
   for (const candidate of candidates) {
     if (!candidate.domain) continue;
     if (candidate.domain === domain) exact.push(candidate);
-    else if (sameDomain(candidate.domain, domain)) related.push(candidate);
+    // Only a host UNDER the company's domain is a branch of it (see `isBranchOf`).
+    else if (isBranchOf(domain, candidate.domain)) related.push(candidate);
   }
   return { exact, related };
 }

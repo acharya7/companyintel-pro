@@ -24,6 +24,7 @@ that, all reproduced by tests before being fixed:
 | 2 | **A self-contradicting row looked like a verified company.** A row carrying two unrelated strong identifiers created a record whose keys had all been refused, yet the record was marked `strong` from what the row *carried*, so later rules treated it as an employer with verified identity. | same | "a contradicting row creates its own record and claims nothing that is taken" |
 | 3 | **Contacts were attached with no separate evidence step.** A normalized-name match was the whole decision, so a person could be attached to any company sharing the name, including a placeholder that carries nothing but the name. | `tools/indexer/src/build.ts` (pass 2) | "companies with one name and different domains stay separate", `tests/association.test.ts` |
 | 4 | Repeated self-contradicting rows created one empty company **per row** (unbounded on a real file). | `CompanyResolver` | "a repeated contradicting pattern joins one record instead of creating one per row" |
+| 5 | **A contact row that carried only a company NAME was judged against an arbitrary member of that name family.** The resolver returns the record that owns the shared `n:` key for such a row (the first company of that name in the input), and Stage B was passed that ref as if the row had claimed it. The same row was then `plausible` at one company in one file order and `conflicting` at another in the reverse order, and country evidence that named the second member was reported as a conflict against the first. | `tools/indexer/src/build.ts` (pass 2) + `src/shared/association.ts` (`NO_CLAIM_REF`) | `tests/indexer-association.test.ts` → "reversing the company rows changes neither the employer nor the verdict"; `tests/association.test.ts` → "a contact row that carried no employer identity has no employer claim" |
 
 One measurement consequence worth knowing before reading a run report: `identifierConflicts` counts
 only **strong** refusals (`d:` / `l:` / `s:`). Every namesake record "claims" the shared `n:` name
@@ -76,9 +77,13 @@ Rules, in the order the resolver applies them:
    *evidence pattern* (`normalized name + sorted strong keys`), so every later row
    with the same pattern joins it instead of creating another empty company. Such
    a record reports `identityClaimed: false` and `strong: false`.
-4. **A name-only row joins a name-only record of the same name** — never a record
-   that already owns strong identifiers. `strong` is computed from what the record
-   *owns*, not from what its row carried.
+4. **A name-only row resolves to the record that owns the shared `n:<name>` key**
+   — the first company of that name read from the sources. That resolution places
+   the row in a name family; it is **not** an employer claim. Stage B therefore
+   receives `NO_CLAIM_REF` for such a contact (§3), so a person whose row carried
+   only a name can never be attached to an arbitrary member of a shared name.
+   `strong` is computed from what the record *owns*, not from what its row carried,
+   so a contradicting row never looks verified.
 5. **Ambiguity is recorded, not resolved.** Every company in a normalized-name
    family with more than one member is flagged `ambiguous`, which is what the
    interface reports as "kept apart".
@@ -103,33 +108,64 @@ placeholders*), and decides with `associateContact()` in
 returns a confidence percentage — nothing here is calibrated against employment
 ground truth.
 
+A row that carried **no employer identifier at all** (only a company name) has no
+claim to defend. Build passes `NO_CLAIM_REF` for it, and Stage B decides from the
+contact's own evidence: a corporate email domain names the employer (high
+confidence), a country that matches exactly one member makes it a possible match
+(plausible), and anything ambiguous stays unresolved. Nothing is attached to
+whichever company happened to be read first.
+
 ### What counts as evidence
 
 | Evidence | Strength | Notes |
 | --- | --- | --- |
 | The source row itself carried the employer's identity (`claimedIdentity`) | strong, record-provided | The row's own domain / LinkedIn / scoped source id is owned by the record it resolved to |
 | Contact email domain equals a candidate's domain | strong (independent) | Exact host first, then a parent/branch host (`mail.acme.com` under `acme.com`) only if no exact match exists |
-| Contact email domain equals another candidate's domain | strong, reassignment | This is the one case that *moves* a contact |
-| Country matches exactly one candidate | weak, supporting or flagging | Supports the claim (plausible) or flags it (conflict). Never relocates on its own |
+| Contact email domain equals another candidate's domain | strong, reassignment | Moves a contact only when the row *claimed an identified employer*; for a name-only row it identifies the employer instead (`email_domain_matches_assigned_company`, no `movedFrom`) |
+| Country matches exactly one candidate | weak, supporting or flagging | Supports an identified claim (plausible) or flags it (conflict). It identifies the employer only when the row carried no claim at all, where the alternative is being preserved |
 | Unique name in the family | weak | Nothing to confuse it with → plausible, never verified |
 
 Explicitly **not** evidence: a public mailbox provider (gmail, yahoo, outlook, …);
-name similarity or a shared normalized name; dataset order; a person's own
-LinkedIn URL; a country difference on its own; the number of contacts a company
-already has.
+name similarity or a shared normalized name; **the company name on the row** (it
+names a family, not an employer); dataset order; a person's own LinkedIn URL; a
+country difference on its own; the number of contacts a company already has.
 
 ### The four categories
 
 | Category | Exact criteria | UI label |
 | --- | --- | --- |
 | `high_confidence` | The row's identity is owned by the assigned record, and no email-domain evidence contradicts it (`row_carries_employer_identity`); **or** the contact's email domain matches exactly one candidate, and that candidate is the one assigned (`email_domain_matches_assigned_company`, `email_domain_matches_other_company_of_same_name`). | Verified evidence |
-| `plausible` | No strong evidence, but one candidate is consistent: unique name (`unique_name`), country evidence fits the assigned company (`country_supports_assigned_company`), exactly one credible candidate exists (`single_strong_candidate`), or the whole family is name-only (`no_credible_candidate`). | Possible match |
+| `plausible` | No strong evidence, but one candidate is consistent: exactly one credible candidate exists (`single_strong_candidate`), country evidence fits an identified claim (`country_supports_assigned_company`), country evidence identifies the employer of a name-only row (`country_identifies_company`), a unique name leaves nothing to confuse it with (`unique_name`), or the whole family is name-only (`no_credible_candidate`). | Possible match |
 | `unresolved` | Several credible candidates remain and nothing separates them (`several_candidates_remain`). The contact is **not attached** to any company. | Employer unresolved |
-| `conflicting` | Positive evidence points away from the assigned company: a corporate domain belongs to another member of the family (`email_domain_conflicts_with_row_identity`), the domain matches no member while the family has domains (`email_domain_outside_name_family`), or the country identifies another member (`country_points_to_other_company_of_same_name`). Attached and displayed as disputed — never as a verified employee. | Disputed employer |
+| `conflicting` | Positive evidence points away from an employer the row identified: the corporate domain belongs to another member of the family (`email_domain_conflicts_with_row_identity`), the domain matches no member while the family (and the claim) has domains (`email_domain_outside_name_family`), or the country identifies another member than the claimed one (`country_points_to_other_company_of_same_name`). Attached and displayed as disputed — never as a verified employee. | Disputed employer |
 
 Every verdict stores its `reason`, the `evidence` it used (`name`, `domain`,
 `country`, `rowIdentity`, candidate count) and, where relevant, the candidate
-company ids. `movedFrom` records the company id a reassigned contact came from.
+company ids. `movedFrom` records the company id a reassigned contact came from; it
+is only written when the row claimed an identified employer, so a name-only row can
+never be shown as having "previously worked at" an arbitrary company.
+
+### Repeatable scenario checks
+
+`bun run index:assoc-scenarios` builds ONE synthetic corpus containing the eleven
+association situations the specification lists (identical names in different
+countries, subsidiaries, similar brands, corporate domains, public providers,
+conflicting evidence, job changes, duplicate rows, missing company identifiers,
+missing country/domain, ambiguous names), indexes it with the real pipeline, and
+prints per-situation counts, the category split and an independent reconciliation
+(`bun test tests/association-scenarios.test.ts` locks those numbers). It reads no
+source data, uses no credentials and makes no network request. It is a regression
+harness, **not** an accuracy measurement: the corpus is adversarial and tiny.
+
+With the no-claim rule in place, the reasons the importer emits are
+`row_carries_employer_identity`, `email_domain_matches_assigned_company`,
+`email_domain_conflicts_with_row_identity`, `email_domain_outside_name_family`,
+`country_identifies_company`, `single_strong_candidate`,
+`several_candidates_remain` and `no_credible_candidate`. `unique_name`,
+`country_supports_assigned_company`, `country_points_to_other_company_of_same_name`
+and `email_domain_matches_other_company_of_same_name` remain in the schema and in
+the pure function for records written before this rule (and for callers that do
+supply an identified claim); an indexer run no longer produces them.
 
 `src/shared/association.ts` holds the single source of truth for labels and hints,
 so the Worker, the preview adapter and the React pages cannot disagree.

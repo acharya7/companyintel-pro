@@ -161,11 +161,13 @@ describe("two-stage association through the real indexer", () => {
     expect(counters.uniqueContacts).toBe(15);
     expect(counters.contactsHighConfidence! + counters.contactsPlausible! + counters.contactsConflicting! + counters.contactsUnresolved!).toBe(15);
     expect(counters.contactsHighConfidence).toBe(7);
-    expect(counters.contactsPlausible).toBe(4);
-    expect(counters.contactsConflicting).toBe(3);
+    expect(counters.contactsPlausible).toBe(6);
+    expect(counters.contactsConflicting).toBe(1);
     expect(counters.contactsUnresolved).toBe(1);
-    // One reassignment: Gina's address names the other Delta company.
-    expect(counters.contactsMoved).toBe(1);
+    // No reassignment is recorded: every contact that changed company did so from
+    // a row that only carried a NAME (no employer identity), so it was identified
+    // by its own evidence rather than moved away from a claimed employer.
+    expect(counters.contactsMoved ?? 0).toBe(0);
     expect(counters.unassignedObjects).toBe(1);
   }, 60_000);
 
@@ -190,16 +192,16 @@ describe("two-stage association through the real indexer", () => {
     }
 
     const alpha = byName.get("Delta Systems Limited")!;
-    expect(alpha.contactCount).toBe(6);
-    expect(alpha.associations).toEqual({ highConfidence: 2, plausible: 1, conflicting: 3, total: 6 });
+    expect(alpha.contactCount).toBe(5);
+    expect(alpha.associations).toEqual({ highConfidence: 2, plausible: 2, conflicting: 1, total: 5 });
     const beta = byName.get("Delta Systems Pvt Ltd")!;
-    expect(beta.contactCount).toBe(2);
-    expect(beta.associations).toEqual({ highConfidence: 2, plausible: 0, conflicting: 0, total: 2 });
+    expect(beta.contactCount).toBe(3);
+    expect(beta.associations).toEqual({ highConfidence: 2, plausible: 1, conflicting: 0, total: 3 });
     expect(byName.get("Umbrella Group")!.associations).toEqual({ highConfidence: 1, plausible: 1, conflicting: 0, total: 2 });
     expect(byName.get("Acme Corporation")!.associations).toEqual({ highConfidence: 2, plausible: 2, conflicting: 0, total: 4 });
   }, 60_000);
 
-  test("a contact whose email domain names another company is reassigned, with provenance", async () => {
+  test("a name-only row whose email domain names a company is attached there, with no invented employer", async () => {
     const fixture = await buildFixture();
     const bucket = bucketFor(fixture);
     const store = new R2Store(bucket as unknown as R2Bucket);
@@ -211,10 +213,12 @@ describe("two-stage association through the real indexer", () => {
     const gina = betaContacts.find((contact) => contact.fullName === "Gina Rossi")!;
     expect(gina).toBeDefined();
     expect(gina.association?.category).toBe("high_confidence");
-    expect(gina.association?.reason).toBe("email_domain_matches_other_company_of_same_name");
-    // Provenance: the move can be explained after the fact.
-    expect((gina.association as { movedFrom?: string } | undefined)?.movedFrom).toBe(alpha.id);
+    // Her row carried only "Delta Systems" (a name), so the domain identifies the
+    // employer; there is no claimed employer to have moved away from.
+    expect(gina.association?.reason).toBe("email_domain_matches_assigned_company");
+    expect((gina.association as { movedFrom?: string } | undefined)?.movedFrom).toBeUndefined();
     expect(gina.companyId).toBe(beta.id);
+    expect(fixture.result.counters.contactsMoved ?? 0).toBe(0);
   }, 60_000);
 
   test("conflicting evidence is attached but flagged, never silently confirmed", async () => {
@@ -225,18 +229,29 @@ describe("two-stage association through the real indexer", () => {
     const contacts = await contactsOf(store, alpha.id);
     const byName = new Map(contacts.map((contact) => [contact.fullName, contact]));
 
+    // The only genuine conflict: the row identifies Alpha, the address names Beta.
     expect(byName.get("Kyle Adams")!.association?.category).toBe("conflicting");
     expect(byName.get("Kyle Adams")!.association?.reason).toBe("email_domain_conflicts_with_row_identity");
-    expect(byName.get("Omar Haddad")!.association?.reason).toBe("email_domain_outside_name_family");
-    expect(byName.get("Priya Menon")!.association?.reason).toBe("country_points_to_other_company_of_same_name");
     // The row's own identity still wins the attachment; the conflict is a label.
     expect(byName.get("Kyle Adams")!.companyId).toBe(alpha.id);
+
+    // A name-only row is never called a conflict with a company it never claimed:
+    // the country identifies Alpha as a possible employer, which stays plausible.
+    expect(byName.get("Omar Haddad")!.association?.category).toBe("plausible");
+    expect(byName.get("Omar Haddad")!.association?.reason).toBe("country_identifies_company");
+    expect(byName.get("Omar Haddad")!.companyId).toBe(alpha.id);
 
     // Plausible and high-confidence contacts carry their own reasons.
     expect(byName.get("Ada Lovelace")!.association?.reason).toBe("row_carries_employer_identity");
     expect(byName.get("Sam Allen")!.association?.reason).toBe("email_domain_matches_assigned_company");
-    expect(byName.get("Nina Patel")!.association?.reason).toBe("country_supports_assigned_company");
+    expect(byName.get("Nina Patel")!.association?.reason).toBe("country_identifies_company");
     expect(byName.get("Nina Patel")!.association?.category).toBe("plausible");
+    // Priya's country names the other Delta company, so she is attached there as a
+    // possible match instead of being flagged at whichever record was read first.
+    const beta = (await allCompanies(store)).find((company) => company.name === "Delta Systems Pvt Ltd")!;
+    const priya = (await contactsOf(store, beta.id)).find((contact) => contact.fullName === "Priya Menon")!;
+    expect(priya.association?.category).toBe("plausible");
+    expect(priya.association?.reason).toBe("country_identifies_company");
     // A personal address is recorded as such, and does not weaken the record's identity.
     expect(byName.get("Ada Lovelace")!.email).toBe("ada.lovelace@deltasystems.example");
   }, 60_000);
@@ -333,6 +348,105 @@ describe("two-stage association through the real indexer", () => {
     // The reader's partition function must be the indexer's own.
     expect(spoolPartitionOfNormalizedName("delta systems", PARTITIONS)).toBe(partitionFor("n:delta systems", PARTITIONS));
     expect(fixture.result.manifest.indexFormatVersion).toBe(INDEX_FORMAT_VERSION);
+  }, 60_000);
+});
+
+/* -------------------------------------------------------------------------- */
+
+describe("a name-only contact is attached by evidence, not by input order", () => {
+  const COMPANY_ROWS = [
+    "Meridian Systems,https://meridian-us.example,,United States,Austin,,,",
+    "Meridian Systems,https://meridian-de.example,,Germany,Berlin,,,",
+  ];
+  const CONTACT_ROWS = [
+    "Meridian Systems,Dan Ito,Engineer,Senior,Engineering,,United States",
+    "Meridian Systems,Lena Fischer,Engineer,Senior,Engineering,,Germany",
+  ];
+  const CONTACT_NAMES = ["Dan Ito", "Lena Fischer"];
+
+  /** Build the same corpus in a given company-row order and read the verdicts. */
+  async function summary(order: number[]): Promise<{ us: string; de: string; rows: Record<string, unknown> }> {
+    const root = mkdtempSync(join(tmpdir(), "companyintel-assoc-order-"));
+    try {
+      const csv1 = join(root, "companies.csv");
+      const csv2 = join(root, "contacts.csv");
+      writeFileSync(csv1, `Company Name,Website,Company LinkedIn,Country,City,Contact Name,Job Title,Email\n${order.map((index) => COMPANY_ROWS[index]).join("\n")}\n`, "utf8");
+      writeFileSync(csv2, `organization,full_name,title,seniority,department,work_email,contact_country\n${CONTACT_ROWS.join("\n")}\n`, "utf8");
+      const outputDir = join(root, "out");
+      const result = await runIndex(
+        {
+          datasetVersion: "assoc-order-v1",
+          sources: [
+            { id: "csv1", path: csv1, encoding: "utf8", delimiter: "," },
+            { id: "csv2", path: csv2, encoding: "utf8", delimiter: "," },
+          ],
+          workDir: join(root, "work"),
+          outputDir,
+          partitions: 8,
+          shards: { exact: 4, prefix: 4, token: 4, trigram: 4, ids: 4 },
+        },
+        {},
+      );
+      const bucket = new FakeR2Bucket();
+      bucket.loadObjects(outputDir, result.objects.map((object) => object.key));
+      const store = new R2Store(bucket as unknown as R2Bucket);
+      // Read through the real directory + partitions, for the version this test built.
+      const directory = (await store.getDirectory("assoc-order-v1"))!;
+      const companies: Company[] = [];
+      for (let partition = 0; partition < directory.shards.companyPartitions; partition += 1) {
+        const payload = await store.getJson<CompanyPartitionPayload>(companyPartitionKey("assoc-order-v1", partition));
+        if (payload) companies.push(...(payload.companies as Company[]));
+      }
+      const source = new R2CandidateSource(store, directory);
+      const us = companies.find((company) => company.country === "United States")!;
+      const de = companies.find((company) => company.country === "Germany")!;
+      const countryById = new Map(companies.map((company) => [company.id, company.country]));
+      const rows: Record<string, unknown> = {};
+      for (const company of companies) {
+        const ref = await source.refForCompanyId(company.id);
+        const contacts = ref === null ? [] : await store.getContactsByCompanyRef("assoc-order-v1", ref);
+        for (const contact of contacts) {
+          rows[contact.fullName] = {
+            companyId: contact.companyId,
+            country: countryById.get(contact.companyId),
+            category: contact.association?.category,
+            reason: contact.association?.reason,
+          };
+        }
+      }
+      return { us: us.id, de: de.id, rows };
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  test("reversing the company rows changes neither the employer nor the verdict", async () => {
+    const forward = await summary([0, 1]);
+    const reversed = await summary([1, 0]);
+
+    // The record that owns the shared name key flips between the two runs; the
+    // contacts must not follow it.
+    expect(reversed.rows).toEqual(forward.rows);
+    expect(forward.rows["Dan Ito"]).toEqual({
+      companyId: forward.us,
+      country: "United States",
+      category: "plausible",
+      reason: "country_identifies_company",
+    });
+    expect(forward.rows["Lena Fischer"]).toEqual({
+      companyId: forward.de,
+      country: "Germany",
+      category: "plausible",
+      reason: "country_identifies_company",
+    });
+    // Under the old resolution these two flipped between "plausible" and
+    // "conflicting" with the row order. Neither is ever disputed now.
+    for (const name of CONTACT_NAMES) {
+      expect((forward.rows[name] as { category: string }).category).toBe("plausible");
+      expect((reversed.rows[name] as { category: string }).category).toBe("plausible");
+    }
+    // Both contacts are attached (nothing is preserved) in either order.
+    expect(Object.keys(forward.rows).sort()).toEqual([...CONTACT_NAMES].sort());
   }, 60_000);
 });
 
@@ -514,7 +628,7 @@ describe("the Worker serves the preserved contacts without pretending they are e
     expect(body.contacts[0].fullName).toBe("Leo Frank");
     expect(body.contacts[0].association.category).toBe("unresolved");
     expect(body.totals.unresolved).toBe(1);
-    expect(body.totals.conflicting).toBe(3);
+    expect(body.totals.conflicting).toBe(1);
 
     // The other categories are attached contacts, not preserved ones.
     const conflictingUnassigned = await api(`/api/companies/${alpha.id}/unassigned?category=conflicting`);
@@ -526,11 +640,11 @@ describe("the Worker serves the preserved contacts without pretending they are e
 
     const disputed = await api(`/api/companies/${alpha.id}/contacts?association=conflicting`);
     const disputedContacts = (disputed.body as unknown as { contacts: Contact[] }).contacts;
-    expect(disputedContacts.map((contact) => contact.fullName).sort()).toEqual(["Kyle Adams", "Omar Haddad", "Priya Menon"]);
+    expect(disputedContacts.map((contact) => contact.fullName).sort()).toEqual(["Kyle Adams"]);
 
     const profile = await api(`/api/companies/${alpha.id}`);
     const company = (profile.body as unknown as { company: Company }).company;
-    expect(company.associations).toEqual({ highConfidence: 2, plausible: 1, conflicting: 3, total: 6 });
+    expect(company.associations).toEqual({ highConfidence: 2, plausible: 2, conflicting: 1, total: 5 });
   }, 60_000);
 });
 

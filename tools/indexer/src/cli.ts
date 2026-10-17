@@ -527,6 +527,18 @@ async function cmdPass2FromSpool(config: IndexerConfig, flags: Record<string, st
     process.exitCode = 1;
     return;
   }
+  if (flags["no-resume"]) {
+    // `--no-resume` means "clear the spool and rebuild from the sources" to the
+    // ordinary command. Here it could only mean that, and this command must never
+    // touch the source spool — refusing it prevents the one flag that reads like a
+    // harmless retry from being copied over from the old procedure.
+    console.error(
+      "Refusing --no-resume: pass2-from-spool never rebuilds Pass 1 and never clears a spool.\n" +
+        "  To restart an interrupted experimental merge, re-run the same command without --no-resume: it replays safely.",
+    );
+    process.exitCode = 1;
+    return;
+  }
   // A flag that was typed without its value becomes `true`; that would silently
   // fall back to a default (or assert sample 1), so it is refused explicitly.
   const textFlag = (name: string): string | undefined | null => {

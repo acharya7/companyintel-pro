@@ -291,6 +291,39 @@ function assertIdentityShape(identity: unknown, where: string): asserts identity
   }
 }
 
+/**
+ * The checkpoint's Pass 1 counters must be usable before the merge starts.
+ *
+ * A resumed/imported run restores `rowsRead`, `rowsRejected` and every source's
+ * `rowsRead` from the checkpoint, and the final validation fails with
+ * `source_missing_rows` if a source has none. Discovering that AFTER hours of
+ * merging would waste the run, so the same fact is checked up front. Nothing is
+ * written before this point.
+ */
+function assertPassOneCounters(counters: unknown, identity: CheckpointIdentity): void {
+  const candidate = counters as { rowsRead?: unknown; perSource?: Record<string, { rowsRead?: unknown } | undefined> } | null | undefined;
+  const problems: string[] = [];
+  if (!candidate || typeof candidate !== "object") {
+    problems.push("it records no counters at all");
+  } else if (typeof candidate.rowsRead !== "number" || !Number.isFinite(candidate.rowsRead) || candidate.rowsRead <= 0) {
+    problems.push("rowsRead is not a positive number");
+  } else {
+    for (const source of identity.sources) {
+      const entry = candidate.perSource?.[source.id];
+      if (!entry || typeof entry.rowsRead !== "number" || !Number.isFinite(entry.rowsRead) || entry.rowsRead <= 0) {
+        problems.push(`source ${source.id} has no positive rowsRead`);
+      }
+    }
+  }
+  if (problems.length) {
+    throw new Error(
+      `Refusing the experimental import: the source checkpoint's Pass 1 counters are not usable (${problems.join("; ")}).\n` +
+        "  The imported run restores them so its validation can prove every source contributed; without them the merge would\n" +
+        "  only fail at the very end. Nothing was written. Re-run the source Pass 1 if its checkpoint is damaged.",
+    );
+  }
+}
+
 async function readCheckpointSource(sourceWorkDir: string, outputVersion: string) {
   const path = checkpointPathFor(sourceWorkDir);
   if (!existsSync(path)) {
@@ -542,6 +575,7 @@ async function prepareWorkspace(planBase: SpoolImportBase, counters: Record<stri
   }
 
   const record = (await readJsonFile(recordPath, "the experimental import record")) as ImportRecord;
+  assertIdentityShape(record?.sourceIdentity, recordPath);
   const problems: string[] = [];
   if (record?.format !== 1) problems.push("its format is not 1");
   if (record?.sourceWorkDir !== sourceWorkDir) problems.push(`it imports from ${record?.sourceWorkDir ?? "unknown"}`);
@@ -551,7 +585,7 @@ async function prepareWorkspace(planBase: SpoolImportBase, counters: Record<stri
   if (record?.outputDir !== outputDir) problems.push(`it wrote to ${record?.outputDir ?? "unknown"}`);
   if (record?.sourceCheckpointSha256 !== sourceCheckpointSha256) problems.push("the source checkpoint has changed since this experiment started");
   if (record?.sourceManifestSha256 !== sourceManifestSha256) problems.push("the source spool manifest has changed since this experiment started");
-  if (!record?.sourceIdentity || identityDiff(record.sourceIdentity, sourceIdentity).length) {
+  if (identityDiff(record.sourceIdentity, sourceIdentity).length) {
     problems.push("the source run identity it recorded is different");
   }
   if (problems.length) {
@@ -597,6 +631,7 @@ export async function prepareSpoolImport(request: SpoolImportRequest): Promise<S
   /* 1. Source checkpoint: exists, finished Pass 1, has provenance, different version. */
   const source = await readCheckpointSource(sourceWorkDir, outputVersion);
   const sourceIdentity = source.identity;
+  assertPassOneCounters(source.counters, sourceIdentity);
   checks.push(`source checkpoint: stage pass2-merge, version ${sourceIdentity.version}, sha256 ${source.sha256.slice(0, 12)}…`);
 
   /* 2. Manifest: complete, same run as the checkpoint, self-consistent. */

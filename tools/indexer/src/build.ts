@@ -29,7 +29,7 @@ import { dirname, join, resolve, sep } from "node:path";
 import { gzipSync } from "node:zlib";
 
 import type { AssociationCounts, Company, Contact, DatasetStats, DatasetVersionSummary, FacetBucket, IndexingCounters, SourceRef, UnassignedContact } from "../../../src/shared/models";
-import { associateContact, type AssociationCandidate, type AssociationRecord } from "../../../src/shared/association";
+import { NO_CLAIM_REF, associateContact, type AssociationCandidate, type AssociationRecord } from "../../../src/shared/association";
 import { NORMALIZER_VERSION, normalizeAttribute, normalizeDomain } from "../../../src/shared/normalize";
 import {
   INDEX_FORMAT_VERSION,
@@ -1763,13 +1763,28 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
        * better, so the placeholders are used (and the verdict stays `plausible`).
        */
       const credible = family.filter((candidate) => candidate.hasStrongIdentity);
+      /*
+       * A row whose only company field was a NAME has no employer claim.
+       *
+       * The resolver maps such a row to whichever record owns the shared `n:` key —
+       * the first company of that name read from the sources. Passing that ref as a
+       * claim attaches the contact to an arbitrary member and makes the verdict
+       * depend on input order (country evidence that names the second member became
+       * a "conflict" on the first). The row's name identifies a family, not an
+       * employer, so Stage B gets the explicit no-claim sentinel and decides from
+       * the contact's own evidence. `claimedIdentity` is exactly the fact that
+       * distinguishes that case: the row carried a strong identifier it owns.
+       */
+      const claimedRef = pending.identityClaimed ? pending.claimedRef : NO_CLAIM_REF;
       const decision = associateContact({
         candidates: credible.length ? credible : family,
         contact: pending.input,
-        claimedRef: pending.claimedRef,
+        claimedRef,
         claimedIdentity: pending.identityClaimed,
       });
-      const claimedCompanyId = candidates.get(pending.claimedRef)?.id ?? "";
+      // Only an identity-bearing claim can be "moved from": a no-claim row has no
+      // employer to record as the previous one.
+      const claimedCompanyId = pending.identityClaimed ? (candidates.get(pending.claimedRef)?.id ?? "") : "";
 
       if (decision.assignedRef === null) {
         const contact = contactFromRow(pending, "", decision.record);

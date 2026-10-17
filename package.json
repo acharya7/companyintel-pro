@@ -17,6 +17,7 @@
     "bench:hydration": "bun scripts/benchmark-hydration.mjs",
     "search:explain": "bun scripts/explain-query.mjs",
     "index:audit": "bun scripts/association-audit.mjs",
+    "index:assoc-scenarios": "bun scripts/association-scenarios.mjs",
     "r2:doctor": "bun scripts/r2-doctor.mjs",
     "r2:schema": "bun scripts/r2-schema.mjs",
     "verify:r2": "bun scripts/verify-raw.mjs",

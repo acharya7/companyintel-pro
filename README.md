@@ -26,12 +26,12 @@ No Convex, no SQL database, no KV/D1/Durable Objects, no Redis, no search server
   contact is attached to a company only on evidence (row identity, email domain, country), never
   on a name match alone; ambiguous contacts are preserved under the name they claimed instead of
   being shown as employees (`docs/association.md`)
-- Tests: `bun test` (479 tests, 0 fail) — normalization, relevance, prototype-chain safety,
+- Tests: `bun test` (491 tests, 0 fail) — normalization, relevance, prototype-chain safety,
   CSV/indexer, R2 store, end-to-end index + Worker API over a generated index, the bounded
-  hydration funnel, two-stage association (identity ownership, reassignment, preservation,
-  dedupe, reconciliation), the association audit, the isolated Pass 2 rebuild from an existing
-  spool, lead recovery, security, the R2 probe and its runner, and the S3 verification scripts
-  over a stub transport
+  hydration funnel, two-stage association (identity ownership, no-claim rows, preservation,
+  dedupe, order-independence, reconciliation), the association scenario corpus, the association
+  audit, the isolated Pass 2 rebuild from an existing spool, lead recovery, security, the R2
+  probe and its runner, and the S3 verification scripts over a stub transport
 
 ## Documentation
 
@@ -87,6 +87,9 @@ bun run index:spool-doctor
 # Association audit of an existing index: stored categories vs. the audit's own classification,
 # preserved contacts, moved contacts, count/facet reconciliation (read-only, no credentials)
 bun run index:audit -- --version v1-bench-1m
+# Synthetic scenario corpus: the 11 association situations, indexed and checked end to end
+# (counts, categories, duplicates, reconciliation; no source data, no credentials, no network)
+bun run index:assoc-scenarios
 # Pass-2 (merge) timing and file-handle load, on this machine, without the real corpus
 bun run index:bench-pass2 --fs-count
 # Full run + upload, then activate (each step is documented in docs/indexing.md)
@@ -144,13 +147,13 @@ The equivalent S3-key path remains available: `bun scripts/verify-raw.mjs[--json
 | Area | Status |
 | --- | --- |
 | Frontend, Worker, indexer, probe typechecks | **IMPLEMENTED AND TESTED** — `bun run check` → 5/5 PASS |
-| Test suite (479 tests, 0 fail) | **IMPLEMENTED AND TESTED** — normalization, prototype-chain safety, relevance, CSV parsing, indexer pipeline + R2 streaming sources, R2 store, Access security, end-to-end index build + Worker route handlers, the bounded hydration funnel (including checkpoint provenance), the read-only probe, the newline-safe JSONL codec (U+2028/U+2029, truncation, chunk boundaries, CRLF), spool-manifest integrity, the read-only spool doctor, and the isolated Pass 2 rebuild from an existing spool (identity separation, isolation, corruption, byte-identical originals, mid-merge restart) |
+| Test suite (491 tests, 0 fail) | **IMPLEMENTED AND TESTED** — normalization, prototype-chain safety, relevance, CSV parsing, indexer pipeline + R2 streaming sources, R2 store, Access security, end-to-end index build + Worker route handlers, the bounded hydration funnel (including checkpoint provenance), the read-only probe, the newline-safe JSONL codec (U+2028/U+2029, truncation, chunk boundaries, CRLF), spool-manifest integrity, the read-only spool doctor, the isolated Pass 2 rebuild from an existing spool (identity separation, isolation, corruption, byte-identical originals, mid-merge restart), the two-stage association rules (order-independence, no-claim rows, preservation, dedupe, reconciliation) and the synthetic scenario corpus |
 | Build and bundles | **IMPLEMENTED AND TESTED** — `bun run build` exits 0 and the `dist/` scan finds no server identifier; `wrangler deploy --dry-run` bundles the Worker (737 KiB) and the probe (39 KiB) with the expected bindings and `workers_dev = false` |
 | Worker → R2 access path | **IMPLEMENTED AND TESTED** — `tests/worker-r2-binding.test.ts` proves the Worker reaches R2 only through the `COMPANY_DATA` binding, never with S3 secrets, and that the bucket is not published |
 | Read-only R2 probe (native binding, no keys) | **IMPLEMENTED AND TESTED locally** — `tests/r2-probe.test.ts`, `tests/r2-probe-schema.test.ts`, `tests/verify-r2-remote-script.test.ts` cover routing, bound clamping, the production refusal, 405 on writes, no write/delete call existing anywhere in the probe, 1 KB/6 MB read budgets, missing-object handling, the schema report and the runner's 0/1/2 exit codes. **Not run against your account** |
 | Read-only R2 verification scripts (S3 keys) | **VERIFIED ON THE REAL BUCKET** (`r2:doctor`, `r2:schema`, `verify:r2`, `index:profile`) — plus the stub-transport tests: bounded 25-object `raw/` listing, size/ETag + 1 KB ranged body read, missing-object and denied-credential exit codes, `--json` reports with no cell values |
 | Indexer Mode B (read the CSVs straight from R2) | **VERIFIED ON THE REAL OBJECTS, BOUNDED** — a 20,000-records-per-source dry run (39,505 rows, 1,826 objects, validation passed, nothing uploaded or published); full 64.26 GB run not started (needs your approval) |
-| Company ↔ contact association | **IMPLEMENTED AND TESTED on synthetic fixtures with the real code paths** — identifier ownership is first-owner-wins (a later row can never take a domain from the record that carried it first), resolution and association are separate stages, and every contact is either attached with a stored category or preserved in `unassigned/` under the name it claimed. **Not yet measured on the real benchmark** — this environment has no access to the Windows spool; the PowerShell verification is in `docs/association.md` §7 |
+| Company ↔ contact association | **IMPLEMENTED AND TESTED on synthetic fixtures with the real code paths** — identifier ownership is first-owner-wins (a later row can never take a domain from the record that carried it first), resolution and association are separate stages, a row that carried only a company name has no employer claim and can never be attached to an arbitrary namesake, and every contact is either attached with a stored category or preserved in `unassigned/` under the name it claimed (`bun run index:assoc-scenarios` reports the full situation matrix). **Not yet measured on the real benchmark** — this environment has no access to the Windows spool; the PowerShell verification is in `docs/association.md` §7 |
 | Search engine + ranking | **IMPLEMENTED AND TESTED** — recall@1 0.939 / recall@5 0.97 on the labelled fixture set |
 | R2 object layout, manifests, rollback | **IMPLEMENTED, PARTIALLY TESTED** — layout and pointer logic tested; the real R2 path needs a deployed bucket |
 | Worker API + R2 reads | **IMPLEMENTED, PARTIALLY TESTED** — routing, validation and Access verified by tests; end-to-end reads require a published dataset |

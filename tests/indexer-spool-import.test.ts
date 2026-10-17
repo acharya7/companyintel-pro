@@ -52,7 +52,7 @@ const CSV2_HEADERS = ["organization", "domain", "employee_range", "full_name", "
  *
  *   - Priya's row carries A's domain  → high confidence, A;
  *   - Erin's row carries B's domain   → high confidence, B;
- *   - Omar claims the name-only record but his email names B → reassigned, B;
+ *   - Omar's row carries only a name but his email names B → identified at B;
  *   - Nina claims the name-only record with a personal address and no country
  *     evidence → several credible candidates → preserved, never attached.
  */
@@ -696,10 +696,12 @@ describe("association on the imported spool", () => {
     expect(contacts.length).toBeGreaterThan(0);
     const byName = new Map(contacts.map((contact) => [contact.fullName, contact]));
     expect(byName.get("Priya Menon")?.association?.category).toBe("high_confidence");
-    // Reassignment: claimed the name-only record, but the email names company B.
+    // Identification, not a reassignment: the row carried only a name, so the email
+    // domain names the employer directly and no previous employer is invented.
     const omar = byName.get("Omar Farouk");
     expect(omar?.association?.category).toBe("high_confidence");
-    expect(omar?.association?.movedFrom).toBeTruthy();
+    expect(omar?.association?.reason).toBe("email_domain_matches_assigned_company");
+    expect(omar?.association?.movedFrom).toBeUndefined();
 
     const preserved = readPreserved(outputDir, OUTPUT_VERSION);
     const nina = preserved.find((contact) => contact.fullName === "Nina Park");
@@ -708,7 +710,8 @@ describe("association on the imported spool", () => {
     expect(nina?.companyId).toBe("");
     expect(nina?.claimedCompanyName).toBe("Vertex Analytics");
 
-    expect(result.counters.contactsMoved).toBe(fixtures.sourceResult.counters.contactsMoved);
+    expect(result.counters.contactsMoved ?? 0).toBe(fixtures.sourceResult.counters.contactsMoved ?? 0);
+    expect(result.counters.contactsMoved ?? 0).toBe(0);
     expect(result.counters.contactsUnresolved).toBe(fixtures.sourceResult.counters.contactsUnresolved);
     expect(result.counters.unassignedObjects).toBe(fixtures.sourceResult.counters.unassignedObjects);
 

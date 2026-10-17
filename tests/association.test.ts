@@ -17,11 +17,13 @@ import {
   ASSOCIATION_CATEGORIES,
   ASSOCIATION_CATEGORY_HINTS,
   MAX_CANDIDATE_IDS,
+  NO_CLAIM_REF,
   ASSOCIATION_CATEGORY_LABELS,
   associateContact,
   associationMatchesFilter,
   auditClassForCategory,
   emailDomainOf,
+  isBranchOf,
   isPublicEmailDomain,
   isTrustedAssociation,
   sameDomain,
@@ -163,6 +165,30 @@ describe("subsidiaries, aliases and shared group domains", () => {
     expect(decision.record.evidence.domain).toBe("sibling");
   });
 
+  test("a parent-domain address is not a branch of a subsidiary's own domain", () => {
+    // `isBranchOf` is directional: only a host UNDER the company's domain is a
+    // branch of it. A person at the group domain is not thereby a verified
+    // employee of the subsidiary, so this must never be high confidence.
+    expect(isBranchOf("mail.acme.example", "acme.example")).toBe(true);
+    expect(isBranchOf("acme.example", "mail.acme.example")).toBe(false);
+    expect(isBranchOf("acme.example", "acme.example")).toBe(true);
+
+    const subsidiary = candidate({ ref: 0, id: "c_sub", name: "Northwind Logistics", domain: "logistics.northwind.example", country: "United Kingdom" });
+    const decision = decide({
+      // A name-only claim: `claimedRef` is the placeholder record, not a candidate.
+      candidates: [subsidiary],
+      claimedRef: 99,
+      contact: { email: "frank@northwind.example" },
+    });
+    expect(decision.category).toBe("plausible");
+    expect(decision.reason).toBe("single_strong_candidate");
+    expect(decision.assignedRef).toBe(subsidiary.ref);
+    expect(decision.record.evidence.domain).toBe("outside_family");
+    // The branch direction still matches.
+    const branch = decide({ candidates: [subsidiary], claimedRef: subsidiary.ref, contact: { email: "ops@mail.logistics.northwind.example" } });
+    expect(branch.category).toBe("high_confidence");
+  });
+
   test("a corporate alias domain that matches nobody is a contradiction, not a guess", () => {
     const company = candidate({ ref: 0, id: "c_acme", name: "Acme Corporation", domain: "acme.example" });
     const decision = decide({
@@ -287,6 +313,44 @@ describe("contacts with no reliable employer evidence", () => {
     const placeholder = candidate({ ref: 0, id: "c_placeholder", hasStrongIdentity: false });
     const other = candidate({ ref: 1, id: "c_other", hasStrongIdentity: false });
     const decision = decide({ candidates: [placeholder, other], claimedRef: placeholder.ref });
+    expect(decision.category).toBe("plausible");
+    expect(decision.reason).toBe("no_credible_candidate");
+    expect(decision.assignedRef).toBe(placeholder.ref);
+  });
+});
+
+describe("a contact row that carried no employer identity has no employer claim", () => {
+  test("the no-claim sentinel is never one of the candidates", () => {
+    const { a, b } = twoCompanies();
+    // A row that names only "Delta Systems" must not be attached to whichever
+    // record happened to own the shared name key. Its own domain names the employer.
+    const decision = decide({ candidates: [a, b], claimedRef: NO_CLAIM_REF, contact: { email: "x@deltasystems.in" } });
+    expect(decision.category).toBe("high_confidence");
+    expect(decision.assignedRef).toBe(b.ref);
+    expect(decision.reason).toBe("email_domain_matches_assigned_company");
+    // Nothing was claimed, so nothing was "moved away from".
+    expect(decision.moved).toBe(false);
+  });
+
+  test("country evidence identifies the matching member instead of accusing the first", () => {
+    const { a, b } = twoCompanies();
+    const decision = decide({ candidates: [a, b], claimedRef: NO_CLAIM_REF, contact: { country: "India" } });
+    expect(decision.category).toBe("plausible");
+    expect(decision.reason).toBe("country_identifies_company");
+    expect(decision.assignedRef).toBe(b.ref);
+  });
+
+  test("a corporate domain outside the family never turns into a conflict with an arbitrary member", () => {
+    const { a, b } = twoCompanies();
+    const decision = decide({ candidates: [a, b], claimedRef: NO_CLAIM_REF, contact: { email: "someone@contractor.example" } });
+    expect(decision.category).toBe("unresolved");
+    expect(decision.assignedRef).toBeNull();
+    expect(decision.candidateCompanyIds?.sort()).toEqual([a.id, b.id].sort());
+  });
+
+  test("a family of name-only records still answers with a real member, never the sentinel", () => {
+    const placeholder = candidate({ ref: 0, id: "c_placeholder", hasStrongIdentity: false });
+    const decision = decide({ candidates: [placeholder], claimedRef: NO_CLAIM_REF });
     expect(decision.category).toBe("plausible");
     expect(decision.reason).toBe("no_credible_candidate");
     expect(decision.assignedRef).toBe(placeholder.ref);
