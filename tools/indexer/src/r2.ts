@@ -140,7 +140,13 @@ export class R2Client {
 
     return fetch(`${this.endpoint}${canonicalUri}${queryString}`, {
       method,
-      headers: { ...headers, authorization },
+      // `identity` keeps the transport honest: Node's fetch transparently gunzips a
+      // response that carries `content-encoding: gzip`, yet leaves the header in
+      // place. A reader that trusts that header (the Worker decides whether to
+      // gunzip an index shard from it) would then try to inflate plain JSON and
+      // treat every shard as empty. Asking for the stored bytes means the header
+      // and the body always agree.
+      headers: { ...headers, authorization, "accept-encoding": "identity" },
       body: body ? new Uint8Array(body) : undefined,
     });
   }
@@ -152,23 +158,41 @@ export class R2Client {
    * Worker never lists the bucket except for the bounded `raw/` page listing.
    */
   async list(prefix: string, maxKeys = 50): Promise<{ key: string; size: number; lastModified: string | null }[]> {
-    const response = await this.sign("GET", "", undefined, undefined, {
-      bucketRoot: true,
-      query: { "list-type": "2", prefix, "max-keys": String(maxKeys) },
-    });
+    return (await this.listPage(prefix, maxKeys)).objects;
+  }
+
+  /**
+   * One page of ListObjectsV2, including the continuation token.
+   *
+   * `list()` above returns the first page only, which is all the verification
+   * scripts ever needed. A reader that must enumerate a whole prefix (the local
+   * development API stands in for a Worker binding, whose `list()` paginates)
+   * needs the cursor, so it is returned here rather than parsed again.
+   */
+  async listPage(
+    prefix: string,
+    maxKeys = 1000,
+    cursor?: string,
+  ): Promise<{ objects: { key: string; size: number; lastModified: string | null; etag: string | null }[]; truncated: boolean; cursor: string | undefined }> {
+    const query: Record<string, string> = { "list-type": "2", prefix, "max-keys": String(maxKeys) };
+    if (cursor) query["continuation-token"] = cursor;
+    const response = await this.sign("GET", "", undefined, undefined, { bucketRoot: true, query });
     if (!response.ok) {
       throw new Error(`ListObjectsV2 failed: HTTP ${response.status} ${(await response.text().catch(() => "")).slice(0, 300)}`);
     }
     const xml = await response.text();
-    const objects: { key: string; size: number; lastModified: string | null }[] = [];
+    const objects: { key: string; size: number; lastModified: string | null; etag: string | null }[] = [];
     for (const match of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) {
       const block = match[1];
       const key = /<Key>([\s\S]*?)<\/Key>/.exec(block)?.[1] ?? "";
       const size = Number(/<Size>(\d+)<\/Size>/.exec(block)?.[1] ?? "0");
       const lastModified = /<LastModified>([\s\S]*?)<\/LastModified>/.exec(block)?.[1] ?? null;
-      if (key) objects.push({ key: decodeXml(key), size, lastModified });
+      const etag = /<ETag>([\s\S]*?)<\/ETag>/.exec(block)?.[1]?.replace(/"/g, "") ?? null;
+      if (key) objects.push({ key: decodeXml(key), size, lastModified, etag });
     }
-    return objects;
+    const truncated = /<IsTruncated>true<\/IsTruncated>/.test(xml);
+    const next = /<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/.exec(xml)?.[1];
+    return { objects, truncated, cursor: next ? decodeXml(next) : undefined };
   }
 
   /** Read a byte range of one object (used to sample a 10/50 GB CSV cheaply). */
@@ -220,9 +244,25 @@ export class R2Client {
     return this.put(key, body, contentType, 4, gzip ? { contentEncoding: "gzip" } : undefined);
   }
 
-  /** GET one object (used by the verification script; never writes). */
+  /**
+   * GET one object (used by the verification script; never writes).
+   *
+   * The response body is returned as stored, and the reported encoding always
+   * matches it. Node's fetch decodes a `content-encoding: gzip` body itself while
+   * leaving the header in place, so a reader that trusts the header alone — the
+   * Worker treats a gzip flag as "inflate this shard" — would try to inflate plain
+   * JSON and see an empty shard. The 1f 8b check is the only reliable answer, and
+   * stripping the header when it lies keeps every caller (dev API, verify scripts)
+   * honest about what it is holding.
+   */
   async get(key: string): Promise<Response> {
-    return this.sign("GET", key);
+    const response = await this.sign("GET", key);
+    const encoding = response.headers.get("content-encoding");
+    if (!encoding || !response.ok || response.status === 206) return response;
+    const bytes = Buffer.from(await response.arrayBuffer());
+    const headers = new Headers(response.headers);
+    if (!(bytes[0] === 0x1f && bytes[1] === 0x8b)) headers.delete("content-encoding");
+    return new Response(new Uint8Array(bytes), { status: response.status, statusText: response.statusText, headers });
   }
 
   async head(key: string): Promise<{ exists: boolean; size: number | null; etag: string | null }> {

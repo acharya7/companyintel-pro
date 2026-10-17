@@ -1,0 +1,73 @@
+{
+  "$comment": [
+    "CompanyIntel — DEVELOPMENT sample config (private preview only).",
+    "",
+    "Same REAL R2 sources and the same mapping overrides as indexer.config.json, but:",
+    "  - its own work/output directories, so the verified v1 / v1-bench-1m artifacts are never touched;",
+    "  - `rawCacheDir: null` (stream straight from R2 — this sandbox has <1 GB free);",
+    "  - fewer partitions/shards (a sample is small; file count costs disk and inode time);",
+    "  - uploads enabled, so the version can be activated for the development Worker/preview.",
+    "",
+    "It is driven by scripts/dev-index-r2.mjs, which samples a bounded number of rows per source,",
+    "validates the version, uploads it under its OWN version prefix and never writes",
+    "manifests/active.json.",
+    ""
+  ],
+  "datasetVersion": "dev",
+  "sources": [
+    {
+      "id": "csv1",
+      "path": "r2://company-intel-data/raw/file1.csv",
+      "encoding": "utf-8",
+      "delimiter": "\t",
+      "columns": {
+        "companyid": "organization_id",
+        "companyname": "organization_name",
+        "companydomain": "organization_domain",
+        "companywebsite": "organization_website_url",
+        "industry": "organization_industries",
+        "companysize": "organization_num_current_employees",
+        "companyrevenue": "organization_revenue_in_thousands_int",
+        "companycity": "organization_hq_location_city",
+        "companystate": "organization_hq_location_state",
+        "companycountry": "organization_hq_location_country"
+      }
+    },
+    {
+      "id": "csv2",
+      "path": "r2://company-intel-data/raw/file2.csv",
+      "encoding": "utf-8",
+      "delimiter": "\t",
+      "columns": {
+        "contactname": "person_name",
+        "firstname": "person_first_name_unanalyzed",
+        "lastname": "person_last_name_unanalyzed",
+        "jobtitle": "person_title",
+        "seniority": "person_seniority",
+        "department": "person_functions",
+        "email": "person_email",
+        "phone": "person_phone",
+        "linkedin": "person_linkedin_url",
+        "contactcity": "person_location_city",
+        "contactstate": "person_location_state",
+        "contactcountry": "person_location_country",
+        "companyname": "sanitized_organization_name_unanalyzed"
+      }
+    }
+  ],
+  "workDir": ".indexer-dev-work",
+  "outputDir": ".indexer-dev-output",
+  "rawCacheDir": null,
+  "partitions": 64,
+  "shards": {
+    "exact": 64,
+    "prefix": 32,
+    "token": 32,
+    "trigram": 64,
+    "ids": 32
+  },
+  "upload": {
+    "enabled": true,
+    "bucket": "company-intel-data"
+  }
+}

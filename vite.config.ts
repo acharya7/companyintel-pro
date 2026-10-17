@@ -3,10 +3,22 @@ import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import path from "path";
 import { defineConfig } from "vite";
+// Dev-only: mounts the real Worker API at /api/* inside the dev server, backed by
+// the private R2 bucket. See tools/dev-api/vite-plugin.mjs. Never part of a build.
+import { companyIntelDevApi } from "./tools/dev-api/vite-plugin.mjs";
 
 // https://vite.dev/config/
-export default defineConfig({
-  plugins: [react(), vlyPlugin(), tailwindcss()],
+//
+// In `serve` the preview talks to the private development API (worker/src/app.ts
+// over R2) instead of the bundled synthetic dataset: `VITE_API_MODE=worker` with
+// no base URL means same-origin /api/*, which the plugin below answers. Set
+// COMPANYINTEL_DEV_API=off to fall back to the bundled sample dataset.
+export default defineConfig(({ command }) => {
+  const devApi = command === "serve" && process.env.COMPANYINTEL_DEV_API !== "off";
+  if (devApi && !process.env.VITE_API_MODE) process.env.VITE_API_MODE = "worker";
+
+  return {
+  plugins: [react(), vlyPlugin(), tailwindcss(), ...(devApi ? [companyIntelDevApi({ root: __dirname })] : [])],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
@@ -101,4 +113,5 @@ export default defineConfig({
       overlay: false,
     },
   },
+  };
 });
