@@ -339,10 +339,11 @@ describe("two-stage association through the real indexer", () => {
     rmSync(root, { recursive: true, force: true });
   }, 120_000);
 
-  test("the directory declares format v3 and where preserved contacts live", async () => {
+  test("the directory declares the current format and where preserved contacts live", async () => {
     const fixture = await buildFixture();
     expect(fixture.result.directory.formatVersion).toBe(INDEX_FORMAT_VERSION);
-    expect(INDEX_FORMAT_VERSION).toBe(3);
+    // Association categories arrived in v3; the projection/detail split is v4.
+    expect(INDEX_FORMAT_VERSION).toBeGreaterThanOrEqual(3);
     expect(fixture.result.directory.shards.spoolPartitions).toBe(PARTITIONS);
     expect(fixture.result.directory.unassigned).toEqual({ objects: 1, contacts: 1 });
     // The reader's partition function must be the indexer's own.
@@ -671,7 +672,7 @@ describe("the association audit, on a real generated index", () => {
     const report = JSON.parse(run.stdout);
 
     expect(report.version).toBe(VERSION);
-    expect(report.indexFormatVersion).toBe(3);
+    expect(report.indexFormatVersion).toBe(INDEX_FORMAT_VERSION);
     // A contact is either attached or preserved; nothing is outside the two sums.
     expect(report.reconciliation.contactCount.mismatched).toBe(0);
     expect(report.reconciliation.associations.mismatched).toBe(0);

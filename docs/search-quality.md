@@ -125,17 +125,23 @@ until the domain is indexed — a v3 candidate, listed in §9.
 
 `ADAPTIVE_HYDRATE_MAX_STEPS = 2` doubles the partition budget while (a) the requested page is
 still short, (b) the previous sweep was cut short by the partition cap
-(`hydrationBudgetHit()`), and (c) there are candidates left to hydrate. It stops when the
-page fills, when the cap stops it, when the source says more reads could not have found
-anything, **when a rung hydrated more records and ranked none of them**, or at
-`SEARCH_LIMITS.maxHydrate` (64 partitions). Partitions already read are memoised, so a rung
-is spent only on partitions the previous rung could not reach.
+(`hydrationBudgetHit()`), and (c) there are candidates left to hydrate. It stops on evidence
+about the **whole candidate set**, and on nothing weaker:
 
-The yield rule is what keeps "bounded hydration" true of the whole search rather than of its
-first pass. Doubling the budget is a bet that the deeper candidates can fill the page; when a
-rung qualifies nothing, a third rung re-reads more partitions for the same answer. The engine
-records the stop as `retrieval.ladderStopped = "no_new_hits"` (and `bun run search:explain`
-prints it).
+| stop | what proves it is safe |
+| --- | --- |
+| `stoppedEarly` | the page is full of hits scoring above `WEAK_CEILING`, the best a token/trigram-only candidate can reach, so nothing left can reorder or extend it |
+| `candidates_exhausted` (`retrieval.ladderStopped`) | every candidate retrieval produced has been hydrated, so no larger budget could add a row |
+| source says the last sweep dropped nothing | `hydrationBudgetHit() === false`: the cap did not cut the sweep, so more budget reads nothing new |
+| `SEARCH_LIMITS.maxHydrate` (64 partitions) | the configured ceiling, reported as a floor (`totalIsLowerBound`) |
+
+An earlier version also stopped at the first rung that ranked nothing new. That is **not** a
+safe criterion: hydration spends its budget in candidate order, and an unproductive rung says
+nothing about the partitions it did not reach — a query whose only matches sit deeper lost
+them. The rule was removed; `tests/search-funnel.test.ts` pins the shape (a match reachable
+only in a later partition is still found after an unproductive rung) and compares a later
+page against an exhaustive reference. Bounded mode still sacrifices recall at the ceiling,
+and that is reported as a lower-bound total rather than presented as complete.
 
 Measured on the real-data sample (`bun scripts/benchmark-hydration.mjs --version v1-dry5-250
 --repeat 2`), 8 query classes, 82 company partitions:
@@ -166,27 +172,28 @@ Read this table honestly:
 - The unbounded "reference" is a *reference for what this index can return*, not proof of
   complete coverage of the source data.
 
-### What the yield rule costs and saves
+### What makes the ladder affordable: format v4 search projections
 
-Same index and same engine, two strategies per query — the ladder as it runs, and `fixed 64`,
-which is where the ladder used to end (the rungs it could take, with nothing to stop it).
-`company-intel-data` @ `dev-r2-20k-fields-20261017`: 20,259 companies, 82 partitions,
-~1.2 MB per partition, measured through `R2Store` + `R2CandidateSource`:
+Walking to the ceiling is only expensive when a partition is expensive. Format v4 (see
+`docs/architecture.md`) keeps every source column in `details/` and out of the search
+projection, so a company partition is **21 KB** instead of **1.2 MB** on the same records
+(`dev-r2-20k-proj-20261017`, 20,259 companies, 82 partitions). 64 partitions ≈ 1.35 MB, not
+78 MB — which is why the safe ladder can now be the only ladder.
 
-| query | strategy | rungs | partitions | objects / bytes | rows | ms |
-| --- | --- | --- | --- | --- | --- | --- |
-| `qualtrics` | ladder | 2 | 32 | 43 / **39.7 MB** | 1 | 2,933 |
-| `qualtrics` | fixed 64 | 1 | 64 | 75 / **78.6 MB** | 1 | 3,972 |
-| `global technology` | ladder | 3 | 64 | 81 / 79.0 MB | 2 | 4,730 |
-| `global technology` | fixed 64 | 1 | 64 | 81 / 79.0 MB | 2 | 4,368 |
+Measured through the running preview (`bun scripts/benchmark-preview.mjs before|after`), identical queries, same
+records, only the index layout changed:
 
-- Where the rule fires it halves the bytes and saves a second of CPU for **the same row set**
-  (`lost 0` against the unbounded reference on both queries). `qualtrics` has one genuine match
-  and 1,600 trigram candidates; the second rung read 16 more partitions, ranked nothing, and
-  ended the ladder at 32 instead of walking to 64.
-- Where every rung ranks new rows (`global technology`) it does not fire, and the ladder costs
-  what the fixed budget costs — which is the point: the rule cannot cut a page that could
-  still fill.
+| query | v3 (inline fields) | v4 (projections) | R2 reduction |
+| --- | --- | --- | --- |
+| `Microsoft` (exact) | 78.5 MB · 6,188 ms · 4 rows | **8.0 MB · 5,083 ms** · 4 rows | 10× |
+| `microsft` (fuzzy) | 78.4 MB · 5,859 ms · 5 rows | **1.24 MB · 1,946 ms** · 5 rows | 63× |
+| `qualtrics` (sparse) | 74.9 MB · 7,746 ms · 1 row | **1.51 MB · 2,301 ms** · 1 row | 50× |
+| `global technology` (broad) | 79.0 MB · 6,209 ms · 2 rows | **1.33 MB · 1,978 ms** · 2 rows | 60× |
+
+A repeat of the same query on a warm isolate now costs **~100 ms and 156 bytes** (the whole
+working set fits the isolate cache, which it never did at 1.2 MB per partition). The exact
+query's remaining cold cost is not bytes: it reads 64 *small* partitions plus ~13 shards,
+so round-trip latency and gzip decode dominate on this 1-vCPU sandbox.
 
 The numbers scale with partition size, not with the corpus: a full index has the same 250
 companies per partition, so the per-search cost above is the per-search cost of the real
@@ -337,11 +344,13 @@ Two rules keep it honest:
    the partition cap can both leave a better-ranked candidate unread; `totalIsLowerBound` and
    the short-page notice say so. Removing this entirely needs per-partition max-score metadata
    (v3) or the compaction side index.
-3. **Sparse queries pay for one unproductive rung.** A query whose true match count is below
-   the page size (an exact name with four matches) still takes the second rung, because the
-   engine cannot know the rung will rank nothing until it has read it. The yield rule makes
-   that the *last* rung — measured above at 39.7 MB instead of 78.6 MB — but it cannot make it
-   free; only pre-computed counts avoid it.
+3. **Sparse queries walk to the partition ceiling.** A query whose true match count is below
+   the page size (an exact name with four matches) cannot fill its page, so the ladder keeps
+   climbing while the source says the cap is what stopped it. That is deliberate — stopping
+   earlier is what lost reachable matches — and it is affordable only because a format-v4
+   partition is 21 KB: 64 partitions ≈ 1.35 MB, measured at 1.5–8 MB per search including
+   shards. A v3 index paid 75–79 MB for the same behaviour. Only pre-computed per-partition
+   score bounds would end the climb sooner without risking recall.
 4. **The 1 M index was not measured here.** Everything in §5–§7 is the 20 K real-data sample.
    The commands below produce the 1 M numbers.
 5. **The association audit cannot see source provenance** and does not attempt to. A future

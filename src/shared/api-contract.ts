@@ -456,8 +456,11 @@ export const companySearchResponseSchema = z.object({
     budgetLimited: z.boolean(),
     fuzzyDeferred: z.boolean(),
     fuzzyRecovered: z.boolean(),
-    /** Set when the adaptive ladder stopped because a rung ranked nothing new. */
-    ladderStopped: z.literal("no_new_hits").optional(),
+    /**
+     * Set when the adaptive ladder stopped climbing because every candidate had
+     * been hydrated (so a larger partition budget could not add a row).
+     */
+    ladderStopped: z.literal("candidates_exhausted").optional(),
     r2: z
       .object({
         objectsRead: z.number().int(),

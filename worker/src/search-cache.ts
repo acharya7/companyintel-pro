@@ -34,8 +34,14 @@
  *                        side (`objectsRead === cacheMisses` by construction).
  */
 
-/** Object key prefixes whose contents are immutable once published. */
-const CACHEABLE_PREFIXES = ["indexes/", "companies/", "contacts/"] as const;
+/**
+ * Object key prefixes whose contents are immutable once published.
+ *
+ * `details/` is included for format v4: a record view reads one detail object, and
+ * a page that opens several records (or the same record twice) should pay for it
+ * once per isolate, exactly like a shard.
+ */
+const CACHEABLE_PREFIXES = ["indexes/", "companies/", "contacts/", "details/"] as const;
 
 /**
  * True when an object may be cached.

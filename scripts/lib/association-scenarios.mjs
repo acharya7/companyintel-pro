@@ -743,7 +743,10 @@ export async function runAssociationScenarios(options = {}) {
       },
       {
         id: "format-v3",
-        ok: directory.formatVersion === 3 && manifest.indexFormatVersion === 3,
+        // v3 introduced association categories; every later format is a superset,
+        // so the invariant is "this index understands categories", not a pin to
+        // the one version that happened to ship them.
+        ok: directory.formatVersion >= 3 && manifest.indexFormatVersion >= 3,
         detail: `directory format ${directory.formatVersion}, manifest format ${manifest.indexFormatVersion}`,
       },
       {

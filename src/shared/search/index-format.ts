@@ -7,9 +7,17 @@
  *   raw/                  original CSV files, never modified by the app
  *   staging/<version>/    output that is not published yet
  *   indexes/<version>/…   exact / prefix / token / trigram shards + directory
- *   companies/<version>/… canonical company metadata partitions
- *   contacts/<version>/…  contact partitions, one per company range
+ *   companies/<version>/… SEARCH PROJECTIONS: the fields a search matches, ranks,
+ *                         filters and summarises on (no `attributes`, no facets)
+ *   contacts/<version>/…  contact projections, one object per company range
+ *   details/<version>/…   FULL records: every source column and detail-only
+ *                         fields, aligned to the projections by ref (format v4)
  *   unassigned/<version>/…contacts preserved WITHOUT an employer (format v3)
+ *
+ * Format v4 splits search from detail. A search reads only projections, so its
+ * bytes no longer scale with how many columns a record has; opening a record
+ * reads one detail object (never the whole index). Both layouts share the same
+ * refs, partition boundaries and object keys, so the two halves can never drift.
  *   manifests/<version>/  manifest + validation report
  *   manifests/active.json pointer to the published version (single small object)
  *   app-data/             saved leads, saved searches, settings, exports
@@ -26,7 +34,7 @@
 
 import { shardOf } from "../hash";
 
-export const INDEX_FORMAT_VERSION = 3;
+export const INDEX_FORMAT_VERSION = 4;
 
 /**
  * Formats this reader/writer still understands.
@@ -38,8 +46,19 @@ export const INDEX_FORMAT_VERSION = 3;
  * 3 — v2 plus: `association` on each contact, `associations` counts on each
  *     company, `unassigned/<version>/####.json.gz` objects, and
  *     `shards.spoolPartitions` so the reader can locate them.
+ * 4 — v3 plus the projection/detail split: company and contact partitions carry
+ *     no `attributes` (and companies no `facets`), and every partition has a
+ *     matching `details/<version>/{companies,contacts}/####.json.gz` object that
+ *     holds exactly those fields, aligned by ref. A v3 index stays readable: the
+ *     reader uses the inline fields when `formatVersion < 4`. Nothing is written
+ *     in place, so a v3 version remains a valid rollback target.
  */
-export const SUPPORTED_INDEX_FORMAT_VERSIONS: readonly number[] = [2, 3];
+export const SUPPORTED_INDEX_FORMAT_VERSIONS: readonly number[] = [2, 3, 4];
+
+/** True when a version stores full records in `details/` instead of inline. */
+export function isDetailSplitFormat(formatVersion: number | undefined): boolean {
+  return typeof formatVersion === "number" && formatVersion >= 4;
+}
 
 /** True when a directory can be read by this build. */
 export function isSupportedFormatVersion(value: unknown): boolean {
@@ -52,6 +71,7 @@ export const R2_PREFIX = {
   indexes: "indexes/",
   companies: "companies/",
   contacts: "contacts/",
+  details: "details/",
   unassigned: "unassigned/",
   manifests: "manifests/",
   appData: "app-data/",
@@ -191,6 +211,23 @@ export function contactPartitionKey(version: string, partition: number): string 
 }
 
 /**
+ * Full company records for one projection partition (format v4).
+ *
+ * One object per company partition, not per record: the partition boundaries are
+ * already sized so a single search reads a bounded number of them, and keeping the
+ * detail objects on the same boundaries means opening a record costs exactly one
+ * object — the same read a v3 index needed, while a search no longer pays for the
+ * columns it never looks at.
+ */
+export function companyDetailKey(version: string, partition: number): string {
+  return `${R2_PREFIX.details}${version}/companies/${String(partition).padStart(5, "0")}.json.gz`;
+}
+
+export function contactDetailKey(version: string, partition: number): string {
+  return `${R2_PREFIX.details}${version}/contacts/${String(partition).padStart(5, "0")}.json.gz`;
+}
+
+/**
  * Object holding the contacts of one spool partition that could not be
  * associated with any company (format v3).
  *
@@ -321,8 +358,20 @@ export interface IndexDirectory {
     companies: number;
     contacts: number;
     total: number;
+    /** Bytes of `details/` objects (format v4; omitted on an inline index). */
+    details?: number;
     /** Bytes of `unassigned/` objects (format v3; omitted when there are none). */
     unassigned?: number;
+  };
+  /**
+   * Object counts per kind, so the dataset page can show that the projection and
+   * detail halves line up one-to-one (format v4).
+   */
+  objects?: {
+    companyProjections: number;
+    companyDetails: number;
+    contactProjections: number;
+    contactDetails: number;
   };
   /**
    * Contacts preserved without an employer (format v3). Absent on a v2 index, or
@@ -408,11 +457,64 @@ export function postingsFor(payload: ShardPayload | null | undefined, term: stri
   return terms[term];
 }
 
-/** Company profile partition (also used to hydrate search candidates). */
+/**
+ * Company SEARCH PROJECTION partition.
+ *
+ * Holds only what retrieval, ranking, filtering and a result row need. A format
+ * v4 object has no `attributes` and no `facets`; the complete record is in the
+ * matching `companyDetailKey` object.
+ */
 export interface CompanyPartitionPayload {
   /** Global ref of the first record in this object. */
   firstRef: number;
   companies: unknown[];
+}
+
+/**
+ * Fields that exist only for the record view, kept out of the search projection.
+ *
+ * `null` marks a record that has neither, so the arrays stay aligned with the
+ * projection by ref offset without paying for empty objects.
+ */
+export interface CompanyDetailRecord {
+  attributes?: Record<string, string>;
+  facets?: unknown;
+}
+
+export interface CompanyDetailPayload {
+  firstRef: number;
+  records: (CompanyDetailRecord | null)[];
+}
+
+/**
+ * Full contact records for one contact projection object (format v4), grouped by
+ * company ref exactly like the projection, with each company's array aligned to
+ * that company's contact order.
+ */
+export interface ContactDetailPayload {
+  firstRef: number;
+  byCompany: Record<string, (Record<string, string> | null)[]>;
+}
+
+/**
+ * Detail record of one company/contact, or `null` when the payload has no entry
+ * for it. Own-property lookup for the same reason as `contactsFor`: the payload
+ * is parsed JSON, and its keys are numeric strings.
+ */
+export function detailForCompany(payload: CompanyDetailPayload | null | undefined, ref: number): CompanyDetailRecord | null {
+  if (!payload) return null;
+  const record = payload.records[ref - payload.firstRef];
+  return record && typeof record === "object" ? record : null;
+}
+
+export function detailForContacts(
+  payload: ContactDetailPayload | null | undefined,
+  ref: number,
+): (Record<string, string> | null)[] | undefined {
+  const byCompany = payload?.byCompany;
+  const key = String(ref);
+  if (!byCompany || !Object.prototype.hasOwnProperty.call(byCompany, key)) return undefined;
+  return byCompany[key];
 }
 
 /** Contact partition: contacts grouped by company ref. */
@@ -451,9 +553,15 @@ export function contactsFor(payload: ContactPartitionPayload | null | undefined,
  * uploads each file to the identical key in R2 — so a local validation run and
  * the uploaded layout can never drift apart.
  */
-export function folderFor(kind: "companies" | "contacts" | "indexes", version: string, suffix: string | number): string {
+export function folderFor(
+  kind: "companies" | "contacts" | "companyDetails" | "contactDetails" | "indexes",
+  version: string,
+  suffix: string | number,
+): string {
   if (kind === "companies") return companyPartitionKey(version, Number(suffix));
   if (kind === "contacts") return contactPartitionKey(version, Number(suffix));
+  if (kind === "companyDetails") return companyDetailKey(version, Number(suffix));
+  if (kind === "contactDetails") return contactDetailKey(version, Number(suffix));
   const value = String(suffix);
   return `${R2_PREFIX.indexes}${version}/${value.endsWith(".json") ? `${value}.gz` : value}`;
 }

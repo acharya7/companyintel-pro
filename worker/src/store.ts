@@ -13,7 +13,7 @@
  */
 
 import type { Company, Contact, DatasetStats, DatasetVersionSummary, SavedLead, SavedSearch, UnassignedContact, UserSettings, ActivityEntry } from "../../src/shared/models";
-import { R2_PREFIX, leadShardKey, statsKey, activeManifestKey, companyPartitionKey, contactPartitionKey, exportMetaKey, exportObjectKey, indexDirectoryKey, indexShardKey, manifestKey, partitionOfRef, contactPartitionOfRef, savedSearchesKey, settingsKey, activityKey, unassignedPartitionKey, validationKey, progressKey, type IndexDirectory, type ShardPayload, type IndexKind, type CompanyPartitionPayload, type ContactPartitionPayload, type ContactShardKind, type ContactShardPayload, type UnassignedPartitionPayload } from "../../src/shared/search/index-format";
+import { R2_PREFIX, leadShardKey, statsKey, activeManifestKey, companyPartitionKey, contactPartitionKey, companyDetailKey, contactDetailKey, exportMetaKey, exportObjectKey, indexDirectoryKey, indexShardKey, manifestKey, partitionOfRef, contactPartitionOfRef, savedSearchesKey, settingsKey, activityKey, unassignedPartitionKey, validationKey, progressKey, detailForCompany, detailForContacts, isDetailSplitFormat, type IndexDirectory, type ShardPayload, type IndexKind, type CompanyPartitionPayload, type ContactPartitionPayload, type CompanyDetailPayload, type ContactDetailPayload, type ContactShardKind, type ContactShardPayload, type UnassignedPartitionPayload } from "../../src/shared/search/index-format";
 import { SHARDING, contactsFor, postingsFor, snapshotKey } from "../../src/shared/search/index-format";
 import { shardOf } from "../../src/shared/hash";
 import { isCacheableKey, type ObjectCache, type ReadMetrics } from "./search-cache";
@@ -55,10 +55,34 @@ export interface R2StoreOptions {
 }
 
 export class R2Store {
+  /**
+   * Format version per dataset version, so "does this index store details inline?"
+   * is answered once per request instead of once per record. The directory object
+   * it comes from is itself an immutable, cacheable index object — this memo just
+   * avoids re-decoding it on every record of an export loop.
+   */
+  private readonly formatVersions = new Map<string, number>();
+
   constructor(
     private readonly bucket: R2Bucket,
     private readonly options: R2StoreOptions = {},
   ) {}
+
+  /**
+   * True when this version keeps full records in `details/` (format v4+).
+   *
+   * A v2/v3 index carries `attributes` inline in its partitions; those versions
+   * stay fully readable, which is what makes a rollback to the previous version a
+   * pointer change rather than a rebuild.
+   */
+  private async hasSplitDetails(version: string): Promise<boolean> {
+    const memo = this.formatVersions.get(version);
+    if (memo !== undefined) return isDetailSplitFormat(memo);
+    const directory = await this.getDirectory(version);
+    const formatVersion = directory?.formatVersion ?? 0;
+    this.formatVersions.set(version, formatVersion);
+    return isDetailSplitFormat(formatVersion);
+  }
 
   /* ------------------------------ primitives ----------------------------- */
 
@@ -326,20 +350,52 @@ export class R2Store {
     return out;
   }
 
+  /**
+   * The complete company record: search projection + its detail object.
+   *
+   * This is the record view (company page, exports, leads), so it pays one extra
+   * read on a format-v4 index to get every source column. Search never calls it —
+   * `getCompaniesByRefs` returns the projections, which is what keeps search bytes
+   * independent of how many columns a record has.
+   */
   async getCompanyByRef(version: string, ref: number): Promise<Company | null> {
     const partition = partitionOfRef(ref);
     const payload = await this.getJson<CompanyPartitionPayload>(companyPartitionKey(version, partition));
     if (!payload) return null;
-    return (payload.companies[ref - payload.firstRef] as Company | undefined) ?? null;
+    const company = (payload.companies[ref - payload.firstRef] as Company | undefined) ?? null;
+    if (!company || !(await this.hasSplitDetails(version))) return company;
+
+    const detail = detailForCompany(await this.getJson<CompanyDetailPayload>(companyDetailKey(version, partition)), ref);
+    if (!detail) return company;
+    return {
+      ...company,
+      ...(detail.attributes ? { attributes: detail.attributes } : {}),
+      ...(detail.facets ? { facets: detail.facets as Company["facets"] } : {}),
+    };
   }
 
+  /**
+   * A company's contacts WITH their full source columns.
+   *
+   * Same split as the company record: the projection is enough for lists, filters
+   * and exports of canonical fields, and the detail object is read only when the
+   * caller needs `attributes` (contact page, export, reassignment).
+   */
   async getContactsByCompanyRef(version: string, ref: number): Promise<Contact[]> {
     const partition = contactPartitionOfRef(ref);
     const payload = await this.getJson<ContactPartitionPayload>(contactPartitionKey(version, partition));
     if (!payload) return [];
     // `contactsFor` does the own-property lookup: a parsed payload must never
     // answer from `Object.prototype`.
-    return (contactsFor(payload, ref) as Contact[] | undefined) ?? [];
+    const contacts = (contactsFor(payload, ref) as Contact[] | undefined) ?? [];
+    if (!contacts.length || !(await this.hasSplitDetails(version))) return contacts;
+
+    const attributes = detailForContacts(await this.getJson<ContactDetailPayload>(contactDetailKey(version, partition)), ref);
+    if (!attributes) return contacts;
+    return contacts.map((contact, position) => {
+      const full = attributes[position];
+      return full ? { ...contact, attributes: full } : contact;
+    });
   }
 
   /**

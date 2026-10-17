@@ -123,8 +123,11 @@ verbatim as `attributes` (visible in the company and person detail screens). The
 cap and no column cap — the corpus' longest values (a 3,539-character
 `organization_all_possible_domains`, a 3,011-character `organization_short_description`) arrive
 whole, and long text is collapsed in the UI with a “Show all N characters” control rather than
-shortened in storage. Search results stay lightweight: the full row is returned only by the
-detail endpoints — see `docs/indexing.md`
+shortened in storage. Search results stay lightweight, and since index format v4 the **storage**
+is split too: search reads only a projection of each record (identity, matching, ranking,
+filters, result-row fields — 21 KB per 250 companies), while every source column lives in a
+versioned `details/` object that only a record view reads. Opening a company or person still
+returns every column in full — see `docs/architecture.md` ("Format v4") and `docs/indexing.md`
 ("What a record carries: every source column").
 
 Search covers **companies and people** from one box (`/companies`, source selector
@@ -193,14 +196,15 @@ The equivalent S3-key path remains available: `bun scripts/verify-raw.mjs[--json
 | Indexer Mode B (read the CSVs straight from R2) | **VERIFIED ON THE REAL OBJECTS, BOUNDED** — a 20,000-records-per-source dry run (39,505 rows, 1,826 objects, validation passed, nothing uploaded or published); full 64.26 GB run not started (needs your approval) |
 | Company ↔ contact association | **IMPLEMENTED AND TESTED on synthetic fixtures with the real code paths** — identifier ownership is first-owner-wins (a later row can never take a domain from the record that carried it first), resolution and association are separate stages, a row that carried only a company name has no employer claim and can never be attached to an arbitrary namesake, and every contact is either attached with a stored category or preserved in `unassigned/` under the name it claimed (`bun run index:assoc-scenarios` reports the full situation matrix). **Not yet measured on the real benchmark** — this environment has no access to the Windows spool; the PowerShell verification is in `docs/association.md` §7 |
 | Search engine + ranking | **IMPLEMENTED AND TESTED** — recall@1 0.939 / recall@5 0.97 on the labelled fixture set |
-| R2 object layout, manifests, rollback | **IMPLEMENTED, PARTIALLY TESTED** — layout and pointer logic tested; the real R2 path needs a deployed bucket |
+| R2 object layout, manifests, rollback | **IMPLEMENTED AND VERIFIED ON THE REAL BUCKET** — format v4 index built, uploaded (594 objects), verified byte-for-byte from R2, activated in the preview, rolled back to the v3 version and re-activated. The published pointer itself was never written by the preview |
 | Worker API + R2 reads | **IMPLEMENTED, PARTIALLY TESTED** — routing, validation and Access verified by tests; end-to-end reads require a published dataset |
 | Streaming indexer | **IMPLEMENTED, TESTED on synthetic CSVs and RUN against real data** — both schemas, multiline records, cross-file association, shard bounds, checkpoint + spool manifest, restart-safe pass 2, upload retries, checksums, atomic publish/rollback. Two defects were found by real runs: `JSON Parse error: Unterminated string` (U+2028/U+2029 were line terminators to the old reader) and an unsafe/slow interrupted pass 2 (postings appended on replay; one async stream per posting over 1,792 shard files — measured 550,958 stream lifecycles for ≈1.15 M postings, now 5,376 appends). Both are fixed and regression-tested; the 1 M re-run plus the real 64.26 GB run are pending your approval gate |
 | Real data in R2 (`raw/`) | **VERIFIED** — `raw/file1.csv` 10,223,471,749 B and `raw/file2.csv` 54,038,527,871 B listed, HEADed and read with signed ranged GETs; schemas profiled per file; no published dataset. Results: `docs/verification.md` → Phase A |
 | Browser-rendered UI | **BLOCKED here** — no browser in this sandbox; manual checklist in `docs/verification.md` → Phase C |
 | Cloudflare deployment + Access policy | **NOT STARTED** — manual steps are in `docs/deployment.md`, awaiting your go-ahead. `workers_dev = false` is already set in `wrangler.toml`, so add your custom-domain route before deploying |
 | Full 64.26 GB indexing | **READY, NOT RUN HERE** — the one command (`index-full.cmd`, or `bun run index:full -- --version v1-full-<date> --yes`) is implemented and tested end to end: resumable stages, coverage gate, bounded remote verification, activation that R2 must confirm. This environment has ~0.4 GB free against a ~182 GB requirement (132 GB with `rawCacheDir: null`), so the run belongs on the machine that holds the corpus |
-| Cost/performance figures | **MEASURED against the real-data sample index** on a 1-vCPU sandbox: 0.02–0.24 s and ≤ 2.07 MB per query locally, which is above a Workers Free CPU budget — see `docs/verification.md` → Phase E and `docs/cost.md` |
+| Search-time cost, format v4 | **MEASURED on the live preview** (real bucket, 20,259 companies, 82 partitions): company search reads **1.24–8.0 MB and 1.95–5.08 s cold**, **~0.1 s and 156 bytes warm**, versus **74.9–79.0 MB and 5.86–7.75 s** on the previous v3 index — same queries, same records, same hit counts. Contact search 1.51–2.55 s cold, 0.11 s warm. See `docs/verification.md` → Phase L |
+| Cost/performance figures | **MEASURED against the real-data sample index** on a 1-vCPU sandbox — see `docs/verification.md` → Phase E/L and `docs/cost.md` |
 
 ## Manual actions required from you
 

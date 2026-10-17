@@ -32,7 +32,7 @@ import { checkpointPathFor, spoolDirFor, spoolManifestPathFor } from "../tools/i
 import { prepareSpoolImport, runExperimentalPass2, type SpoolImportRequest } from "../tools/indexer/src/spool-import";
 import type { Contact, UnassignedContact } from "../src/shared/models";
 import type { CompanyPartitionPayload, ContactPartitionPayload, IndexDirectory, UnassignedPartitionPayload } from "../src/shared/search/index-format";
-import { indexDirectoryKey } from "../src/shared/search/index-format";
+import { INDEX_FORMAT_VERSION, indexDirectoryKey } from "../src/shared/search/index-format";
 
 const projectRoot = join(import.meta.dir, "..");
 const VERSION = "src-v1";
@@ -483,7 +483,7 @@ describe("the experimental index is its own artifact", () => {
 
     const directory = readDirectory(outputDir, OUTPUT_VERSION);
     expect(directory.version).toBe(OUTPUT_VERSION);
-    expect(directory.formatVersion).toBe(3);
+    expect(directory.formatVersion).toBe(INDEX_FORMAT_VERSION);
     expect(directory.shards.spoolPartitions).toBe(PARTITIONS);
 
     expect(existsSync(join(outputDir, "manifests", OUTPUT_VERSION, "manifest.json"))).toBe(true);

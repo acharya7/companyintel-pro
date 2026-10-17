@@ -226,9 +226,14 @@ responses are parsed with Zod and an undeclared field would be silently dropped.
 
 Search stays cheap because a search result is a **summary**, not a record: `CompanySearchHit` and
 `ContactSearchHit` carry the fields a result row shows, and the full attribute map is only returned by
-`GET /api/companies/:id` and `GET /api/contacts/:id`. Partition objects are the unit of read (250
-companies or 1,000 companies' contacts), so the long values cost bytes only on the detail page that
-actually shows them.
+`GET /api/companies/:id` and `GET /api/contacts/:id`. Since index format v4 the **stored** layout
+follows the same rule: `companies/` and `contacts/` are search projections that omit `attributes`
+(and company `facets`), and the builder writes those fields into
+`details/<version>/{companies,contacts}/#####.json.gz` on the same partition boundaries and refs.
+The reader merges the two only for a record view, so long values cost bytes only on the page that
+shows them — a company partition is 21 KB instead of 1.2 MB on the 20 K real-data sample. The
+builder fails validation (`missing_detail_objects`) if a populated index has no detail objects,
+because such an index would search correctly and open records with their columns missing.
 
 
 `--sample <n>` applies per source, so both schemas are always represented in a sample run — and in

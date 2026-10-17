@@ -125,15 +125,16 @@ the budget is spent across the engine's hydration batches — so a search reads 
    spending, so the engine re-walks the same candidate order with a doubled partition budget —
    but only when the previous sweep was cut short *by that budget*. The source reports
    `hydrationBudgetHit()`, which is the difference between "more budget would find more
-   companies" and "there are no more companies to find"; without it, a sparse query (an exact
-   name with four matches) would pay for a round of reads that cannot find anything. It also
-   stops at the first rung that hydrates more records and ranks none of them
-   (`retrieval.ladderStopped = "no_new_hits"`) — without that rule the ladder always ended at
-   the ceiling, which is where the unbounded cost came back. It stops when the page fills,
-   when the cap stops it, when the source says more reads cannot help, at a rung that ranks
-   nothing new, or at `SEARCH_LIMITS.maxHydrate` (64). A search therefore reads at most 64
-   profile partitions — ~1.2 MB each on the 20 K index with captured attributes, measured at
-   39.7 MB for a sparse query that stops after 32.
+   companies" and "there are no more companies to find". It stops only on evidence about the
+   whole candidate set: the page is full of hits above `WEAK_CEILING`, every candidate has
+   been hydrated (`retrieval.ladderStopped = "candidates_exhausted"`), the source says the
+   last sweep dropped nothing for budget, or `SEARCH_LIMITS.maxHydrate` (64) is reached. A
+   rung that ranks nothing is NOT a stop — it says nothing about the partitions it did not
+   reach, and an earlier rule that used it lost valid results.
+
+   The ladder is affordable because a format-v4 partition is a **search projection**: 21 KB
+   on the 20 K index instead of 1.2 MB with the source columns, so 64 partitions ≈ 1.35 MB.
+   See “Format v4” below.
 5. **Whole-name gating** (`retrieval.fuzzyDeferred` / `fuzzyRecovered`). When the exact and
    prefix stages already produced at least a page of candidates, the token and trigram
    *retrieval* stages are skipped — up to 24 shard reads saved for the most common query
@@ -226,8 +227,11 @@ raw/                 original CSVs (app never writes here)
 staging/<version>/   unpublished intermediate output
 indexes/<version>/   exact|prefix|token|trigram|ids shards + contactToken|contactPrefix|contactTrigram
                      (the person-name index) + directory.json
-companies/<version>/ canonical company partitions (gzip JSON)
-contacts/<version>/  contact partitions grouped by company (gzip JSON)
+companies/<version>/ company SEARCH PROJECTIONS — what a query matches, ranks, filters
+                     and shows (gzip JSON; no source columns, no facets)
+contacts/<version>/  contact projections grouped by company (gzip JSON)
+details/<version>/   FULL records: companies/ and contacts/ objects on the same partition
+                     boundaries, aligned by ref (format v4)
 unassigned/<version>/ contacts preserved WITHOUT an employer (format v3)
 manifests/<version>/ manifest.json, validation.json, progress.json, stats.json
 manifests/active.json  the ONE mutable pointer object
@@ -242,6 +246,37 @@ listing and no scan. Format v2 indexes have no such prefix and stay readable; se
 
 Every search object is immutable and version-addressed, so browser and edge caches can treat
 it as immutable for a year. Rollback = re-point `manifests/active.json`.
+
+### Format v4 — search projections + detail objects
+
+A source record here has 70–106 columns. Baking them into the objects a search hydrates made
+every query pay for fields it never reads: a 20 K-row development index had **1.2 MB
+partitions** and one exact query read **78.5 MB**. Format v4 splits the two uses:
+
+| object | holds | read by |
+| --- | --- | --- |
+| `companies/<v>/#####.json.gz` | identity, canonical fields, aliases, counts, sources, **21 KB** per 250 companies | every search (sorted hydration) |
+| `details/<v>/companies/#####.json.gz` | `attributes` (every source column, verbatim) and `facets` | a company record view — exactly one object |
+| `contacts/<v>/#####.json.gz` | canonical contact fields, association record, source ref | contact lists, filters, search |
+| `details/<v>/contacts/#####.json.gz` | contact `attributes` | a contact record view |
+
+Design choices that matter:
+
+- **Same partitions, same refs.** The detail object shares `firstRef` and record order with its
+  projection, so the two halves cannot drift and the reader indexes the detail array by
+  `ref - firstRef` — no mapping table, no second key space.
+- **One detail object per partition, not per record.** At 250 companies per object the object
+  count stays what it already was (~19 K for the full corpus), rather than the ~1.2 M tiny
+  objects a per-record layout would need. Opening a record is one read of similar size to the
+  v3 partition it replaces; a search no longer reads that object at all.
+- **`details/` is cacheable.** It is immutable and version-addressed, so the same isolate cache
+  that serves shards serves record views.
+- **An index is still validated as a whole.** The builder fails validation if a populated
+  index has no detail objects (`missing_detail_objects`), because that index would search fine
+  and open every record without its columns — silent data loss a checksum cannot catch.
+- **v3 stays readable.** The reader checks the directory's `formatVersion`; below 4 the
+  partitions carry `attributes` inline and no detail object is read. The previously published
+  `dev-r2-20k-fields-20261017` remains a valid rollback target without a rebuild.
 
 Shard counts (512 exact / 256 prefix / 256 token / 512 trigram / 256 ids) are recorded in
 `directory.json`, so the reader never guesses and no query ever lists the bucket.

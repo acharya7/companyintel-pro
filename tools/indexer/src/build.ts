@@ -39,6 +39,9 @@ import {
   unassignedPartitionKey,
   type CompanyPartitionPayload,
   type ContactPartitionPayload,
+  type CompanyDetailPayload,
+  type CompanyDetailRecord,
+  type ContactDetailPayload,
   type IndexDirectory,
   type ContactPostings,
   type ContactShardPayload,
@@ -1596,19 +1599,62 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   let contactBufferBucket = 0;
   let companyPartitionIndex = 0;
   let contactPartitionIndex = 0;
+  let companyDetailPartitions = 0;
+  let contactDetailPartitions = 0;
 
+  /**
+   * Write one company partition as a SEARCH PROJECTION plus its detail object.
+   *
+   * The two halves are written together so they cannot drift: same `firstRef`, same
+   * record order, same object index. Everything a search matches, ranks, filters or
+   * displays stays in the projection; `attributes` (every source column) and
+   * `facets` go to `details/`, which only a record view reads. This is what makes
+   * search bytes independent of the corpus's column count.
+   */
   const flushCompanies = async () => {
     if (!companyBuffer.length) return;
-    const payload: CompanyPartitionPayload = { firstRef: companyBufferStart, companies: companyBuffer };
+    const records: (CompanyDetailRecord | null)[] = companyBuffer.map((company) => {
+      const detail: CompanyDetailRecord = {};
+      if (company.attributes) detail.attributes = company.attributes;
+      if (company.facets) detail.facets = company.facets;
+      return detail.attributes || detail.facets ? detail : null;
+    });
+    const projection = companyBuffer.map((company) => {
+      const copy = { ...company };
+      delete copy.attributes;
+      delete copy.facets;
+      return copy;
+    });
+    const payload: CompanyPartitionPayload = { firstRef: companyBufferStart, companies: projection };
     await writer.writeJson(folderFor("companies", config.datasetVersion, companyPartitionIndex), payload);
+    if (records.some(Boolean)) {
+      const detail: CompanyDetailPayload = { firstRef: companyBufferStart, records };
+      await writer.writeJson(folderFor("companyDetails", config.datasetVersion, companyPartitionIndex), detail);
+      companyDetailPartitions += 1;
+    }
     companyPartitionIndex += 1;
     companyBuffer = [];
   };
 
+  /**
+   * Write one contact partition as a projection plus its detail object.
+   *
+   * Contacts lose only `attributes`; every canonical field, the association record
+   * and the source ref stay in the projection, because lists, filters, ranking and
+   * the result rows all use them.
+   */
   const flushContacts = async () => {
     if (!contactBuffer.size) return;
     const byCompany: Record<string, Contact[]> = {};
-    for (const [ref, contacts] of contactBuffer) byCompany[String(ref)] = contacts;
+    const detailsByCompany: Record<string, (Record<string, string> | null)[]> = {};
+    for (const [ref, contacts] of contactBuffer) {
+      detailsByCompany[String(ref)] = contacts.map((contact) => contact.attributes ?? null);
+      byCompany[String(ref)] = contacts.map((contact) => {
+        const copy = { ...contact };
+        delete copy.attributes;
+        return copy;
+      });
+    }
     // `firstRef` must be the first ref in this object, and the object index must
     // be derivable from it: the reader locates a company's contacts with
     // `contactPartitionOfRef(ref) = floor(ref / companiesPerContactPartition)`.
@@ -1617,6 +1663,11 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       byCompany,
     };
     await writer.writeJson(folderFor("contacts", config.datasetVersion, contactPartitionIndex), payload);
+    if (Object.values(detailsByCompany).some((list) => list.some(Boolean))) {
+      const detail: ContactDetailPayload = { firstRef: payload.firstRef, byCompany: detailsByCompany };
+      await writer.writeJson(folderFor("contactDetails", config.datasetVersion, contactPartitionIndex), detail);
+      contactDetailPartitions += 1;
+    }
     contactPartitionIndex += 1;
     contactBuffer = new Map();
   };
@@ -2267,12 +2318,13 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   const bytes = writer.objects.reduce(
     (total, object) => {
       if (object.key.startsWith("indexes/")) total.indexes += object.bytes;
+      else if (object.key.startsWith("details/")) total.details += object.bytes;
       else if (object.key.startsWith("companies/")) total.companies += object.bytes;
       else if (object.key.startsWith("contacts/")) total.contacts += object.bytes;
       else if (object.key.startsWith("unassigned/")) total.unassigned += object.bytes;
       return total;
     },
-    { indexes: 0, companies: 0, contacts: 0, unassigned: 0 },
+    { indexes: 0, details: 0, companies: 0, contacts: 0, unassigned: 0 },
   );
 
   const directory: IndexDirectory = {
@@ -2302,7 +2354,16 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     },
     counts: { companies: counters.uniqueCompanies, contacts: counters.uniqueContacts, indexedAliases: 0 },
     sources: config.sources.map((source) => source.id),
-    bytes: { ...bytes, total: bytes.indexes + bytes.companies + bytes.contacts + bytes.unassigned },
+    bytes: {
+      ...bytes,
+      total: bytes.indexes + bytes.details + bytes.companies + bytes.contacts + bytes.unassigned,
+    },
+    objects: {
+      companyProjections: companyPartitionIndex,
+      companyDetails: companyDetailPartitions,
+      contactProjections: contactPartitionIndex,
+      contactDetails: contactDetailPartitions,
+    },
     ...(counters.unassignedObjects
       ? { unassigned: { objects: counters.unassignedObjects, contacts: counters.contactsUnresolved ?? 0 } }
       : {}),
@@ -2346,9 +2407,21 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   const validateMs = Date.now() - validateStart;
   const enoughShards = writer.objects.filter((object) => object.key.startsWith("indexes/")).length > 0;
   const bothSources = config.sources.every((source) => (counters.perSource[source.id]?.rowsRead ?? 0) > 0);
+  /**
+   * The projection/detail split is only lossless if BOTH halves exist.
+   *
+   * A format-v4 index whose `details/` objects were never written would still
+   * search perfectly and then open every record with its source columns missing —
+   * silent data loss that no checksum would notice. So a populated index MUST carry
+   * detail objects, and a partition that lost its detail object is reported here
+   * instead of being discovered by a user.
+   */
+  const missingDetails =
+    (counters.uniqueCompanies > 0 && companyDetailPartitions === 0) ||
+    (counters.uniqueContacts > 0 && contactDetailPartitions === 0);
   const validation = {
     version: config.datasetVersion,
-    passed: missing.length === 0 && enoughShards && bothSources,
+    passed: missing.length === 0 && enoughShards && bothSources && !missingDetails,
     checkedAt: new Date().toISOString(),
     verifiedObjects: writer.objects.length - missing.length,
     missingObjects: missing,
@@ -2363,6 +2436,17 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
               message: `Not every source contributed rows: ${config.sources
                 .map((source) => `${source.id}=${counters.perSource[source.id]?.rowsRead ?? 0}`)
                 .join(", ")}`,
+            },
+          ]
+        : []),
+      ...(missingDetails
+        ? [
+            {
+              severity: "error" as const,
+              code: "missing_detail_objects",
+              message:
+                "The search projections were written without their detail objects, so opening a record would lose its source columns. " +
+                `(company details: ${companyDetailPartitions} of ${companyPartitionIndex} partitions, contact details: ${contactDetailPartitions} of ${contactPartitionIndex})`,
             },
           ]
         : []),

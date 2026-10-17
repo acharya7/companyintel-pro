@@ -55,12 +55,25 @@ sample: 421 KB at fixed 16 → 1.15 MB mean for the ladder, unchanged for exact/
 90 rows instead of 70 across the sample's 8 query classes). The per-query ceiling is still 64
 partitions, so even the worst case stays inside the operation and byte budgets below.
 
-The ladder stops at the first rung that hydrates more records and ranks none of them
-(`retrieval.ladderStopped = "no_new_hits"`), so a query with one genuine match does not walk
-to the ceiling. Measured on the 20 K dev index (`dev-r2-20k-fields-20261017`, 82 partitions):
-`qualtrics` now reads 32 partitions / 39.7 MB instead of 64 / 78.6 MB for the same single row,
-while a broad query whose every rung ranks new rows (`global technology`) still reads 64
-partitions / 79 MB, exactly as the fixed budget does. See `docs/search-quality.md` §5.
+The ladder stops only on evidence about the whole candidate set (page full of confident hits,
+candidate set exhausted, the source reporting the cap did not bite, or the 64-partition
+ceiling) — never because one rung ranked nothing, which is not proof that deeper partitions
+hold nothing. What makes that safe is **format v4**: search partitions are projections (21 KB
+on the 20 K dev index) instead of full records (1.2 MB), so reaching the ceiling costs ~1.35 MB
+of partitions rather than 78 MB.
+
+Measured on the same 20,259-company dev index, before and after the split:
+
+| query | v3 cold bytes / time | v4 cold bytes / time | v4 warm |
+| --- | --- | --- | --- |
+| `Microsoft` (exact) | 78.5 MB / 6.19 s | **8.0 MB / 5.08 s** | 0.10 s |
+| `microsft` (fuzzy) | 78.4 MB / 5.86 s | **1.24 MB / 1.95 s** | 0.07 s |
+| `qualtrics` (sparse) | 74.9 MB / 7.75 s | **1.51 MB / 2.30 s** | 0.10 s |
+| `global technology` (broad) | 79.0 MB / 6.21 s | **1.33 MB / 1.98 s** | 0.09 s |
+
+Warm repeats read ~156 bytes, because the working set now fits the isolate cache. The exact
+query's remaining cold cost is round trips (64 small partitions + ~13 shards), not bytes. See
+`docs/search-quality.md` §5.
 
 **Measured reads per query, cold and warm** (real-data sample, real read path —
 `bun run bench:real -- --version <version>`):

@@ -97,7 +97,7 @@ describe("indexer output", () => {
   test("the layout is sharded: no object per company or per contact", () => {
     const keys = fixture.result.objects.map((object) => object.key);
     // Tier 1: the bucket holds only these prefixes.
-    expect(keys.every((key) => /^(indexes|companies|contacts|manifests)\//.test(key))).toBe(true);
+    expect(keys.every((key) => /^(indexes|companies|contacts|details|manifests)\//.test(key))).toBe(true);
     // Tier 2: object names are numeric shard/partition names or fixed manifest
     // names — never a company id or a contact id.
     expect(
@@ -112,7 +112,33 @@ describe("indexer output", () => {
     // token, trigram, ids) plus the three person-name kinds (contactToken,
     // contactPrefix, contactTrigram) that make a global contact search possible.
     const shardSkeleton = 8 * 8;
-    expect(fixture.result.objects.length).toBeLessThanOrEqual(shardSkeleton + 8);
+    expect(fixture.result.objects.length).toBeLessThanOrEqual(shardSkeleton + 8 + 8);
+  });
+
+  test("search projections carry no source columns, and every partition has its detail object", () => {
+    const { version, objects } = fixture.result;
+    const companyProjections = objects.filter((object) => object.key.startsWith(`companies/${version}/`));
+    const companyDetails = objects.filter((object) => object.key.startsWith(`details/${version}/companies/`));
+    const contactDetails = objects.filter((object) => object.key.startsWith(`details/${version}/contacts/`));
+
+    expect(companyProjections.length).toBeGreaterThan(0);
+    expect(companyDetails.length).toBe(companyProjections.length);
+    expect(contactDetails.length).toBeGreaterThan(0);
+    // The whole point of the split: a search result never pays for the columns.
+    for (const object of companyProjections) {
+      const payload = JSON.parse(gunzipSync(bucket.getObject(object.key)!.bytes).toString("utf8"));
+      for (const company of payload.companies) {
+        expect(company.attributes).toBeUndefined();
+        expect(company.facets).toBeUndefined();
+        expect(typeof company.name).toBe("string");
+        expect(typeof company.contactCount).toBe("number");
+      }
+    }
+    // ...and the detail objects really do carry them, aligned by ref.
+    const first = JSON.parse(gunzipSync(bucket.getObject(companyDetails[0]!.key)!.bytes).toString("utf8"));
+    expect(first.firstRef).toBe(0);
+    expect(first.records.length).toBeGreaterThan(0);
+    expect(first.records.some((record: { attributes?: Record<string, string> } | null) => record?.attributes)).toBe(true);
   });
 });
 
@@ -252,10 +278,46 @@ describe("R2 object reader", () => {
 
     const companyKey = `companies/${fixture.version}/${String(partitionOfRef(ref!)).padStart(5, "0")}.json.gz`;
     const contactKey = `contacts/${fixture.version}/${String(contactPartitionOfRef(ref!)).padStart(5, "0")}.json.gz`;
+    const companyDetailKey = `details/${fixture.version}/companies/${String(partitionOfRef(ref!)).padStart(5, "0")}.json.gz`;
     expect(bucket.keys().includes(companyKey)).toBe(true);
     expect(bucket.keys().includes(contactKey)).toBe(true);
+    expect(bucket.keys().includes(companyDetailKey)).toBe(true);
     // A search hydrates at most `maxHydrate` partitions, never the whole index.
     expect(bucket.counters.bytesRead).toBeLessThan(8 * 1024 * 1024);
+  });
+
+  test("opening a company record returns every source column, from one detail object", async () => {
+    const source = await sourceFor();
+    const response = await search("Microsoft");
+    const ref = await source.refForCompanyId(response.hits[0]!.id);
+    bucket.resetCounters();
+    const company = await store.getCompanyByRef(fixture.version, ref!);
+
+    expect(company?.attributes).toBeDefined();
+    expect(Object.keys(company?.attributes ?? {}).length).toBeGreaterThan(3);
+    // The record view reads the projection + exactly one detail object.
+    expect(bucket.counters.readKeys.filter((key) => key.startsWith(`details/${fixture.version}/`)).length).toBe(1);
+  });
+
+  test("a search never reads a detail object", async () => {
+    bucket.resetCounters();
+    await search("Microsoft");
+    expect(bucket.counters.readKeys.filter((key) => key.startsWith("details/")).length).toBe(0);
+  });
+
+  test("opening a contact returns its full row, and lists keep the summaries", async () => {
+    const source = await sourceFor();
+    const response = await search("Microsoft");
+    const ref = await source.refForCompanyId(response.hits[0]!.id);
+    const full = await store.getContactsByCompanyRef(fixture.version, ref!);
+    expect(full.length).toBeGreaterThan(0);
+    expect(full.some((contact) => contact.attributes && Object.keys(contact.attributes).length > 0)).toBe(true);
+
+    const summaries = await store.getContactsByCompanyRefs(fixture.version, [ref!]);
+    const listed = summaries.get(ref!) ?? [];
+    expect(listed.length).toBe(full.length);
+    // The list path must stay projection-only: no source columns anywhere.
+    expect(listed.every((contact) => contact.attributes === undefined)).toBe(true);
   });
 
   test("gzip without content-encoding metadata is still readable (rclone uploads)", async () => {

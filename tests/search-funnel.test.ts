@@ -152,7 +152,9 @@ class OverreachIndex extends SyntheticIndex {
     const postings = payload.terms[this.overreachTerm] ?? { refs: [], q: [] };
     for (const ref of this.overreachRefs) {
       postings.refs.push(ref);
-      postings.q!.push(qualityByte(0, 8));
+      // Maximum prominence: these candidates must be hydrated BEFORE the genuine
+      // matches, which is what makes the early rungs unproductive.
+      postings.q!.push(255);
     }
     payload.terms[this.overreachTerm] = postings;
     return payload;
@@ -252,17 +254,19 @@ describe("bounded R2 hydration", () => {
     expect(index.partitionsRead.length).toBeLessThanOrEqual(SHARDING.maxHydrate);
   });
 
-  test("the ladder stops at the first rung that ranks nothing new", async () => {
-    // 40 companies genuinely match and sit in the first partition. The index also
-    // records the query's exact term against 1,000 companies that do not match it
-    // at all, so every rung the ladder can take hydrates more records and ranks
-    // none of them. A third rung would read more partitions for the same answer.
+  test("an unproductive rung does not stop the ladder before a later partition is read", async () => {
+    // The genuine matches sit in partition 2. The first two partitions hold
+    // companies the index's exact postings point at but which do not match the
+    // query at all, so the first rung ranks nothing. Stopping there — as an older
+    // rule did — would return zero rows for a query that has 40.
     const companies: Company[] = [];
-    for (let index = 0; index < 40; index += 1) {
+    for (let index = 0; index < 600; index += 1) companies.push(makeCompany(index, `Zeta Holdings ${index}`));
+    for (let index = 600; index < 640; index += 1) {
       companies.push({ ...makeCompany(index, "Alpha Corporation"), contactCount: 400 });
     }
-    for (let index = 40; index < 1040; index += 1) companies.push(makeCompany(index, `Zeta Holdings ${index}`));
-    const overreach = Array.from({ length: 1000 }, (_, offset) => offset + 40);
+    // Force the misleading exact postings to rank FIRST, so the ladder's early
+    // rungs really do spend their partitions on records that cannot match.
+    const overreach = Array.from({ length: 600 }, (_, offset) => offset);
     const index = new OverreachIndex(companies, "alpha corporation", overreach);
 
     const response = await searchCompanies(new R2CandidateSource(index, directory(companies.length)), "alpha corporation", {
@@ -272,23 +276,35 @@ describe("bounded R2 hydration", () => {
     });
 
     expect(response.hits.length).toBeGreaterThan(0);
-    // Every returned row came from the first rung: the rung that read 250
-    // non-matching companies contributed nothing, which is why it ended the ladder.
     expect(response.hits.every((hit) => hit.name === "Alpha Corporation")).toBe(true);
-    expect(response.retrieval.ladderStopped).toBe("no_new_hits");
-    // One productive rung plus the rung that proved nothing was left: the same
-    // rows, without walking on to the ceiling for them.
-    expect(index.partitionsRead.length).toBe(2);
+    // The first rung found these rows; the rung after it hydrated a partition and
+    // added none. The ladder must still have read the remaining partitions (3 in
+    // total) instead of stopping at the unproductive rung.
+    expect(index.partitionsRead.length).toBe(3);
 
-    // The same search without the ladder reads the same rows from the first rung.
-    const fixed = new OverreachIndex(companies, "alpha corporation", overreach);
-    const direct = await searchCompanies(new R2CandidateSource(fixed, directory(companies.length)), "alpha corporation", {
+    // The exhaustive reference finds the same rows, and the ladder costs no recall.
+    const reference = await searchCompanies(new R2CandidateSource(new OverreachIndex(companies, "alpha corporation", overreach), directory(companies.length)), "alpha corporation", {
       pageSize: 100,
-      maxHydrate: 1,
-      adaptiveHydration: false,
+      maxHydrate: 4096,
     });
-    expect(direct.hits.map((hit) => hit.id)).toEqual(response.hits.map((hit) => hit.id));
-    expect(direct.retrieval.ladderStopped).toBeUndefined();
+    expect(reference.hits.map((hit) => hit.id)).toEqual(response.hits.map((hit) => hit.id));
+  });
+
+  test("a later page of a many-partition query matches the exhaustive reference", async () => {
+    // Pagination is where a bounded first pass shows up as a missing row: page 2
+    // asks for rows 26–50, which a query spread over 1,200 companies cannot produce
+    // from one partition. The exhaustive reference (every partition) is the proof
+    // that the bounded ladder did not silently drop a page's worth of matches.
+    const index = new SyntheticIndex(manyCompanies(1200));
+    const bounded = await searchCompanies(new R2CandidateSource(index, directory(1200)), "alpha", { pageSize: 25, page: 2 });
+    const reference = await searchCompanies(new R2CandidateSource(new SyntheticIndex(manyCompanies(1200)), directory(1200)), "alpha", {
+      pageSize: 25,
+      page: 2,
+      maxHydrate: 4096,
+    });
+
+    expect(bounded.hits.length).toBeGreaterThan(0);
+    expect(bounded.hits.map((hit) => hit.id)).toEqual(reference.hits.map((hit) => hit.id));
   });
 
   test("a rung that ranks new rows keeps the ladder climbing", async () => {

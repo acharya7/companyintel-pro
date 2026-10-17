@@ -61,7 +61,8 @@ describe("synthetic association scenarios", () => {
     expect(report.counters.uniqueContacts).toBe(32);
     expect(report.counters.duplicateRowsResolved).toBe(4);
     expect(report.counters.contactsMoved ?? 0).toBe(0);
-    expect(report.index.formatVersion).toBe(3);
+    // Association categories exist from format 3 onward; later formats keep them.
+    expect(report.index.formatVersion).toBeGreaterThanOrEqual(3);
   }, 60_000);
 
   test("uncertain contacts are never presented as confirmed employees", async () => {

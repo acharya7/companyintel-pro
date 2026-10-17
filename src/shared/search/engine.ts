@@ -334,14 +334,14 @@ export async function searchCompanies(
     /** True when those skipped stages had to be run after all (a short page). */
     fuzzyRecovered: false,
     /**
-     * Why the hydration ladder stopped early, when it did.
+     * Why the hydration ladder stopped short of its ceiling, when it did.
      *
-     * `"no_new_hits"` means a rung with a larger partition budget qualified no
-     * additional row, so a further rung would have read more partitions for the
-     * same answer. Reported so an operator can tell a bounded search from a
-     * mis-tuned one instead of inferring it from the byte count.
+     * `"candidates_exhausted"` means every candidate retrieval produced had been
+     * hydrated, so no larger partition budget could add a row. There is deliberately
+     * no "a rung ranked nothing" case: that is not evidence about the candidates a
+     * later rung would reach, and using it lost valid results.
      */
-    ladderStopped: undefined as "no_new_hits" | undefined,
+    ladderStopped: undefined as "candidates_exhausted" | undefined,
   };
 
   /** Candidates that must be found before another page row is known to exist. */
@@ -582,32 +582,37 @@ export async function searchCompanies(
     for (let step = 0; step < adaptiveSteps; step += 1) {
       if (stoppedEarly || pageFull() || !budgetLimited) break;
       // Nothing left to hydrate: a bigger cap cannot add a row the candidate
-      // list does not contain, and re-walking it would only cost CPU.
-      if (hydrated >= budgetedRefs().length) break;
+      // list does not contain, and re-walking it would only cost CPU. This — the
+      // exhausted candidate set — is the only rung-level stop that is safe: a rung
+      // that ranks nothing new says nothing about the candidates it could not
+      // reach, and deeper partitions may well hold valid results.
+      if (hydrated >= budgetedRefs().length) {
+        retrieval.ladderStopped = "candidates_exhausted";
+        break;
+      }
       const next = Math.min(retrieval.hydrateBudget * ADAPTIVE_HYDRATE_FACTOR, SEARCH_LIMITS.maxHydrate);
       if (next <= retrieval.hydrateBudget) break;
-      const rankedBefore = scored.length;
       await sweep(next);
       budgetLimited = source.hydrationBudgetHit?.() ?? false;
       /*
-       * A rung that RANKS nothing is the end of the ladder.
+       * A rung that ranks nothing is NOT a reason to stop.
        *
-       * Doubling the partition budget is a bet: it is worth the extra reads only if
-       * the deeper candidates can actually fill the page. When a rung hydrates more
-       * records and qualifies none of them, a third rung re-reads yet more partitions
-       * for the same answer — measured on the real 20 K index: a search for a common
-       * name walked 16 → 32 → 64 partitions (64 MB of JSON) and returned the four
-       * exact hits it had after the FIRST rung. This is the load-bearing rule for
-       * `maxHydrate`: without it the ladder always ends at the ceiling, and the
-       * "bounded hydration" claim is true only of the first pass.
+       * Hydration spends its budget in candidate order, and a rung's extra
+       * partitions are simply the next candidates in that order. When one of them
+       * ranks nothing, that says nothing about the partitions still unread — a query
+       * whose only genuine matches sit at refs the first rung never reached would
+       * lose them. (An earlier version stopped here and cut recall on exactly that
+       * shape; `tests/search-funnel.test.ts` now pins that a later partition is
+       * still reached after an unproductive rung.)
        *
-       * Completeness is still reported honestly: `budgetLimited` remains true, so the
-       * API still shows the total as a floor ("of 40+") rather than a total.
+       * The defensible stops are therefore evidence about the whole candidate set:
+       *   - the page is full of hits that beat anything weaker stages can produce
+       *     (`stoppedEarly`, proved by `WEAK_CEILING`), or
+       *   - every candidate has been hydrated (`candidates_exhausted` below), or
+       *   - the source reports that the last sweep dropped nothing for budget, so
+       *     more budget could not have read anything, or
+       *   - the ceiling is reached.
        */
-      if (scored.length === rankedBefore) {
-        retrieval.ladderStopped = "no_new_hits";
-        break;
-      }
     }
   }
 
