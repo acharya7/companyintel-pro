@@ -20,7 +20,7 @@ import { describe, expect, test } from "bun:test";
 import { app } from "../worker/src/app";
 import type { Env } from "../worker/src/env";
 import { FakeR2Bucket } from "./helpers/fake-r2";
-import { buildFixtureDataset } from "./helpers/fixture-dataset";
+import { buildFixtureDataset, LONG_FIELDS } from "./helpers/fixture-dataset";
 import { activeManifestKey } from "../src/shared/search/index-format";
 
 const fixture = await buildFixtureDataset();
@@ -182,6 +182,46 @@ describe("Worker API routes (real fetch handler)", () => {
     expect(status).toBe(200);
     expect(body.contact.id).toBe(contactId);
     expect(body.company.name).toBe("Infosys Limited");
+  });
+
+  test("company detail returns every source column, with long and unicode values intact", async () => {
+    const search = await api("/api/companies/search?q=Microsoft");
+    const id = search.body.hits[0].id as string;
+    const { status, body } = await api(`/api/companies/${encodeURIComponent(id)}`);
+    expect(status).toBe(200);
+
+    const attributes = body.company.attributes as Record<string, string>;
+    // A value well past the old 400-character cap arrives whole, not truncated.
+    expect(attributes["Company Description"]).toBe(LONG_FIELDS.companyDescription);
+    expect(attributes["Company Description"].length).toBeGreaterThan(4000);
+    expect(attributes["Company Description"].endsWith("…")).toBe(false);
+    // Unicode survives the whole pipeline unchanged.
+    expect(attributes["Organization Notes"]).toBe(LONG_FIELDS.companyNote);
+    // A MAPPED column is captured too: the canonical name is normalised, the raw
+    // source value must still be available.
+    expect(attributes["Company Name"]).toBe("Microsoft Corporation");
+  });
+
+  test("contact detail returns the complete original row", async () => {
+    const search = await api("/api/companies/search?q=Microsoft");
+    const companyId = search.body.hits[0].id as string;
+    const contacts = await api(`/api/companies/${encodeURIComponent(companyId)}/contacts?pageSize=25`);
+    const amy = (contacts.body.contacts as Array<{ id: string; fullName: string }>).find(
+      (contact) => contact.fullName === "Amy Hood",
+    );
+    expect(amy).toBeDefined();
+    const { status, body } = await api(`/api/contacts/${encodeURIComponent(amy!.id)}`);
+    expect(status).toBe(200);
+    expect((body.contact.attributes as Record<string, string>).person_bio).toBe(LONG_FIELDS.personBio);
+    expect((body.contact.attributes as Record<string, string>).person_bio.length).toBeGreaterThan(1000);
+  });
+
+  test("search results stay lightweight: the full row is only on the detail endpoint", async () => {
+    const { body } = await api("/api/companies/search?q=Microsoft");
+    const hit = body.hits[0];
+    expect(hit.name).toBe("Microsoft Corporation");
+    // A summary hit carries the fields a result row shows, never the source row.
+    expect(hit.attributes).toBeUndefined();
   });
 
   test("saved leads round-trip through R2 (save → list → patch → delete)", async () => {

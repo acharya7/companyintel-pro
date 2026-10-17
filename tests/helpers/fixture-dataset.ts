@@ -48,8 +48,22 @@ export interface FixtureDataset {
 
 /* --------------------------------- csv1 ---------------------------------- */
 
-const CSV1 = `"Company Name","Website","Industry","Country","City","Company Size","Contact Name","Job Title","Email","Phone"
-"Microsoft Corporation","https://www.microsoft.com","Software","United States","Redmond","10001+","Satya Nadella","Chief Executive Officer","satya.nadella@microsoft.com","+1 425 882 8080"
+/**
+ * A value longer than the old 400-character capture cap, with commas (so the CSV
+ * reader must honour quoting) and non-ASCII punctuation. It exists to prove the
+ * lossless path end to end: indexer → partition object → API → record.
+ */
+const LONG_DESCRIPTION = Array.from(
+  { length: 40 },
+  (_, index) => `Segment ${index}: Microsoft builds platforms, tools and services for developers, enterprises and consumers — “worldwide”.`,
+).join(" ");
+
+/** Unicode a naive pipeline mangles (combining marks, CJK, emoji, RTL). */
+const UNICODE_NOTE = "café · naïve · 東京 · مرحبا · ✅ — “quoted”";
+
+/** csv1 carries a long company description and a unicode note on the first row only. */
+const CSV1 = `"Company Name","Website","Industry","Country","City","Company Size","Contact Name","Job Title","Email","Phone","Company Description","Organization Notes"
+"Microsoft Corporation","https://www.microsoft.com","Software","United States","Redmond","10001+","Satya Nadella","Chief Executive Officer","satya.nadella@microsoft.com","+1 425 882 8080","${LONG_DESCRIPTION}","${UNICODE_NOTE}"
 "Microsoft Corporation","https://www.microsoft.com","Software","United States","Redmond","10001+","Kevin Scott","Chief Technology Officer","kevin.scott@microsoft.com",""
 "Microsoft Corporation","https://www.microsoft.com","Software","United States","Redmond","10001+","Kevin Scott","Chief Technology Officer","kevin.scott@microsoft.com",""
 "Infosys Limited","https://www.infosys.com","IT Services","India","Bengaluru","10001+","Salil Parekh","Chief Executive Officer
@@ -63,8 +77,9 @@ and Managing Director","salil.parekh@infosys.com","+91 80 2852 0261"
 
 /* --------------------------------- csv2 ---------------------------------- */
 
-const CSV2 = `organization,domain,linkedin_url,industry,employee_range,full_name,designation,seniority,department,work_email,mobile,linkedin_profile,location_country
-Microsoft Corp,https://www.microsoft.com,https://www.linkedin.com/company/microsoft,Software,10001+,Amy Hood,Chief Financial Officer,Executive,Finance,amy.hood@microsoft.com,,https://www.linkedin.com/in/amyhood,United States
+const PERSON_BIO = `${"Amy has led finance across cloud, devices and enterprise sales. ".repeat(30)}—“quoted”, comma-separated, and 東京.`;
+const CSV2 = `organization,domain,linkedin_url,industry,employee_range,full_name,designation,seniority,department,work_email,mobile,linkedin_profile,location_country,person_bio
+Microsoft Corp,https://www.microsoft.com,https://www.linkedin.com/company/microsoft,Software,10001+,Amy Hood,Chief Financial Officer,Executive,Finance,amy.hood@microsoft.com,,https://www.linkedin.com/in/amyhood,United States,"${PERSON_BIO.replace(/"/g, '""')}"
 Microsoft Corp,https://www.microsoft.com,https://www.linkedin.com/company/microsoft,Software,10001+,Judson Althoff,Chief Commercial Officer,Executive,Sales,judson.althoff@microsoft.com,+1 425 555 0199,,United States
 Vertex Analytics Private Limited,https://www.vertexanalytics.example,https://www.linkedin.com/company/vertex-analytics,Analytics,51-200,Arun Das,Data Engineer,Mid,Data,arun.das@vertexanalytics.example,,,India
 Vertex Analytics Pvt Ltd,https://metrics.vertexanalytics.example,https://www.linkedin.com/company/vertex-metrics,Analytics,51-200,Divya Rao,Director of Analytics,Director,Analytics,divya.rao@metrics.vertexanalytics.example,,,India
@@ -101,7 +116,16 @@ export function buildFixtureDataset(): Promise<FixtureDataset> {
       partitions: 16,
       shards: { exact: 8, prefix: 8, token: 8, trigram: 8, ids: 8 },
     };
-    const result = await runIndex(config, {});
+    /*
+     * The merge's free-space floor is lowered for the fixture on purpose.
+     *
+     * The default (512 MB) protects a real run whose output may be gigabytes; the
+     * fixture's output is a few hundred kilobytes, so requiring half a gigabyte of free
+     * space would make the whole suite fail on a machine — or in a container — that is
+     * legitimately nearly full, for a reason that has nothing to do with the code under
+     * test.
+     */
+    const result = await runIndex(config, { diskFloorBytes: 16 * 1024 * 1024 });
     return {
       result,
       outputDir: config.outputDir,
@@ -114,6 +138,13 @@ export function buildFixtureDataset(): Promise<FixtureDataset> {
 }
 
 /** Names/ids the tests assert against, so expectations live in one place. */
+/** The over-long values the lossless-capture tests assert on, in one place. */
+export const LONG_FIELDS = {
+  companyDescription: LONG_DESCRIPTION,
+  companyNote: UNICODE_NOTE,
+  personBio: PERSON_BIO,
+};
+
 export const EXPECTED = {
   /** Present in csv1 (2 unique contacts) and csv2 (2 more) → one merged company. */
   microsoft: { name: "Microsoft Corporation", domain: "microsoft.com", contactsFromCsv1: 2, contactsFromCsv2: 2 },

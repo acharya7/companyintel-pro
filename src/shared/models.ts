@@ -71,13 +71,14 @@ export interface Company {
    */
   facets?: CompanyFacets;
   /**
-   * Source columns that are not part of the canonical model, kept verbatim.
+   * Every column of the source record, keyed by the file's own header text.
    *
    * The canonical fields are what the application searches, filters and ranks on;
-   * everything else the source row carried lives here, so a record detail view can
-   * show ALL of its attributes instead of a curated subset (§ 11 of the
-   * specification). The indexer bounds the count and each value's length
-   * (`MAX_CAPTURED_FIELDS` / `MAX_CAPTURED_VALUE_LENGTH` in `mapping.ts`).
+   * this map is the complete original row, so a record detail view can show ALL of
+   * its attributes instead of a curated subset (§ 11 of the specification). There
+   * is no column cap and no character cap: values are stored in full, and a long
+   * one is collapsed only in the display (`LongText`). Mapped columns appear here
+   * too, because the canonical value is normalised and the raw one is not.
    */
   attributes?: Record<string, string>;
 }
@@ -119,7 +120,7 @@ export interface Contact {
   country?: string;
   state?: string;
   city?: string;
-  /** Every other column of the source row, kept verbatim (see `Company.attributes`). */
+  /** Every column of the source row, kept verbatim and in full (see `Company.attributes`). */
   attributes?: Record<string, string>;
   source: SourceRef;
   /**

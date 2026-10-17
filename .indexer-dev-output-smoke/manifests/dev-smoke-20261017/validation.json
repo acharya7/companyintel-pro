@@ -1,0 +1,14 @@
+{
+  "version": "dev-smoke-20261017",
+  "passed": true,
+  "checkedAt": "2026-10-17T09:48:48.518Z",
+  "verifiedObjects": 80,
+  "missingObjects": [],
+  "issues": [
+    {
+      "severity": "info",
+      "code": "row_sample",
+      "message": "3941 rows read, 163 rejected."
+    }
+  ]
+}

@@ -15,7 +15,7 @@ import { Link, useParams } from "react-router";
 import { ArrowLeft, Building2, Copy, Linkedin, Mail, Phone, ShieldAlert } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { CardShell, ErrorBlock, InfoRow, LoadingBlock, PageHeader, Section } from "@/components/common";
+import { CardShell, ErrorBlock, InfoRow, LoadingBlock, LongText, PageHeader, Section } from "@/components/common";
 import { useContact, useDatasetStatus } from "@/hooks/use-api";
 import { ASSOCIATION_CATEGORY_LABELS, type AssociationCategory, type AssociationRecord } from "@/shared/association";
 import type { Contact } from "@/shared/models";
@@ -58,10 +58,10 @@ function FieldRow({ label, value, href }: { label: string; value: string; href?:
         <dd className="mt-0.5 break-words text-sm">
           {href ? (
             <a className="text-primary hover:underline" href={href} target="_blank" rel="noreferrer noopener">
-              {value}
+              <LongText text={value} limit={120} />
             </a>
           ) : (
-            value
+            <LongText text={value} />
           )}
         </dd>
       </div>
@@ -239,7 +239,7 @@ export default function ContactDetails() {
           <CardShell>
             <Section
               title="All source fields"
-              description={`Every column of the source row — ${captured.length + extra.length} fields beyond identity, none silently dropped`}
+              description={`Every column the source row carried — ${captured.length} captured source fields plus ${extra.length} derived ones, none truncated`}
             >
               {captured.length ? (
                 <dl className="mb-4 grid gap-x-8 border-b border-border/60 pb-2 sm:grid-cols-2">

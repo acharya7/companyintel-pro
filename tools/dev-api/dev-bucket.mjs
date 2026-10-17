@@ -10,11 +10,16 @@
  *
  * Two rules make it safe to point it at the real bucket:
  *
- *  1. **The published pointer is never written.** `manifests/active.json` reads
- *     resolve to an in-memory pointer (the version this dev server was told to
- *     serve, or the version activated inside this process). Clicking "Activate" in
+ *  1. **The published pointer is never written by the preview.** `manifests/active.json`
+ *     is answered from an in-memory pointer (the version activated inside this
+ *     process, or the one committed to R2 by `cli publish`). Clicking "Activate" in
  *     the preview therefore changes *this process only*; the real pointer in R2 is
  *     untouched, so a development experiment cannot redirect a production deploy.
+ *
+ *     Reads of the pointer are DYNAMIC: the newest activation wins, and the R2
+ *     pointer is re-read at most every five seconds. Publishing a verified index
+ *     therefore makes the running preview serve it without a restart — the thing a
+ *     pinned-at-startup version could never do.
  *  2. **Only the application's own data area is writable.** `app-data/…` (leads,
  *     saved searches, settings, activity, exports) is kept in memory and the active
  *     pointer is intercepted; every other write throws. No code path in the
@@ -79,24 +84,92 @@ function headObject(key, size, httpMetadata, etag) {
  *
  * @param {object} options
  * @param {object} options.remote        `{ getBytes, head, list }` — the real bucket reader.
- * @param {string|null} options.version  the index version this server serves.
+ * @param {string|null} options.version  index version to serve when nothing is published.
+ * @param {boolean} [options.pin]        true when `version` came from the environment: serve it always.
  * @param {(message: string) => void} [options.log]
  */
-export function createDevBucket({ remote, version = null, log = () => {} }) {
-  /** In-memory application data (`app-data/…`) and, if activated here, the pointer. */
+export function createDevBucket({ remote, version = null, pin = false, log = () => {} }) {
+  /** In-memory application data (`app-data/…`). */
   const memory = new Map();
-  /** The active pointer this process serves; null means "whatever R2 says". */
-  const pointer = {
-    version,
-    previousVersion: null,
-    activatedAt: version ? new Date().toISOString() : null,
-    activatedBy: "dev-api",
-  };
 
   const activeKey = "manifests/active.json";
+  /**
+   * A version discovered on disk at startup, used when neither this process nor R2
+   * has published a pointer. It is a fallback, not a pin: the moment a newer
+   * activation exists it stops being served.
+   */
+  const fallbackVersion = version;
+  /** An activation performed in this process (the Dataset page's Activate button). */
+  let localPointer = null;
+  /** Last read of the real pointer, with its TTL. */
+  let remoteRead = { at: 0, pointer: null };
+  const POINTER_TTL_MS = 5000;
+  /** What the last resolution chose, so a change can be logged once. */
+  let served = null;
 
-  function pointerBytes() {
-    if (!pointer.version) return null;
+  async function readRemotePointer() {
+    const now = Date.now();
+    if (now - remoteRead.at < POINTER_TTL_MS) return remoteRead.pointer;
+    let pointer = null;
+    try {
+      const found = await remote.getBytes(activeKey);
+      if (found) {
+        const parsed = JSON.parse(new TextDecoder().decode(found.bytes));
+        if (parsed?.version) {
+          pointer = {
+            version: parsed.version,
+            previousVersion: parsed.previousVersion ?? null,
+            activatedAt: parsed.activatedAt ?? null,
+            activatedBy: parsed.activatedBy ?? "r2",
+          };
+        }
+      }
+    } catch {
+      // An unreadable pointer is "no pointer": the fallback version still serves.
+      pointer = null;
+    }
+    remoteRead = { at: now, pointer };
+    return pointer;
+  }
+
+  /**
+   * The pointer this process should serve.
+   *
+   * Order of precedence:
+   *   1. `pin` (COMPANYINTEL_DEV_DATASET_VERSION) — an explicit instruction wins.
+   *   2. the newest activation of {this process, R2} by `activatedAt`. That is what
+   *      makes an R2 publish take effect in the running preview, while an Activate
+   *      click still wins until something newer is published.
+   *   3. the version discovered at startup, so a bucket with index objects but no
+   *      pointer still shows real data instead of "no dataset".
+   */
+  async function resolvePointer() {
+    if (pin && fallbackVersion) {
+      return { version: fallbackVersion, previousVersion: null, activatedAt: null, activatedBy: "pinned" };
+    }
+    const candidates = [];
+    if (localPointer) candidates.push(localPointer);
+    const remotePointer = await readRemotePointer();
+    if (remotePointer) candidates.push(remotePointer);
+    if (fallbackVersion) {
+      candidates.push({ version: fallbackVersion, previousVersion: null, activatedAt: null, activatedBy: "discovered" });
+    }
+    if (!candidates.length) return null;
+    const stamp = (entry) => (entry.activatedAt ? Date.parse(entry.activatedAt) || 0 : 0);
+    // `sort` is stable, so on equal timestamps the earlier candidate (local, then
+    // R2, then the startup discovery) keeps precedence.
+    const ranked = [...candidates].sort((a, b) => stamp(b) - stamp(a));
+    const chosen = ranked[0];
+    if (served !== chosen.version) {
+      log(`serving index version ${chosen.version} (${chosen.activatedBy})`);
+      served = chosen.version;
+    }
+    return chosen;
+  }
+
+  async function pointerBytes() {
+    const pointer = await resolvePointer();
+    if (!pointer?.version) return null;
     return new TextEncoder().encode(
       JSON.stringify({
         version: pointer.version,
@@ -109,9 +182,7 @@ export function createDevBucket({ remote, version = null, log = () => {} }) {
 
   async function read(key) {
     if (key === activeKey) {
-      const staged = memory.get(key);
-      if (staged) return { ...staged, synthetic: false };
-      const bytes = pointerBytes();
+      const bytes = await pointerBytes();
       if (bytes) return { bytes, httpMetadata: { contentType: "application/json" }, etag: null, synthetic: true };
     }
     const staged = memory.get(key);
@@ -122,8 +193,8 @@ export function createDevBucket({ remote, version = null, log = () => {} }) {
   }
 
   return {
-    /** The version this server currently serves (the dev override or an activation). */
-    activeVersion: () => pointer.version,
+    /** The version this server currently serves (resolved, not cached). */
+    activeVersion: async () => (await resolvePointer())?.version ?? null,
 
     async get(key) {
       const found = await read(key);
@@ -132,9 +203,9 @@ export function createDevBucket({ remote, version = null, log = () => {} }) {
     },
 
     async head(key) {
-      if (key === activeKey && pointerBytes()) {
-        const bytes = pointerBytes();
-        return headObject(key, bytes.byteLength, { contentType: "application/json" }, null);
+      if (key === activeKey) {
+        const bytes = await pointerBytes();
+        if (bytes) return headObject(key, bytes.byteLength, { contentType: "application/json" }, null);
       }
       const staged = memory.get(key);
       if (staged) return headObject(key, staged.bytes.byteLength, staged.httpMetadata, null);
@@ -156,12 +227,14 @@ export function createDevBucket({ remote, version = null, log = () => {} }) {
       if (key === activeKey) {
         try {
           const parsed = JSON.parse(new TextDecoder().decode(bytes));
-          pointer.version = parsed.version ?? pointer.version;
-          pointer.previousVersion = parsed.previousVersion ?? pointer.previousVersion;
-          pointer.activatedAt = parsed.activatedAt ?? new Date().toISOString();
-          pointer.activatedBy = parsed.activatedBy ?? "dev-api";
-          log(`active version switched to ${pointer.version} (in-process only; R2 manifests/active.json untouched)`);
-          memory.delete(key);
+          if (!parsed?.version) throw new Error("the pointer has no version");
+          localPointer = {
+            version: parsed.version,
+            previousVersion: parsed.previousVersion ?? null,
+            activatedAt: parsed.activatedAt ?? new Date().toISOString(),
+            activatedBy: parsed.activatedBy ?? "dev-api",
+          };
+          log(`active version switched to ${localPointer.version} (in-process only; R2 manifests/active.json untouched)`);
           return headObject(key, bytes.byteLength, { contentType: "application/json" }, null);
         } catch (error) {
           throw new Error(`Refusing an unparseable active pointer: ${error.message}`);

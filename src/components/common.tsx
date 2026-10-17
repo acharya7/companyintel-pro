@@ -6,7 +6,7 @@
  * consistent across the application.
  */
 
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -255,6 +255,32 @@ export function InfoRow({ label, children }: { label: string; children: ReactNod
       <dt className="w-48 shrink-0 text-xs uppercase tracking-[0.08em] text-muted-foreground">{label}</dt>
       <dd className="min-w-0 text-sm break-words">{children}</dd>
     </div>
+  );
+}
+
+/**
+ * A value that can be long — a 3 KB company description, a JSON blob column.
+ *
+ * The source value is stored and delivered whole (the indexer never truncates), so
+ * this only decides how much of it is on screen: a collapsed preview with the real
+ * character count, and a toggle that shows every character. Nothing is lost — the
+ * copy button copies the full value, not the preview.
+ */
+export function LongText({ text, limit = 280 }: { text: string; limit?: number }) {
+  const [expanded, setExpanded] = useState(false);
+  if (text.length <= limit) return <>{text}</>;
+  return (
+    <span className="block">
+      <span className="block whitespace-pre-wrap break-words">{expanded ? text : `${text.slice(0, limit)}…`}</span>
+      <button
+        type="button"
+        className="mt-1 text-xs font-medium text-primary hover:underline"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        {expanded ? "Show less" : `Show all ${text.length.toLocaleString()} characters`}
+      </button>
+    </span>
   );
 }
 

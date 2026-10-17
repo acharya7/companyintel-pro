@@ -32,17 +32,16 @@
  *     configured mode and ships no dev code;
  *   - it never logs a credential or a record value.
  *
- * The index version served is chosen in this order:
- *   1. `COMPANYINTEL_DEV_DATASET_VERSION` — explicit, used by the dev scripts;
- *   2. the newest `manifests/<version>/manifest.json` under a `dev-` prefix;
- *   3. the newest manifest of any version that passed validation;
- *   4. the real `manifests/active.json` if one exists.
+ * The index version served is chosen per request (see `dev-bucket.mjs`), so a
+ * version published to R2 while the preview is running is served within seconds:
+ *   1. `COMPANYINTEL_DEV_DATASET_VERSION` (or a plugin option) — an explicit PIN;
+ *   2. otherwise the newest activation of {this process, R2's `manifests/active.json`};
+ *   3. otherwise the version discovered at startup — the newest `dev-*` manifest,
+ *      then the newest validated manifest, then whatever the pointer names.
  */
 
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
-
-import { createDevBucket } from "./dev-bucket.mjs";
 
 export const DEV_VERSION_ENV = "COMPANYINTEL_DEV_DATASET_VERSION";
 export const DEV_BUCKET_ENV = "COMPANYINTEL_DEV_BUCKET";
@@ -129,6 +128,13 @@ async function resolveVersion(client, requested) {
  */
 async function createHandler(server, options) {
   const { R2Client, credentialsFromEnv } = await server.ssrLoadModule("/tools/indexer/src/r2.ts");
+  /*
+   * The bucket shim is loaded through the module runner too, not statically: the
+   * handler is rebuilt whenever anything under `tools/dev-api` changes (see the
+   * watcher in `configureServer`), so a fix to the pointer resolution or the write
+   * guard takes effect without restarting the platform-managed dev server.
+   */
+  const { createDevBucket } = await server.ssrLoadModule("/tools/dev-api/dev-bucket.mjs");
   const workerEntry = await server.ssrLoadModule("/worker/src/index.ts");
   const worker = workerEntry.default ?? workerEntry;
 
@@ -142,7 +148,16 @@ async function createHandler(server, options) {
   }
 
   const client = new R2Client(credentials);
-  const version = await resolveVersion(client, options.version ?? process.env[DEV_VERSION_ENV] ?? null);
+  /*
+   * An explicitly requested version (plugin option or COMPANYINTEL_DEV_DATASET_VERSION)
+   * is a PIN. Otherwise the discovered version is only a startup fallback: the shim
+   * resolves the served version per request, so publishing a verified index to R2
+   * makes the running preview serve it within seconds — no restart, which the
+   * platform-managed dev server never gets.
+   */
+  const requested = options.version ?? process.env[DEV_VERSION_ENV] ?? null;
+  const pin = Boolean(requested);
+  const version = await resolveVersion(client, requested);
 
   const remote = {
     async head(key) {
@@ -167,6 +182,7 @@ async function createHandler(server, options) {
   const dataBucket = createDevBucket({
     remote,
     version,
+    pin,
     log: (message) => server.config.logger.info(`  [dev-api] ${message}`),
   });
 
@@ -183,7 +199,10 @@ async function createHandler(server, options) {
   const context = { waitUntil: () => {}, passThroughOnException: () => {} };
 
   if (version) {
-    server.config.logger.info(`  [dev-api] serving index version ${version} from bucket ${bucket} (read-only; active pointer untouched)`);
+    server.config.logger.info(
+      `  [dev-api] ${pin ? "pinned to" : "starting on"} index version ${version} from bucket ${bucket} ` +
+        (pin ? "(COMPANYINTEL_DEV_DATASET_VERSION / plugin option)" : "(follows the newest activation; R2 pointer is never written by the preview)"),
+    );
   } else {
     server.config.logger.warn(
       "  [dev-api] no index version found. Run `bun run dev:index` to build a real development index from R2, " +
@@ -198,8 +217,9 @@ async function createHandler(server, options) {
       const started = Date.now();
       const apiRequest = await toRequest(request);
       const apiResponse = await worker.fetch(apiRequest, env, context);
-      // A dev-only marker, so a browser can prove which process answered.
-      apiResponse.headers.set("x-companyintel-dev-api", version ?? "no-version");
+      // A dev-only marker, so a browser can prove which process AND which index
+      // version answered — and can watch a newly published version take over.
+      apiResponse.headers.set("x-companyintel-dev-api", (await dataBucket.activeVersion()) ?? "no-version");
       await writeResponse(apiResponse, response);
       server.config.logger.info(`  [dev-api] ${apiRequest.method} ${new URL(apiRequest.url).pathname} → ${apiResponse.status} (${Date.now() - started} ms)`);
     },

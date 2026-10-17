@@ -1,0 +1,46 @@
+{
+  "stage": "pass2-merge",
+  "identity": {
+    "version": "dev-r2-20k-fields-20261017",
+    "sampleLimit": 20000,
+    "partitions": 64,
+    "sources": [
+      {
+        "id": "csv1",
+        "path": "r2://company-intel-data/raw/file1.csv",
+        "delimiter": "\t",
+        "columns": 10
+      },
+      {
+        "id": "csv2",
+        "path": "r2://company-intel-data/raw/file2.csv",
+        "delimiter": "\t",
+        "columns": 13
+      }
+    ]
+  },
+  "counters": {
+    "rowsRead": 39505,
+    "rowsRejected": 1376,
+    "uniqueCompanies": 0,
+    "uniqueContacts": 0,
+    "duplicateRowsResolved": 0,
+    "duplicateCompaniesResolved": 0,
+    "ambiguousCompanies": 0,
+    "recordsMissingCompanyId": 19562,
+    "perSource": {
+      "csv1": {
+        "rowsRead": 19505,
+        "rowsRejected": 900,
+        "companies": 0,
+        "contacts": 0
+      },
+      "csv2": {
+        "rowsRead": 20000,
+        "rowsRejected": 476,
+        "companies": 0,
+        "contacts": 0
+      }
+    }
+  }
+}

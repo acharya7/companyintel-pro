@@ -325,9 +325,10 @@ export const companySchema = z.object({
   ambiguous: z.boolean().optional(),
   associations: associationCountsSchema.optional(),
   /**
-   * Unmapped source columns, verbatim. Part of the contract on purpose: the
-   * response is parsed with Zod, which strips unknown keys, so a field the client
-   * is meant to display has to be declared here or it silently disappears.
+   * Every source column of the record, verbatim and in full (long values included).
+   * Part of the contract on purpose: the response is parsed with Zod, which strips
+   * unknown keys, so a field the client is meant to display has to be declared
+   * here or it silently disappears.
    */
   attributes: z.record(z.string(), z.string()).optional(),
 });
@@ -348,7 +349,7 @@ export const contactSchema = z.object({
   country: z.string().optional(),
   state: z.string().optional(),
   city: z.string().optional(),
-  /** Unmapped source columns, verbatim (see `companySchema.attributes`). */
+  /** Every source column, verbatim and in full (see `companySchema.attributes`). */
   attributes: z.record(z.string(), z.string()).optional(),
   source: sourceRefSchema,
   association: associationRecordSchema.optional(),

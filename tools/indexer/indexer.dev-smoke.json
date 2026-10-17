@@ -1,0 +1,77 @@
+{
+  "$comment": [
+    "CompanyIntel — SMOKE-TEST config for the full-index pipeline.",
+    "",
+    "Identical sources and mapping overrides to indexer.dev-full.json, but its own",
+    "work/output directories and a small partition/shard layout, so it can run in a",
+    "few seconds on a machine that cannot hold the full corpus. Its purpose is to",
+    "exercise EVERY stage of `bun run index:full` (dependency and source-version",
+    "checks, preflight, Pass 1, Pass 2, validation, coverage labelling, summary)",
+    "without touching the verified development or benchmark artifacts.",
+    "",
+    "It is also what tests/full-index-pipeline.test.ts runs against, so the operator",
+    "path and the tested path are the same one.",
+    "",
+    "Run:  bun scripts/full-index.mjs --config tools/indexer/indexer.dev-smoke.json \\",
+    "        --version dev-smoke-<date> --sample 2000 --no-upload --yes",
+    "",
+    "A SAMPLE, not the dataset: the pipeline labels it PARTIAL and refuses to activate it."
+  ],
+  "datasetVersion": "dev-smoke",
+  "sources": [
+    {
+      "id": "csv1",
+      "path": "r2://company-intel-data/raw/file1.csv",
+      "encoding": "utf-8",
+      "delimiter": "\t",
+      "columns": {
+        "companyid": "organization_id",
+        "companyname": "organization_name",
+        "companydomain": "organization_domain",
+        "companywebsite": "organization_website_url",
+        "industry": "organization_industries",
+        "companysize": "organization_num_current_employees",
+        "companyrevenue": "organization_revenue_in_thousands_int",
+        "companycity": "organization_hq_location_city",
+        "companystate": "organization_hq_location_state",
+        "companycountry": "organization_hq_location_country"
+      }
+    },
+    {
+      "id": "csv2",
+      "path": "r2://company-intel-data/raw/file2.csv",
+      "encoding": "utf-8",
+      "delimiter": "\t",
+      "columns": {
+        "contactname": "person_name",
+        "firstname": "person_first_name_unanalyzed",
+        "lastname": "person_last_name_unanalyzed",
+        "jobtitle": "person_title",
+        "seniority": "person_seniority",
+        "department": "person_functions",
+        "email": "person_email",
+        "phone": "person_phone",
+        "linkedin": "person_linkedin_url",
+        "contactcity": "person_location_city",
+        "contactstate": "person_location_state",
+        "contactcountry": "person_location_country",
+        "companyname": "sanitized_organization_name_unanalyzed"
+      }
+    }
+  ],
+  "workDir": ".indexer-dev-work-smoke",
+  "outputDir": ".indexer-dev-output-smoke",
+  "rawCacheDir": null,
+  "partitions": 8,
+  "shards": {
+    "exact": 8,
+    "prefix": 8,
+    "token": 8,
+    "trigram": 8,
+    "ids": 8
+  },
+  "upload": {
+    "enabled": false,
+    "bucket": "company-intel-data"
+  }
+}

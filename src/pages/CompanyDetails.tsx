@@ -34,6 +34,7 @@ import {
   FacetList,
   InfoRow,
   LoadingBlock,
+  LongText,
   PageHeader,
   Pager,
   Section,
@@ -132,7 +133,7 @@ export default function CompanyDetails() {
   }
 
   const record = company.data!.company;
-  /** Unmapped source columns of this company row (see the "All source fields" section). */
+  /** Every source column of this company record (see the "All source fields" section). */
   const capturedAttributes = Object.entries(record.attributes ?? {});
   const rows = contacts.data?.contacts ?? [];
   const allSelected = rows.length > 0 && rows.every((contact) => selected.has(contact.id));
@@ -309,17 +310,17 @@ export default function CompanyDetails() {
 
         {capturedAttributes.length ? (
           /*
-           * Every OTHER column of the source row.
+           * EVERY column of the source row, verbatim — mapped columns included.
            *
            * The section above shows the fields the application has a canonical place
-           * for; this one shows the rest of the record — the industry codes, employee
-           * counts and source-specific columns that used to be dropped on the floor.
-           * Each value is copyable and a URL is clickable, and nothing is truncated
-           * by the UI (the indexer bounds a value's length when it captures it).
+           * for; this one shows the whole record: the industry codes, employee counts,
+           * domains, descriptions and source-specific columns that used to be dropped.
+           * The indexer stores each value in full, so a long description is collapsed
+           * here for readability and expanded in place — never shortened in storage.
            */
           <Section
             title="All source fields"
-            description={`${capturedAttributes.length} additional columns exactly as the source row carries them`}
+            description={`${capturedAttributes.length} source columns, exactly as the source record carries them`}
           >
             <dl className="divide-y divide-border/60">
               {capturedAttributes.map(([label, value]) => (
@@ -328,10 +329,10 @@ export default function CompanyDetails() {
                     <span className="min-w-0 break-words">
                       {/^https?:\/\//i.test(value) ? (
                         <a className="text-primary hover:underline" href={value} target="_blank" rel="noreferrer noopener">
-                          {value}
+                          <LongText text={value} limit={120} />
                         </a>
                       ) : (
-                        value
+                        <LongText text={value} />
                       )}
                     </span>
                     <Button

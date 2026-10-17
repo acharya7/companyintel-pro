@@ -32,10 +32,12 @@ import {
   publishVersion,
   runIndex,
   uploadOutput,
+  verifyRemoteObjects,
+  verifyRemoteVersion,
   type IndexerConfig,
   type ProgressEvent,
 } from "./build";
-import { credentialsFromEnv } from "./r2";
+import { R2Client, credentialsFromEnv } from "./r2";
 import { adoptSpool, inspectSpool, spoolManifestPathFor, type SpoolInspection } from "./spool";
 import {
   defaultExperimentalOutputDir,
@@ -748,6 +750,45 @@ async function cmdValidate(config: IndexerConfig, flags: Record<string, string |
   console.log(`  recorded verdict  ${validation ? (validation.passed ? "passed" : "FAILED") : "not recorded"}`);
   for (const failure of failures.slice(0, 25)) console.log(`  ! ${failure}`);
   if (failures.length) process.exitCode = 1;
+
+  /*
+   * `--remote` additionally reads every object back FROM R2 and compares content.
+   * A local re-hash proves the files still match their own record; it says nothing
+   * about the bucket. This is the check that makes "uploaded" mean "uploaded
+   * intact", and it is what the full-index pipeline runs before activating.
+   */
+  if (flags.remote) {
+    const credentials = credentialsFromEnv(config.upload?.bucket);
+    if (!credentials) {
+      console.error("\n--remote needs R2 credentials (R2_* variables or .r2-credentials.json).");
+      process.exitCode = 1;
+      return;
+    }
+    const client = new R2Client(credentials);
+    const objects = lines.map((line) => JSON.parse(line) as { key: string; bytes: number });
+    const offset = Number(typeof flags.offset === "string" ? flags.offset : 0) || 0;
+    const limit = Number(typeof flags.limit === "string" ? flags.limit : objects.length) || objects.length;
+    console.log(`\nRemote verification of ${version} (R2)…`);
+    const remote = await verifyRemoteObjects(client, objects, {
+      outputDir: resolve(config.outputDir),
+      offset,
+      limit,
+      onProgress: (done, total) => {
+        if (done % 50 === 0) console.log(`  verified ${done}/${total} from R2`);
+      },
+    });
+    console.log(`  read back         ${remote.checked} object(s), ${(remote.bytes / 1e6).toFixed(1)} MB`);
+    for (const problem of remote.problems.slice(0, 25)) console.log(`  ! ${problem.key} — ${problem.problem}`);
+    if (remote.problems.length) {
+      console.log(`  ${remote.problems.length} remote problem(s) — do NOT activate this version.`);
+      process.exitCode = 1;
+      return;
+    }
+    // The pointer may only be flipped when R2 also holds the manifest and report.
+    const { objectCount, bytes } = await verifyRemoteVersion(client, version);
+    console.log(`  uploaded manifest  ${objectCount} object(s), ${(bytes / 1e6).toFixed(1)} MB recorded, validation passed`);
+    console.log(`  remote verdict     intact`);
+  }
 }
 
 async function cmdPublish(config: IndexerConfig, flags: Record<string, string | boolean>): Promise<void> {
@@ -757,17 +798,24 @@ async function cmdPublish(config: IndexerConfig, flags: Record<string, string | 
     process.exitCode = 1;
     return;
   }
+  /*
+   * A LOCAL validation report is a fast, early refusal — but it is not proof: the
+   * version can be absent from R2, or half-uploaded, and the local directory can
+   * have been deleted since. `publishVersion` therefore verifies the uploaded
+   * manifest and validation report before it flips the pointer, so publishing from
+   * another machine (or after cleaning up the output) is safe as well.
+   */
   const validationPath = resolve(config.outputDir, `manifests/${version}/validation.json`);
-  if (!existsSync(validationPath)) {
-    console.error(`No validation report for ${version}. Run the indexer (and validate) first.`);
-    process.exitCode = 1;
-    return;
-  }
-  const validation = JSON.parse(await readFile(validationPath, "utf8")) as { passed: boolean };
-  if (!validation.passed) {
-    console.error(`Version ${version} did not pass validation and will not be published.`);
-    process.exitCode = 1;
-    return;
+  if (existsSync(validationPath)) {
+    const validation = JSON.parse(await readFile(validationPath, "utf8")) as { passed: boolean };
+    if (!validation.passed) {
+      console.error(`Version ${version} did not pass local validation and will not be published.`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`Local validation report for ${version} passed; verifying the uploaded copy in R2…`);
+  } else {
+    console.log(`No local output for ${version}; relying on the validation report uploaded with it.`);
   }
   const credentials = credentialsFromEnv(config.upload?.bucket);
   if (!credentials) {
@@ -777,8 +825,18 @@ async function cmdPublish(config: IndexerConfig, flags: Record<string, string | 
     process.exitCode = 1;
     return;
   }
-  await publishVersion(version, config.upload?.bucket);
-  console.log(`Published ${version}. The previous version remains in R2 and can be reactivated from the Dataset page.`);
+  try {
+    const { previousVersion } = await publishVersion(version, config.upload?.bucket);
+    console.log(
+      `Published ${version}. ` +
+        (previousVersion
+          ? `The previous version ${previousVersion} remains in R2 and can be reactivated from the Dataset page.`
+          : "There was no previous active version."),
+    );
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  }
 }
 
 function usage(): void {
@@ -831,6 +889,10 @@ Flags
   --check-only        pass2-from-spool: validate the spool and prepare the isolated
                       bookkeeping, then stop before merging anything
   --upload            upload generated objects to R2
+  --remote            validate: also read every object back FROM R2 and compare content
+                      (with --offset/--limit to bound one call)
+  --offset <n>        validate --remote: first object to verify
+  --limit <n>         validate --remote: how many objects to verify in this call
   --yes               confirm a publish operation
 
 Example (Windows PowerShell)

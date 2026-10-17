@@ -1,0 +1,86 @@
+{
+  "identity": {
+    "version": "dev-smoke-20261017",
+    "sampleLimit": 2000,
+    "partitions": 8,
+    "sources": [
+      {
+        "id": "csv1",
+        "path": "r2://company-intel-data/raw/file1.csv",
+        "delimiter": "\t",
+        "columns": 10
+      },
+      {
+        "id": "csv2",
+        "path": "r2://company-intel-data/raw/file2.csv",
+        "delimiter": "\t",
+        "columns": 13
+      }
+    ]
+  },
+  "complete": true,
+  "createdAt": "2026-10-17T09:48:11.866Z",
+  "partitions": [
+    {
+      "file": "part-0000.jsonl",
+      "partition": 0,
+      "bytes": 1439931,
+      "lines": 424,
+      "sha256": "1a6ab2948505d8a08e79ab43ac7bfd0c8217ae7924e86fcdad1bb3bb1003ccab"
+    },
+    {
+      "file": "part-0001.jsonl",
+      "partition": 1,
+      "bytes": 1602753,
+      "lines": 470,
+      "sha256": "a42e0b1df486bafccbb732c00d6a2e08ebefda5ad19a7cc7801f41c1f1e71b8e"
+    },
+    {
+      "file": "part-0002.jsonl",
+      "partition": 2,
+      "bytes": 1733459,
+      "lines": 511,
+      "sha256": "88d98f0bce9fdd0d66ab1a6f47f2b58c14242a5a2edbde22e2b514962f04ea29"
+    },
+    {
+      "file": "part-0003.jsonl",
+      "partition": 3,
+      "bytes": 1694521,
+      "lines": 489,
+      "sha256": "eea0c5a0227d12daa5b4ada64fd40bc8a82749e6e27c9d901abff7dc29109def"
+    },
+    {
+      "file": "part-0004.jsonl",
+      "partition": 4,
+      "bytes": 1649463,
+      "lines": 481,
+      "sha256": "c2abd305cb0484e82e903d8fc71cebf230a2bd7118e0da3ee6c2df423b7ed829"
+    },
+    {
+      "file": "part-0005.jsonl",
+      "partition": 5,
+      "bytes": 1635521,
+      "lines": 455,
+      "sha256": "220a98b895f15e1f2695602c1b6963d85d1cf3a81b3a3a70c9fac29bb4e12197"
+    },
+    {
+      "file": "part-0006.jsonl",
+      "partition": 6,
+      "bytes": 1655102,
+      "lines": 469,
+      "sha256": "a891b7aaf68e059b361f4a5efbf57d421e8eeaace9a62f091f0e7bf334884b96"
+    },
+    {
+      "file": "part-0007.jsonl",
+      "partition": 7,
+      "bytes": 1650414,
+      "lines": 479,
+      "sha256": "6577296e48e7033b760c211062eeb25f81556eb45bc5d62811863c8eb48a6194"
+    }
+  ],
+  "totals": {
+    "files": 8,
+    "lines": 3778,
+    "bytes": 13061164
+  }
+}

@@ -26,7 +26,7 @@ import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, type Wri
 import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { cpus, freemem, totalmem } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
-import { gzipSync } from "node:zlib";
+import { gunzipSync, gzipSync } from "node:zlib";
 
 import type { AssociationCounts, Company, Contact, DatasetStats, DatasetVersionSummary, FacetBucket, IndexingCounters, SourceRef, UnassignedContact } from "../../../src/shared/models";
 import { NO_CLAIM_REF, associateContact, type AssociationCandidate, type AssociationRecord } from "../../../src/shared/association";
@@ -64,6 +64,7 @@ import {
   accumulateFacets,
   partitionFor,
   pickCanonicalKey,
+  mergeAttributes,
   type RawContactInput,
   type RawCompanyInput,
 } from "./mapping";
@@ -1112,7 +1113,22 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   const spoolDir = options.spoolImport?.spoolDir ?? join(workDir, "spool");
   const shardDir = join(workDir, "shards");
   const checkpointPath = join(workDir, "checkpoint.json");
-  const diskFloorBytes = options.diskFloorBytes ?? DISK_FLOOR_BYTES;
+  /*
+   * Free-space floor for the merge.
+   *
+   * An explicit `--disk-floor` always wins. Otherwise the default is ADAPTIVE: a flat
+   * 512 MB reserve is the right protection for a run whose output is gigabytes, but it
+   * is meaningless for a run whose whole output is 3 MB — it would refuse to finish on
+   * a volume that is merely busy, which is how a full-but-healthy disk turns into a
+   * failed build. The floor is therefore the smaller of the configured default and
+   * 1.5x this run's own estimated output, with a 16 MB absolute minimum so a run can
+   * never grind the volume to zero.
+   */
+  const adaptiveFloorBytes = Math.min(
+    DISK_FLOOR_BYTES,
+    Math.max(16 * 1024 * 1024, Math.round(report.estimatedOutputBytes * 1.5)),
+  );
+  const diskFloorBytes = options.diskFloorBytes ?? adaptiveFloorBytes;
   const resume = options.resume !== false;
   const stored: CheckpointFile | null = resume && existsSync(checkpointPath) ? await readCheckpoint(checkpointPath) : null;
   const identity = identityFor(config, options.sampleLimit);
@@ -1668,6 +1684,17 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
             normalizedName: row.normalizedName,
           };
           groups.set(decision.ref, group);
+        } else {
+          /*
+           * A later row for an existing company must not lose its columns.
+           *
+           * The group's canonical input stays first-row-wins (that is the identity
+           * evidence), but the captured attributes are unioned: a company seen in
+           * both source files, or twice in one file, carries every column of every
+           * row. `mergeAttributes` keeps a surname-free header for the first value
+           * and suffixes only genuine collisions.
+           */
+          group.input.attributes = mergeAttributes(group.input.attributes, row.company.attributes, row.source.source);
         }
         for (const key of row.keys) group.keys.add(key);
         const sourceKey = `${row.source.source}\u0000${row.source.row}`;
@@ -2369,17 +2396,64 @@ export interface UploadResult {
 }
 
 /** Upload generated objects, skipping any object that is already identical. */
-export async function uploadOutput(config: IndexerConfig, result: RunResult, onProgress?: (message: string) => void): Promise<UploadResult> {
-  const credentials = credentialsFromEnv(config.upload?.bucket);
-  if (!credentials) {
-    throw new Error(
-      "R2 credentials are not set. Export R2_ACCOUNT_ID, R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY, or upload the output directory with rclone instead.",
-    );
+/**
+ * The slice of `R2Client` the upload and publish paths use.
+ *
+ * Declared as an interface so the ordering and rollback rules can be tested against a
+ * fake bucket instead of only against the network — the properties that matter here
+ * (manifests go last, the pointer is only flipped after R2 confirms the version) are
+ * exactly the ones that are expensive to get wrong.
+ */
+export interface R2WriteClient {
+  head(key: string): Promise<{ exists: boolean; size?: number | null }>;
+  get(key: string): Promise<{ ok: boolean; status?: number; json: () => Promise<unknown> }>;
+  put(
+    key: string,
+    body: Uint8Array | string,
+    contentType?: string,
+    retries?: number,
+    options?: { contentEncoding?: string },
+  ): Promise<unknown>;
+  putJson(key: string, value: unknown, cacheable?: boolean): Promise<unknown>;
+}
+
+export async function uploadOutput(
+  config: IndexerConfig,
+  result: RunResult,
+  onProgress?: (message: string) => void,
+  clientOverride?: R2WriteClient,
+): Promise<UploadResult> {
+  let client: R2WriteClient;
+  if (clientOverride) {
+    client = clientOverride;
+  } else {
+    const credentials = credentialsFromEnv(config.upload?.bucket);
+    if (!credentials) {
+      throw new Error(
+        "R2 credentials are not set. Export R2_ACCOUNT_ID, R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY, or upload the output directory with rclone instead.",
+      );
+    }
+    client = new R2Client(credentials);
   }
-  const client = new R2Client(credentials);
   const output: UploadResult = { uploaded: 0, skipped: 0, bytes: 0 };
 
-  for (const object of result.objects) {
+  /*
+   * Upload the manifests LAST, always.
+   *
+   * `publish` and the Dataset page both treat the presence of
+   * `manifests/<version>/manifest.json` as "this version is complete". Uploading it
+   * in the middle of a 1,800-object run would make a half-uploaded version look
+   * activatable if the process died — so the ordering is enforced here rather than
+   * left to how `writer.objects` happens to be ordered. Within each group the order
+   * stays the writer's (deterministic), so a resumed upload still skips what exists.
+   */
+  const manifestPrefix = `manifests/${config.datasetVersion}/`;
+  const orderedObjects = [
+    ...result.objects.filter((object) => !object.key.startsWith(manifestPrefix)),
+    ...result.objects.filter((object) => object.key.startsWith(manifestPrefix)),
+  ];
+
+  for (const object of orderedObjects) {
     const existing = await client.head(object.key);
     if (existing.exists && existing.size === object.bytes) {
       output.skipped += 1;
@@ -2422,16 +2496,146 @@ export async function uploadOutput(config: IndexerConfig, result: RunResult, onP
 }
 
 /**
+ * Read every uploaded object back and compare its CONTENT with what the run wrote.
+ *
+ * `validate` alone only proves the local files still match their own record: it says
+ * nothing about the bucket. This is the step that makes "uploaded" mean "uploaded
+ * intact", and it is what the full-index pipeline runs before it activates anything.
+ *
+ * The comparison is defined on CONTENT, not stored bytes. `objects.jsonl` records the
+ * hash of the file the indexer wrote, which for a gzipped payload is the hash of the
+ * COMPRESSED bytes; R2 decodes a `content-encoding: gzip` object at the edge and the
+ * HTTP client may decode again, so the same object legitimately comes back compressed
+ * or plain. The only reliable signal is the magic bytes (1f 8b), so both sides are
+ * normalised with it and then hashed.
+ */
+export async function verifyRemoteObjects(
+  client: {
+    get: (key: string) => Promise<{ ok: boolean; status?: number; arrayBuffer: () => Promise<ArrayBuffer> }>;
+    head: (key: string) => Promise<{ exists: boolean; size?: number | null }>;
+  },
+  objects: { key: string; bytes: number }[],
+  options: { outputDir: string; offset?: number; limit?: number; onProgress?: (checked: number, total: number) => void },
+): Promise<{ checked: number; bytes: number; problems: { key: string; problem: string }[] }> {
+  const offset = options.offset ?? 0;
+  const limit = options.limit ?? objects.length;
+  const problems: { key: string; problem: string }[] = [];
+
+  const normalisedHash = (buffer: Uint8Array) => {
+    const isGzip = buffer.length > 2 && buffer[0] === 0x1f && buffer[1] === 0x8b;
+    const plain = isGzip ? new Uint8Array(gunzipSync(buffer)) : buffer;
+    return createHash("sha256").update(plain).digest("hex");
+  };
+
+  let checked = 0;
+  let bytes = 0;
+  for (const object of objects.slice(offset, offset + limit)) {
+    const localPath = join(options.outputDir, object.key);
+    if (!existsSync(localPath)) {
+      problems.push({ key: object.key, problem: "not in the local output directory" });
+      continue;
+    }
+    let local: Uint8Array;
+    try {
+      local = new Uint8Array(await readFile(localPath));
+    } catch (error) {
+      problems.push({ key: object.key, problem: `local read failed: ${error instanceof Error ? error.message : error}` });
+      continue;
+    }
+    const head = await client.head(object.key);
+    if (!head.exists) {
+      problems.push({ key: object.key, problem: "missing from R2" });
+      continue;
+    }
+    if (head.size !== object.bytes) {
+      problems.push({ key: object.key, problem: `size ${head.size ?? "?"} on R2, ${object.bytes} expected` });
+      continue;
+    }
+    const response = await client.get(object.key);
+    if (!response.ok) {
+      problems.push({ key: object.key, problem: `read failed (HTTP ${response.status ?? "?"})` });
+      continue;
+    }
+    const remote = new Uint8Array(await response.arrayBuffer());
+    if (normalisedHash(remote) !== normalisedHash(local)) {
+      problems.push({ key: object.key, problem: "content differs from the local object" });
+      continue;
+    }
+    bytes += object.bytes;
+    checked += 1;
+    options.onProgress?.(checked, objects.length);
+  }
+  return { checked, bytes, problems };
+}
+
+/**
+ * Confirm a version is actually complete in R2 before anything points at it.
+ *
+ * `publish` used to trust the LOCAL validation report. That is wrong in two ways
+ * that both end with the application serving nothing: the output directory can have
+ * been deleted since the upload, and a version can be half-uploaded. Both are
+ * questions only R2 can answer, so they are asked here — the uploaded manifest has
+ * to exist and say the version passed, and the uploaded validation report has to
+ * agree.
+ */
+export async function verifyRemoteVersion(
+  client: { get: (key: string) => Promise<{ ok: boolean; json: () => Promise<unknown> }> },
+  version: string,
+): Promise<{ objectCount: number; bytes: number }> {
+  const manifestResponse = await client.get(`manifests/${version}/manifest.json`);
+  if (!manifestResponse.ok) {
+    throw new Error(
+      `Version ${version} is not complete in R2: manifests/${version}/manifest.json is missing. ` +
+        "The upload never finished, or nothing was uploaded for this version. Nothing was activated.",
+    );
+  }
+  const manifest = (await manifestResponse.json()) as {
+    version?: string;
+    validationPassed?: boolean;
+    objectCount?: number;
+    bytes?: number;
+  };
+  if (manifest.version && manifest.version !== version) {
+    throw new Error(`manifests/${version}/manifest.json describes version ${manifest.version}. Nothing was activated.`);
+  }
+  if (manifest.validationPassed === false) {
+    throw new Error(`Version ${version} recorded a FAILED validation in R2 and cannot be activated.`);
+  }
+
+  const validationResponse = await client.get(`manifests/${version}/validation.json`);
+  if (!validationResponse.ok) {
+    throw new Error(
+      `Version ${version} has no uploaded validation report (manifests/${version}/validation.json). Nothing was activated.\n` +
+        `  Re-run the upload: bun run index:full -- --version ${version} --upload-only --yes`,
+    );
+  }
+  const validation = (await validationResponse.json()) as { passed?: boolean };
+  if (validation.passed !== true) {
+    throw new Error(`Version ${version} did not pass the validation report stored in R2. Nothing was activated.`);
+  }
+  return { objectCount: Number(manifest.objectCount ?? 0), bytes: Number(manifest.bytes ?? 0) };
+}
+
+/**
  * Publish a validated version by flipping the active pointer.
  *
  * The current pointer is read first so the version that was serving becomes
  * `previousVersion`: without that, the Dataset page would have no rollback
  * target and a bad publish could not be reverted in one click.
  */
-export async function publishVersion(version: string, bucket?: string): Promise<{ previousVersion: string | null }> {
-  const credentials = credentialsFromEnv(bucket);
-  if (!credentials) throw new Error("R2 credentials are not set, so the active version cannot be published.");
-  const client = new R2Client(credentials);
+export async function publishVersion(
+  version: string,
+  bucket?: string,
+  clientOverride?: R2WriteClient,
+): Promise<{ previousVersion: string | null }> {
+  let client: R2WriteClient;
+  if (clientOverride) {
+    client = clientOverride;
+  } else {
+    const credentials = credentialsFromEnv(bucket);
+    if (!credentials) throw new Error("R2 credentials are not set, so the active version cannot be published.");
+    client = new R2Client(credentials);
+  }
 
   let previousVersion: string | null = null;
   try {
@@ -2444,6 +2648,9 @@ export async function publishVersion(version: string, bucket?: string): Promise<
   } catch {
     // A missing or unreadable pointer simply means there is nothing to roll back to.
   }
+
+  // Ask R2, not the local directory.
+  await verifyRemoteVersion(client, version);
 
   await client.putJson(
     "manifests/active.json",

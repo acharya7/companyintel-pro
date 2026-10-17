@@ -45,69 +45,107 @@ export {
 } from "../../../src/shared/headers";
 
 /**
- * One source column that is not part of the canonical model.
+ * One source column, captured verbatim onto the record.
  *
  * Captured columns are what make "all available source fields" true rather than
  * aspirational: the canonical mapping covers the fields the app searches, filters
- * and ranks on, and every OTHER column of the row is carried alongside the record
- * so a detail page can show it (§ 11 of the specification).
+ * and ranks on, and EVERY column of the row — mapped or not — is carried alongside
+ * the record so a detail page can show the complete original row (§ 11 of the
+ * specification).
+ *
+ * Mapped columns are captured too, on purpose: the canonical field is normalised
+ * (a company name is legal-suffix-stripped, a phone number is tidied), so without
+ * the raw column the original value would be lost. `organization_name` and
+ * `name` therefore coexist, and the raw one is authoritative for display.
  */
 export interface CapturedColumn {
   /** Position in the source record. */
   index: number;
-  /** Human-readable label derived from the file's own header. */
+  /**
+   * The file's own header text, verbatim — the reversible field mapping.
+   *
+   * A header that appears twice gets `#2`, `#3`, … appended to the second and
+   * later occurrences, in file order, so a collision can never overwrite a value.
+   */
   label: string;
 }
 
 /**
- * Ceilings on the captured attributes of one record.
+ * Every column of a record, keyed by the file's own header text.
  *
- * A cap is necessary rather than nice: with no bound, one source column holding a
- * 100 KB JSON blob would be copied into every row of a 10 GB file. 80 columns and
- * 400 characters per value cover the schemas this project ingests (51 company / 39
- * contact columns) with room to spare, and a truncated value is marked as such by
- * the interface instead of being silently cut.
- */
-export const MAX_CAPTURED_FIELDS = 80;
-export const MAX_CAPTURED_VALUE_LENGTH = 400;
-
-/**
- * Every column of a record that is not already an index key.
+ * There is no column cap: the source schemas are 51 company and 39 contact
+ * columns, and dropping one would lose a field the user asked to see. The values
+ * are stored in full (see `captureAttributes`) — the measured longest values in
+ * the real corpus are ~3.5 KB (`organization_all_possible_domains`) and ~3 KB
+ * (`organization_short_description`), which a record can hold without any
+ * truncation.
  *
- * `mappedIndexes` is the set of positions the canonical field map consumed, so the
- * label shown for a captured column is exactly what the file calls it (tidied for
- * display), never an invented name.
+ * `_map` is accepted for call-site compatibility: it used to decide which columns
+ * were "already covered" by the canonical model. They are captured now as well.
  */
-export function capturedColumns(headers: string[], map: Record<string, number>): CapturedColumn[] {
-  const mapped = new Set(Object.values(map));
+export function capturedColumns(headers: string[], _map?: Record<string, number>): CapturedColumn[] {
+  // Kept for call-site compatibility only; see the doc comment above.
+  void _map;
   const out: CapturedColumn[] = [];
-  const seenLabels = new Set<string>();
+  const occurrences = new Map<string, number>();
   for (let index = 0; index < headers.length; index += 1) {
-    if (mapped.has(index)) continue;
     const header = (headers[index] ?? "").trim();
     if (!header) continue;
-    const label = header.replace(/[_-]+/g, " ").replace(/\s+/g, " ").trim();
-    if (!label || seenLabels.has(label.toLowerCase())) continue;
-    seenLabels.add(label.toLowerCase());
-    out.push({ index, label });
-    if (out.length >= MAX_CAPTURED_FIELDS) break;
+    const seen = (occurrences.get(header) ?? 0) + 1;
+    occurrences.set(header, seen);
+    out.push({ index, label: seen === 1 ? header : `${header}#${seen}` });
   }
   return out;
 }
 
-/** Values of the captured columns of one row, with empty cells omitted. */
+/**
+ * Values of every captured column of one row, verbatim and unbounded.
+ *
+ * Empty cells are omitted rather than stored as `""` — a TSV cannot distinguish
+ * "this cell is empty" from "this row stopped early", and storing 51 empty strings
+ * on every record would cost more than the data. What IS preserved is every value
+ * the source actually carried, at full length: no ellipsis, no character cap.
+ */
 export function captureAttributes(record: string[], columns: CapturedColumn[]): Record<string, string> | undefined {
   if (!columns.length) return undefined;
   const attributes: Record<string, string> = {};
   for (const column of columns) {
     const raw = record[column.index];
     if (raw === undefined || raw === null) continue;
-    let value = String(raw).trim();
+    const value = String(raw).trim();
     if (!value) continue;
-    if (value.length > MAX_CAPTURED_VALUE_LENGTH) value = `${value.slice(0, MAX_CAPTURED_VALUE_LENGTH)}…`;
     attributes[column.label] = value;
   }
   return Object.keys(attributes).length ? attributes : undefined;
+}
+
+/**
+ * Union two captured attribute maps without losing either side.
+ *
+ * A company can be built from rows of BOTH source files, and the two files use
+ * different header names — but where they do collide (or two rows of one file
+ * carry different values for the same column) one of the two values must not be
+ * dropped. The existing value stays under its own header, and the conflicting one
+ * is kept under `<header> (source <id>)`, which is deterministic and traceable.
+ */
+export function mergeAttributes(
+  existing: Record<string, string> | undefined,
+  incoming: Record<string, string> | undefined,
+  sourceId: string,
+): Record<string, string> | undefined {
+  if (!incoming) return existing;
+  if (!existing) return { ...incoming };
+  const merged = { ...existing };
+  for (const [label, value] of Object.entries(incoming)) {
+    if (!(label in merged)) {
+      merged[label] = value;
+      continue;
+    }
+    if (merged[label] === value) continue;
+    const suffixed = `${label} (source ${sourceId})`;
+    merged[suffixed] = value;
+  }
+  return merged;
 }
 
 export interface RawCompanyInput {

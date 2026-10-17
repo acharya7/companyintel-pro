@@ -183,24 +183,37 @@ bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.dev-full.json \
   --sample 20000 --version dev-r2-20k-full-20261017 --disk-floor 150
 ```
 
-### What a record carries: every source column
+### What a record carries: every source column, in full
 
-The canonical model holds the fields the application searches, filters and ranks on. **Every other
-column of the source row is captured on the record** as `attributes` (`Record<label, value>`), by
+The canonical model holds the fields the application searches, filters and ranks on. **Every column
+of the source row is captured on the record** as `attributes` (`Record<label, value>`), by
 `capturedColumns` / `captureAttributes` in `tools/indexer/src/mapping.ts`:
 
-* only columns the canonical map did NOT consume are captured (nothing is duplicated),
-* empty cells are omitted — the record carries the values the row actually has,
-* each value is trimmed and cut at 400 characters, and a cut value ends with `…`,
-* at most 80 columns per record (`MAX_CAPTURED_FIELDS`),
-* the label is the file's own header text, tidied for display (`organization_founded_year` →
-  `organization founded year`) — never a renamed or invented field.
+* every column is captured — mapped ones included, because the canonical field is normalised (a
+  company name loses its legal suffix, a phone number is tidied) and the raw value would otherwise
+  be lost. `organization_name` and `name` therefore coexist;
+* values are stored **in full**: there is no character cap and no ellipsis. The real corpus' longest
+  columns are `organization_all_possible_domains` (3,539 characters), `organization_short_description`
+  (3,011), `organization_current_technologies` (2,841) and `job_functions` (1,164) — all preserved;
+* there is **no column cap** (the sources are 51 and 39 columns); a file with 120 columns keeps 120;
+* the key is the file's **own header text, verbatim**, so the mapping is reversible. A duplicate
+  header becomes `header#2`, `header#3` in file order instead of overwriting the first value;
+* a company built from rows of both files unions their attributes; where the two rows disagree on a
+  value the second one is kept as `<header> (source <id>)`, so nothing is dropped;
+* empty cells are omitted — a TSV cannot distinguish an empty cell from a row that stopped early,
+  and storing 51 empty strings per record would cost more than the data itself.
 
-Both detail screens render them (`CompanyDetails`, `ContactDetails`) with a copy button per value
-and clickable URLs, so a 51-column company row or a 39-column contact row is fully readable instead
-of being reduced to the dozen canonical fields. Captured columns are part of the shared API contract
-(`companySchema.attributes` / `contactSchema.attributes`), because responses are parsed with Zod and
-an undeclared field would be silently dropped.
+Both detail screens render them (`CompanyDetails`, `ContactDetails`) with a copy button per value,
+clickable URLs, and a collapse/expand control for long text, so a 51-column company row or a 39-column
+contact row is fully readable instead of being reduced to the dozen canonical fields. Captured columns
+are part of the shared API contract (`companySchema.attributes` / `contactSchema.attributes`), because
+responses are parsed with Zod and an undeclared field would be silently dropped.
+
+Search stays cheap because a search result is a **summary**, not a record: `CompanySearchHit` and
+`ContactSearchHit` carry the fields a result row shows, and the full attribute map is only returned by
+`GET /api/companies/:id` and `GET /api/contacts/:id`. Partition objects are the unit of read (250
+companies or 1,000 companies' contacts), so the long values cost bytes only on the detail page that
+actually shows them.
 
 
 `--sample <n>` applies per source, so both schemas are always represented in a sample run — and in

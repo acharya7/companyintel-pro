@@ -1,0 +1,204 @@
+
+-- 1/20 dependencies
+bun 1.4.2
+dependencies present
+
+-- 2/20 source version
+source version: d57906404b30 (working tree has uncommitted changes)
+
+-- 3/20 cost expectation
+cost estimate (R2 Standard, from Cloudflare's published prices):
+  a full index is expected in the 9–20 GB range (preflight prints its own estimate). At 20 GB:
+    storage        ~$0.30/month
+    one upload     ~$0.05 of Class A writes (≈12,000 objects at ~1.7 MB each)
+    one read pass  ~$0.0043 of Class B reads
+  egress is free, and search only ever reads shards and partitions, never the source objects.
+
+-- 4/20 resume state
+no checkpoint: this run starts from Pass 1 (both sources are read end to end)
+
+Preflight
+  ok   csv1  10.22 GB  r2://company-intel-data/raw/file1.csv
+  ok   csv2  54.04 GB  r2://company-intel-data/raw/file2.csv
+  input total          64.26 GB
+  free disk            0.41 GB
+  temporary space need 0.35 GB
+    spool               0.00 GB  (canonical rows written by pass 1)
+    raw cache staging   0.01 GB  (largest Mode B .part alive at once)
+    index output        0.00 GB  (written during pass 2, same volume by default)
+    run bookkeeping     0.27 GB  (checkpoint, spool manifest, rejected/objects lists)
+    safety margin       x1.25 applied to the four terms above
+  estimated output     0.00 GB
+  memory free / total  1.23 GB / 2.09 GB
+  cpu cores            1
+  ! Budget 0.0 GB for the Mode B raw-cache staging file as well as 0.0 GB for the spool: they are alive at the same time. Setting `rawCacheDir` to null removes that term and costs a re-download on resume.
+  sample               2,000 records per source (temporary space estimated from this, not from the full input)
+  duration estimate    ~1 s at 5,000 rows/s — the MEASURED end-to-end rate
+                       of the 1 M benchmark (R2 read + parse + spool). The run prints its own per-stage
+                       timings afterwards; use those, not this hint.
+
+
+Schema mapping actually in use (automatic mapping + config overrides)
+  ok   csv1  51 columns · delimiter "\t" · encoding utf-8 · 10 override(s)
+       company id ← "organization_id" · name ← "organization_name" · domain ← "organization_domain"
+       contact email ← — · phone ← — · linkedin ← —
+       not present in this file: companylinkedin, subindustry, contactname, firstname, lastname, jobtitle, designation, seniority, department, email, phone, linkedin, contactcountry, contactstate, contactcity
+       unmapped headers (41): organization_retail_location_count, organization_public_symbol, organization_linkedin_company_size_tag_ids, organization_founded_year, organization_alexa_ranking, organization_relevant_keywords, organization_relevant_keywords_str, organization_linkedin_specialties
+  ok   csv2  39 columns · delimiter "\t" · encoding utf-8 · 13 override(s)
+       company id ← — · name ← "sanitized_organization_name_unanalyzed" · domain ← —
+       contact email ← "person_email" · phone ← "person_phone" · linkedin ← "person_linkedin_url"
+       not present in this file: companydomain, companywebsite, companylinkedin, companyid, industry, subindustry, companycountry, companystate, companycity, companysize, companyrevenue, designation
+       unmapped headers (26): person_name_unanalyzed_downcase, person_email_status_cd, person_extrapolated_email_confidence, person_sanitized_phone, person_email_analyzed, person_detailed_function, person_title_normalized, primary_title_normalized_for_faceting
+
+Preflight only: ready. Authentication, source keys, TSV mapping, disk and memory all check out; nothing was built or uploaded.
+
+--sample 2000 requested: this is a SMOKE TEST of the pipeline, not the full dataset.
+  The version will be labelled PARTIAL and cannot be activated.
+
+Preflight
+  ok   csv1  10.22 GB  r2://company-intel-data/raw/file1.csv
+  ok   csv2  54.04 GB  r2://company-intel-data/raw/file2.csv
+  input total          64.26 GB
+  free disk            0.41 GB
+  temporary space need 0.35 GB
+    spool               0.00 GB  (canonical rows written by pass 1)
+    raw cache staging   0.01 GB  (largest Mode B .part alive at once)
+    index output        0.00 GB  (written during pass 2, same volume by default)
+    run bookkeeping     0.27 GB  (checkpoint, spool manifest, rejected/objects lists)
+    safety margin       x1.25 applied to the four terms above
+  estimated output     0.00 GB
+  memory free / total  1.22 GB / 2.09 GB
+  cpu cores            1
+  ! Budget 0.0 GB for the Mode B raw-cache staging file as well as 0.0 GB for the spool: they are alive at the same time. Setting `rawCacheDir` to null removes that term and costs a re-download on resume.
+  sample               2,000 records per source (temporary space estimated from this, not from the full input)
+  duration estimate    ~1 s at 5,000 rows/s — the MEASURED end-to-end rate
+                       of the 1 M benchmark (R2 read + parse + spool). The run prints its own per-stage
+                       timings afterwards; use those, not this hint.
+
+[preflight] warning: Budget 0.0 GB for the Mode B raw-cache staging file as well as 0.0 GB for the spool: they are alive at the same time. Setting `rawCacheDir` to null removes that term and costs a re-download on resume.
+[profiling] profiled csv2: 39 columns, 26 unmapped, 12 canonical fields absent
+[pass1-partition] pass 1: finished csv1 (1,941 rows)
+[preflight] streaming r2://company-intel-data/raw/file2.csv in 8 MiB chunks (54038527871 bytes)
+  peak memory       0.62 GB RSS
+  peak temp disk    13.1 MB (measured before the failure)
+Stopping before the disk fills: 0.40 GB free on /home/daytona/codebase/.indexer-dev-output-smoke is below the 0.54 GB floor. The Pass 1 spool is untouched and the checkpoint is still at pass2-merge, so re-running the same command resumes pass 2 (its partial output is reset and replayed, not appended to). Free space (or lower `partitions`) first.
+
+Indexing stopped. The spool and checkpoint are intact — re-run this script to RESUME (never --no-resume).
+
+-- 1/20 dependencies
+bun 1.4.2
+dependencies present
+
+-- 2/20 source version
+source version: d57906404b30 (working tree has uncommitted changes)
+
+-- 3/20 cost expectation
+cost estimate (R2 Standard, from Cloudflare's published prices):
+  a full index is expected in the 9–20 GB range (preflight prints its own estimate). At 20 GB:
+    storage        ~$0.30/month
+    one upload     ~$0.05 of Class A writes (≈12,000 objects at ~1.7 MB each)
+    one read pass  ~$0.0043 of Class B reads
+  egress is free, and search only ever reads shards and partitions, never the source objects.
+
+-- 4/20 resume state
+checkpoint found: stage pass2-merge, version dev-smoke-20261017, sample 2000, 8 spooled partition(s)
+  NOTE: that checkpoint belongs to a SAMPLE run. A full run cannot resume it — Pass 1 will be rebuilt (the existing spool is left untouched; use a separate workDir if you want to keep it).
+
+Preflight
+  ok   csv1  10.22 GB  r2://company-intel-data/raw/file1.csv
+  ok   csv2  54.04 GB  r2://company-intel-data/raw/file2.csv
+  input total          64.26 GB
+  free disk            0.40 GB
+  temporary space need 0.35 GB
+    spool               0.00 GB  (canonical rows written by pass 1)
+    raw cache staging   0.01 GB  (largest Mode B .part alive at once)
+    index output        0.00 GB  (written during pass 2, same volume by default)
+    run bookkeeping     0.27 GB  (checkpoint, spool manifest, rejected/objects lists)
+    safety margin       x1.25 applied to the four terms above
+  estimated output     0.00 GB
+  memory free / total  1.27 GB / 2.09 GB
+  cpu cores            1
+  ! Budget 0.0 GB for the Mode B raw-cache staging file as well as 0.0 GB for the spool: they are alive at the same time. Setting `rawCacheDir` to null removes that term and costs a re-download on resume.
+  sample               2,000 records per source (temporary space estimated from this, not from the full input)
+  duration estimate    ~1 s at 5,000 rows/s — the MEASURED end-to-end rate
+                       of the 1 M benchmark (R2 read + parse + spool). The run prints its own per-stage
+                       timings afterwards; use those, not this hint.
+
+
+Schema mapping actually in use (automatic mapping + config overrides)
+  ok   csv1  51 columns · delimiter "\t" · encoding utf-8 · 10 override(s)
+       company id ← "organization_id" · name ← "organization_name" · domain ← "organization_domain"
+       contact email ← — · phone ← — · linkedin ← —
+       not present in this file: companylinkedin, subindustry, contactname, firstname, lastname, jobtitle, designation, seniority, department, email, phone, linkedin, contactcountry, contactstate, contactcity
+       unmapped headers (41): organization_retail_location_count, organization_public_symbol, organization_linkedin_company_size_tag_ids, organization_founded_year, organization_alexa_ranking, organization_relevant_keywords, organization_relevant_keywords_str, organization_linkedin_specialties
+  ok   csv2  39 columns · delimiter "\t" · encoding utf-8 · 13 override(s)
+       company id ← — · name ← "sanitized_organization_name_unanalyzed" · domain ← —
+       contact email ← "person_email" · phone ← "person_phone" · linkedin ← "person_linkedin_url"
+       not present in this file: companydomain, companywebsite, companylinkedin, companyid, industry, subindustry, companycountry, companystate, companycity, companysize, companyrevenue, designation
+       unmapped headers (26): person_name_unanalyzed_downcase, person_email_status_cd, person_extrapolated_email_confidence, person_sanitized_phone, person_email_analyzed, person_detailed_function, person_title_normalized, primary_title_normalized_for_faceting
+
+Preflight only: ready. Authentication, source keys, TSV mapping, disk and memory all check out; nothing was built or uploaded.
+
+--sample 2000 requested: this is a SMOKE TEST of the pipeline, not the full dataset.
+  The version will be labelled PARTIAL and cannot be activated.
+
+Preflight
+  ok   csv1  10.22 GB  r2://company-intel-data/raw/file1.csv
+  ok   csv2  54.04 GB  r2://company-intel-data/raw/file2.csv
+  input total          64.26 GB
+  free disk            0.40 GB
+  temporary space need 0.35 GB
+    spool               0.00 GB  (canonical rows written by pass 1)
+    raw cache staging   0.01 GB  (largest Mode B .part alive at once)
+    index output        0.00 GB  (written during pass 2, same volume by default)
+    run bookkeeping     0.27 GB  (checkpoint, spool manifest, rejected/objects lists)
+    safety margin       x1.25 applied to the four terms above
+  estimated output     0.00 GB
+  memory free / total  1.02 GB / 2.09 GB
+  cpu cores            1
+  ! Budget 0.0 GB for the Mode B raw-cache staging file as well as 0.0 GB for the spool: they are alive at the same time. Setting `rawCacheDir` to null removes that term and costs a re-download on resume.
+  ! Less than 1 GB of free memory: indexing will still run (it is partitioned) but will be slower.
+  sample               2,000 records per source (temporary space estimated from this, not from the full input)
+  duration estimate    ~1 s at 5,000 rows/s — the MEASURED end-to-end rate
+                       of the 1 M benchmark (R2 read + parse + spool). The run prints its own per-stage
+                       timings afterwards; use those, not this hint.
+
+[preflight] warning: Budget 0.0 GB for the Mode B raw-cache staging file as well as 0.0 GB for the spool: they are alive at the same time. Setting `rawCacheDir` to null removes that term and costs a re-download on resume.
+[completed] index built and validated: 2,061 companies, 1,922 contacts
+
+Built version dev-smoke-20261017
+  files read        3,941
+  rows rejected     163
+  unique companies  2,061
+  unique contacts   1,922
+  ambiguous kept apart 13  (name collisions with conflicting strong evidence)
+  missing company id   1,945
+  association       917 high confidence, 1,001 plausible, 0 conflicting, 4 preserved without an employer
+  association moves 0 contact(s) attached to a different company of the same name than their row claimed
+  claims refused    0  (a later row tried to take an identifier another company already owns)
+  objects written   82
+  elapsed           1.8 s (resumed: pass 1 skipped, spool reused)
+  stage timings
+    profiling       0.0 s
+    pass 1          0.0 s  (skipped: resumed)
+    pass 2 merge    0.8 s
+      shard writer  156,473 posting line(s), 64 shard append(s) (2444.9 lines per append), peak buffer 3.1 MB
+    finalize+index  0.5 s
+    validate        0.0 s
+  peak memory       0.15 GB RSS
+  peak temp disk    13.1 MB (/home/daytona/codebase/.indexer-dev-work-smoke)
+  index output      3.8 MB in /home/daytona/codebase/.indexer-dev-output-smoke
+  r2 requests       2 (0 retried, 0.0 MB read, 0 object(s) streamed)
+  csv1: 1,941 rows, 102 rejected
+  csv2: 2,000 rows, 61 rejected
+  output directory  /home/daytona/codebase/.indexer-dev-output-smoke
+  validation        passed
+
+Upload with:
+  bun tools/indexer/src/cli.ts run --config <cfg> --version dev-smoke-20261017 --upload
+Validation passed for dev-smoke-20261017.
+
+Coverage: PARTIAL — this run carries a sample limit (2000) per source.
+  It will be uploaded under its own version id, and ACTIVATION IS DISABLED: a sample must never replace the full dataset.
+
+--no-upload: nothing was written to R2. The version exists locally only.
