@@ -27,7 +27,7 @@ import { join, resolve } from "node:path";
 
 import type { IndexerConfig } from "../indexer/src/build";
 import { identityFor } from "../indexer/src/build";
-import { SPOOL_FORMAT_VERSION, type SpoolProgress, type SpoolSchema } from "../indexer/src/spool-v2";
+import { SPOOL_FORMAT_VERSION, spoolV2SidecarName, type SpoolFrameEntry, type SpoolProgress, type SpoolSchema } from "../indexer/src/spool-v2";
 import type { SpoolManifest } from "../indexer/src/spool";
 import { cloudKeys, type CloudChunkManifest } from "../../src/shared/cloud/types";
 
@@ -77,8 +77,10 @@ export async function assembleRun(options: {
     const file = `part-${String(partition).padStart(4, "0")}.jsonl.gz`;
     const path = join(spoolDir, file);
     const hash = createHash("sha256");
+    const ledger: SpoolFrameEntry[] = [];
     let rows = 0;
     let frames = 0;
+    let offset = 0;
     const chunks = Math.max(...checkpoints.map((entry) => entry.chunks), 0);
     const stream = createWriteStream(path);
     for (let chunk = 0; chunk < chunks; chunk += 1) {
@@ -88,12 +90,15 @@ export async function assembleRun(options: {
         const head = await options.store.head(key);
         if (!head.exists || head.size === null) continue;
         const body = await options.store.getRange(key, 0, head.size);
+        const info = await segmentInfo(options.store, options.version, checkpoint.sourceId, chunk, partition);
+        ledger.push({ offset, bytes: body.length, rows: info.rows, sha256: info.sha256 });
         hash.update(body);
+        offset += body.length;
         frames += 1;
         await new Promise<void>((resolveWrite, rejectWrite) => {
           stream.write(body, (error) => (error ? rejectWrite(error) : resolveWrite()));
         });
-        rows += await segmentRows(options.store, options.version, checkpoint.sourceId, chunk, partition);
+        rows += info.rows;
       }
     }
     await new Promise<void>((resolveEnd, rejectEnd) => stream.end((error?: Error | null) => (error ? rejectEnd(error) : resolveEnd())));
@@ -101,13 +106,17 @@ export async function assembleRun(options: {
       // An empty partition is legal: no company key hashes to it. The merge expects
       // a file for every manifest entry, and an empty gzip member is a valid one.
       const { gzipSync } = await import("node:zlib");
+      const { createHash } = await import("node:crypto");
       const empty = gzipSync(Buffer.alloc(0));
       writeFileSync(path, empty);
       hash.update(empty);
+      ledger.push({ offset: 0, bytes: empty.length, rows: 0, sha256: createHash("sha256").update(empty).digest("hex") });
+      offset = empty.length;
       frames = 1;
     }
     const bytes = statSync(path).size;
     const sha256 = hash.digest("hex");
+    writeFileSync(join(spoolDir, spoolV2SidecarName(partition)), ledger.map((frame) => `${JSON.stringify(frame)}\n`).join(""));
     entries.push({ file, partition, bytes, lines: rows, sha256, frames });
     totalRows += rows;
     totalBytes += bytes;
@@ -150,9 +159,15 @@ export async function assembleRun(options: {
   return { workDir, partitions, rows: totalRows, bytes: totalBytes, files: entries.length };
 }
 
-/** Row count recorded for one (partition, chunk) segment, read from its chunk manifest. */
+/** Row count and checksum recorded for one (partition, chunk) segment. */
 const manifestCache = new Map<string, CloudChunkManifest | null>();
-async function segmentRows(store: BlobStore, version: string, sourceId: string, chunk: number, partition: number): Promise<number> {
+async function segmentInfo(
+  store: BlobStore,
+  version: string,
+  sourceId: string,
+  chunk: number,
+  partition: number,
+): Promise<{ rows: number; sha256: string }> {
   const key = cloudKeys.chunkManifest(version, sourceId, chunk);
   let manifest = manifestCache.get(key);
   if (manifest === undefined) {
@@ -160,6 +175,6 @@ async function segmentRows(store: BlobStore, version: string, sourceId: string, 
     manifestCache.set(key, manifest);
   }
   const segment = manifest?.segments.find((entry) => entry.partition === partition);
-  return segment?.rows ?? 0;
+  return { rows: segment?.rows ?? 0, sha256: segment?.sha256 ?? createHash("sha256").update(Buffer.alloc(0)).digest("hex") };
 }
 

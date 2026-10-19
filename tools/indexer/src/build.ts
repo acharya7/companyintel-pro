@@ -663,7 +663,7 @@ export async function preflight(
      * it could complete.
      */
     for (const source of config.sources) sources.push({ id: source.id, path: source.path, bytes: null, exists: true });
-    warnings.push("Experimental Pass 2 rebuild: the Pass 1 spool is imported, so the sources are not read and no spool is written.");
+    warnings.push("Pass 2 rebuild from a verified spool: the source objects are not read and no spool is written.");
   }
 
   const freeDiskBytes = await freeDiskBytesFor(config.workDir);
@@ -833,6 +833,12 @@ class ShardWriter {
   constructor(
     private readonly root: string,
     private readonly flushBytes = SHARD_FLUSH_BYTES,
+    /**
+     * False in Cloud Pass 2: postings are flushed to R2 at the end of each
+     * partition (or every few partitions) by the driver, so a size-triggered local
+     * flush would create files nobody reads.
+     */
+    private readonly autoFlush = true,
   ) {}
 
   /**
@@ -870,7 +876,28 @@ class ShardWriter {
     this.stats.appends += 1;
     this.stats.bytes += line.length;
     if (this.stats.peakBufferedBytes < this.bufferedBytes) this.stats.peakBufferedBytes = this.bufferedBytes;
-    if (this.bufferedBytes >= this.flushBytes) this.flush();
+    if (this.autoFlush && this.bufferedBytes >= this.flushBytes) this.flush();
+  }
+
+  /**
+   * Send every buffered (kind, shard) group to R2 as one batch object.
+   *
+   * Posting order inside a group is preserved, and groups are written in the same
+   * key order a local flush used, so the final shard is byte-identical to the
+   * local build — that equality is what the cloud equivalence test asserts.
+   */
+  async flushToCloud(io: CloudMergeIo, batch: number): Promise<void> {
+    if (!this.groups.size) return;
+    const keys = [...this.groups.keys()].sort((a, b) => a - b);
+    for (const key of keys) {
+      const lines = this.groups.get(key)!;
+      const kind = SHARD_KINDS[Math.floor(key / SHARD_KEY_STRIDE)];
+      const shard = key % SHARD_KEY_STRIDE;
+      await io.writeShardPart(batch, kind, shard, Buffer.from(lines.join(""), "utf8"));
+    }
+    this.groups.clear();
+    this.bufferedBytes = 0;
+    this.stats.flushes += 1;
   }
 
   /** Write every buffered shard file: one open, one append, one close each. */
@@ -909,7 +936,7 @@ class ShardWriter {
 
   /** Flush what is buffered. Synchronous: there is no pending write to wait for. */
   close(): void {
-    this.flush();
+    if (this.autoFlush) this.flush();
   }
 }
 
@@ -927,14 +954,25 @@ interface WrittenObject {
 class ObjectWriter {
   readonly objects: WrittenObject[] = [];
 
-  constructor(private readonly outputDir: string) {}
+  /**
+   * `put` replaces the local write with a cloud write (Cloud Pass 2). The bytes,
+   * checksum and manifest accounting are identical either way — only the
+   * destination changes.
+   */
+  constructor(
+    private readonly outputDir: string,
+    private readonly put?: (key: string, body: Buffer, gzip: boolean) => Promise<void>,
+  ) {}
 
   async writeJson(key: string, value: unknown, gzip = true): Promise<WrittenObject> {
-    const path = join(this.outputDir, key);
-    await mkdir(dirname(path), { recursive: true });
     const raw = Buffer.from(JSON.stringify(value), "utf8");
     const body = gzip ? gzipSync(raw) : raw;
-    await writeFile(path, body);
+    if (this.put) await this.put(key, body, gzip);
+    else {
+      const path = join(this.outputDir, key);
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, body);
+    }
     const object: WrittenObject = {
       key,
       bytes: body.length,
@@ -946,10 +984,13 @@ class ObjectWriter {
   }
 
   async writeText(key: string, value: string): Promise<WrittenObject> {
-    const path = join(this.outputDir, key);
-    await mkdir(dirname(path), { recursive: true });
     const body = Buffer.from(value, "utf8");
-    await writeFile(path, body);
+    if (this.put) await this.put(key, body, false);
+    else {
+      const path = join(this.outputDir, key);
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, body);
+    }
     const object: WrittenObject = { key, bytes: body.length, sha256: createHash("sha256").update(body).digest("hex"), gzip: false };
     this.objects.push(object);
     return object;
@@ -1112,6 +1153,32 @@ async function resetPass2Output(
 /* Pipeline                                                                   */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Cloud merge hooks: run Pass 2 from segment objects in R2 with bounded local disk.
+ *
+ * The merge itself is unchanged. This interface only relocates the three things
+ * that used to require a whole-corpus local filesystem: the spool partition (one
+ * partition is materialised at a time), the posting shards (flushed to R2 as
+ * batch objects instead of local `.lines` files) and the generated index objects
+ * (written straight to their final versioned keys).
+ */
+export interface CloudMergeIo {
+  /** Materialise one partition into `workDir/spool/part-NNNN.jsonl`; return its bytes/rows/sha. */
+  preparePartition(entry: { partition: number; file: string }): Promise<{ bytes: number; lines: number; sha256: string; segments: number }>;
+  /** Delete the local partition after it has been merged (peak disk stays one partition). */
+  releasePartition(entry: { partition: number; file: string }): Promise<void>;
+  /** Update the durable cloud job state after a partition, and honour pause/abort. */
+  onPartition(info: { partitionsDone: number; partitionsTotal: number; rows: number; companies: number; contacts: number; elapsedMs: number }): Promise<void>;
+  /** One flushed posting-shard group, gzipped by the driver. */
+  writeShardPart(batch: number, kind: ShardKind, shard: number, body: Buffer): Promise<void>;
+  /** Read a shard's parts back, in batch order, as posting lines. */
+  readShardParts(kind: ShardKind, shard: number): AsyncIterable<string>;
+  /** Generated index object, written to its final versioned R2 key. */
+  writeObject(key: string, body: Buffer, gzip: boolean): Promise<void>;
+  /** Read one written object back for validation. */
+  readObject(key: string): Promise<Buffer>;
+}
+
 export interface RunOptions {
   /** Hard cap on records per source (sample runs). */
   sampleLimit?: number;
@@ -1140,6 +1207,17 @@ export interface RunOptions {
    * the source spool is opened for reading only — this run never writes there.
    */
   spoolImport?: SpoolImportSource;
+  /**
+   * Rows already in the spool/segments, when Pass 2 runs without re-reading the
+   * sources (Cloud Pass 2). Used only for the preflight estimate, so the merge does
+   * not HEAD or stream the 64 GB sources again just to size a warning.
+   */
+  importedRows?: number;
+  /**
+   * Cloud Pass 2: merge R2 partition segments and write the index to R2 without a
+   * full local spool or index. Set only by `tools/cloud/pass2.ts`.
+   */
+  cloud?: CloudMergeIo;
 }
 
 export interface RunResult {
@@ -1229,6 +1307,89 @@ interface SpoolRow {
   source: SourceRef;
 }
 
+/** One posting line plus its position, for the same diagnostics in both modes. */
+interface PostingLine {
+  text: string;
+  line: number;
+}
+
+/**
+ * Assemble one company index shard from posting lines.
+ *
+ * Shared by the local build (lines from `workDir/shards/*.lines`) and Cloud Pass 2
+ * (lines from R2 batch objects), so both paths apply the exact same validation and
+ * ordering. Returning the payload instead of writing it keeps the writer — local or
+ * R2 — outside this function.
+ */
+async function companyShardPayload(lines: AsyncIterable<PostingLine>, label: string): Promise<ShardPayload> {
+  // Null-prototype on purpose: `term` is a company name fragment, so a plain
+  // object literal would resolve a company called "Constructor" to
+  // `Object.prototype.constructor` (truthy, but with no `.refs`) and crash the
+  // run mid-way — the same class of bug as the abbreviation lookup in
+  // `src/shared/normalize.ts`.
+  const terms = Object.create(null) as Record<string, Postings>;
+  const lastRef = new Map<string, number>();
+  for await (const line of lines) {
+    const first = line.text.indexOf("\u0001");
+    const second = first === -1 ? -1 : line.text.indexOf("\u0001", first + 1);
+    if (first === -1 || second === -1) {
+      throw new Error(
+        `Index shard ${label} has a malformed posting record at line ${line.line}. The shard is incomplete; re-run to rebuild it.`,
+      );
+    }
+    const term = line.text.slice(0, first);
+    const ref = Number(line.text.slice(first + 1, second));
+    const quality = Number(line.text.slice(second + 1)) || 0;
+    if (!Number.isFinite(ref)) {
+      throw new Error(`Index shard ${label} has a non-numeric ref at line ${line.line}; re-run to rebuild it.`);
+    }
+    if (lastRef.get(term) === ref) continue; // same company already recorded
+    lastRef.set(term, ref);
+    const postings = terms[term] ?? { refs: [], q: [] };
+    postings.refs.push(ref);
+    postings.q!.push(quality);
+    terms[term] = postings;
+  }
+  return { terms };
+}
+
+/**
+ * Assemble one contact-name shard. Same format, but the target is a `p_…` contact
+ * id. A malformed line is a hard error: silently dropping it would make a person
+ * unfindable while the index still claims to cover every contact.
+ */
+async function contactShardPayload(lines: AsyncIterable<PostingLine>, label: string): Promise<ContactShardPayload> {
+  const terms = Object.create(null) as Record<string, ContactPostings>;
+  const lastId = new Map<string, string>();
+  for await (const line of lines) {
+    const first = line.text.indexOf("\u0001");
+    const second = first === -1 ? -1 : line.text.indexOf("\u0001", first + 1);
+    if (first === -1 || second === -1) {
+      throw new Error(`Contact index shard ${label} has a malformed posting record at line ${line.line}. The index is incomplete; re-run the build.`);
+    }
+    const term = line.text.slice(0, first);
+    const id = line.text.slice(first + 1, second);
+    const quality = Number(line.text.slice(second + 1)) || 0;
+    if (!id) throw new Error(`Contact index shard ${label} has an empty contact id at line ${line.line}.`);
+    if (lastId.get(term) === id) continue;
+    lastId.set(term, id);
+    const postings = terms[term] ?? { ids: [], q: [] };
+    postings.ids.push(id);
+    postings.q!.push(quality);
+    terms[term] = postings;
+  }
+  return { terms };
+}
+
+/** Adapt R2 shard part strings to the same `{text, line}` shape local reading uses. */
+async function* linesFromParts(parts: AsyncIterable<string>): AsyncIterable<PostingLine> {
+  let line = 0;
+  for await (const text of parts) {
+    line += 1;
+    yield { text, line };
+  }
+}
+
 export async function runIndex(config: IndexerConfig, options: RunOptions = {}): Promise<RunResult> {
   const startedAt = Date.now();
   // One context for the whole run: it owns the Mode B cache and credentials.
@@ -1236,7 +1397,10 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     cacheDir: config.rawCacheDir === undefined ? undefined : config.rawCacheDir,
     onNotice: (message) => options.onProgress?.({ stage: "preflight", message, rowsRead: 0, rowsRejected: 0, companies: 0, contacts: 0, progress: null, rowsPerSecond: null, etaSeconds: null }),
   });
-  const report = await preflight(config, sourceContext, { sampleLimit: options.sampleLimit, importedRows: options.spoolImport?.rows });
+  const report = await preflight(config, sourceContext, {
+    sampleLimit: options.sampleLimit,
+    importedRows: options.spoolImport?.rows ?? options.importedRows,
+  });
   const emit = (event: Partial<ProgressEvent> & { stage: ProgressEvent["stage"]; message: string }) =>
     options.onProgress?.({
       rowsRead: 0,
@@ -1929,6 +2093,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   const totalPartitions = spoolEntries.length;
   /** Mean rows per partition; a partition far above it is why one step is slower. */
   const averageLines = spoolManifest.totals.lines / Math.max(1, totalPartitions);
+  const cloud = options.cloud;
   const mergeStart = Date.now();
   emit({
     stage: "pass2-merge",
@@ -1952,7 +2117,14 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   // previous attempt's output, and discovering a truncated partition afterwards
   // would cost the operator a working artifact for nothing. (Record counts and
   // checksums still have to be verified while merging — those need a read.)
-  for (const entry of spoolEntries) await assertPartitionLength(entry, spoolDir);
+  if (cloud) {
+    emit({
+      stage: "pass2-merge",
+      message: `pass 2: cloud mode — each of the ${totalPartitions} verified partitions is materialised alone from its R2 segments, merged, then deleted`,
+    });
+  } else {
+    for (const entry of spoolEntries) await assertPartitionLength(entry, spoolDir);
+  }
   /*
    * The manifest says how its rows are encoded. Format 2 rows are compact arrays
    * decoded through the recorded schema; format 1 rows are self-describing JSON
@@ -1962,10 +2134,17 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   const spoolEncoding: 1 | 2 = spoolManifest.format === 2 ? 2 : 1;
   const spoolSchema = spoolEncoding === 2 ? assertSchema(spoolManifest.schema, spoolManifestPathFor(workDir)) : null;
   emit({ stage: "pass2-merge", message: `pass 2: verified the recorded length of all ${totalPartitions} spool partitions (format ${spoolEncoding})` });
-  const pass2Reset = await resetPass2Output(config, { shardDir }, emit);
+  // Cloud mode never writes a local index or local shards, so there is nothing to
+  // reset locally; the driver refuses to run over a version whose manifest exists.
+  const pass2Reset: Pass2ResetReport = cloud
+    ? { shardFiles: 0, outputFiles: 0, outputBytes: 0, cleared: [] }
+    : await resetPass2Output(config, { shardDir }, emit);
 
-  const writer = new ObjectWriter(config.outputDir);
-  const shardWriter = new ShardWriter(shardDir);
+  const writer = new ObjectWriter(
+    config.outputDir,
+    cloud ? (key, body, gzip) => cloud.writeObject(key, body, gzip) : undefined,
+  );
+  const shardWriter = new ShardWriter(shardDir, undefined, !cloud);
   const companyStats = { byIndustry: new Map<string, number>(), byCountry: new Map<string, number>(), bySize: new Map<string, number>() };
   const contactStats = { byDesignation: new Map<string, number>(), byDepartment: new Map<string, number>(), bySeniority: new Map<string, number>() };
   const coverage = { email: 0, linkedin: 0, phone: 0, neither: 0 };
@@ -2067,8 +2246,21 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     const partitionStart = Date.now();
 
     // Re-checked here as well as before the reset: the file could have changed
-    // while earlier partitions were merging.
-    await assertPartitionLength(entry, spoolDir);
+    // while earlier partitions were merging. In cloud mode the partition does not
+    // exist yet: `preparePartition` concatenates its segment objects into this one
+    // file and returns the length/rows/checksum those segments record, so the same
+    // integrity rules still apply.
+    let expectations = entry;
+    if (cloud) {
+      const prepared = await cloud.preparePartition(entry);
+      expectations = { ...entry, bytes: prepared.bytes, lines: prepared.lines, sha256: prepared.sha256 };
+      emit({
+        stage: "pass2-merge",
+        message: `pass 2: partition ${entry.partition} materialised from ${prepared.segments} segment(s) — ${prepared.bytes.toLocaleString()} bytes, ${prepared.lines.toLocaleString()} rows`,
+      });
+    } else {
+      await assertPartitionLength(entry, spoolDir);
+    }
 
     const partitionHash = createHash("sha256");
     let recordsSeen = 0;
@@ -2224,13 +2416,13 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       throw new Error(`pass 2 could not merge partition ${entry.partition} (${entry.file}): ${error.message}`);
     }
 
-    if (recordsSeen !== entry.lines) {
+    if (recordsSeen !== expectations.lines) {
       throw new Error(
         `Spool partition ${entry.file} lost or gained records: ${recordsSeen.toLocaleString()} read, ${entry.lines.toLocaleString()} recorded by pass 1.\n` +
           "  Nothing was deleted; re-run with --no-resume to rebuild the spool from the sources.",
       );
     }
-    if (partitionHash.digest("hex") !== entry.sha256) {
+    if (partitionHash.digest("hex") !== expectations.sha256) {
       throw new Error(
         `Spool partition ${entry.file} does not match the checksum pass 1 recorded. Its contents changed after it was\n` +
           "  written, so it will not be merged. Nothing was deleted; re-run with --no-resume to rebuild the spool.",
@@ -2591,6 +2783,34 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
         ` · this partition ${(partitionMs / 1000).toFixed(1)}s` +
         (notes.length ? ` — ${notes.join("; ")}` : ""),
     });
+
+    /*
+     * Cloud Pass 2: bounded batches.
+     *
+     *   - postings are flushed every few partitions as gzip objects instead of
+     *     growing local `.lines` files (one small PUT per kind/shard/batch);
+     *   - the materialised partition is deleted immediately, so peak local disk is
+     *     one partition plus the flush buffer, never the corpus;
+     *   - the durable job state is updated and pause/abort are honoured between
+     *     partitions. Re-running after a stop replays from partition 1 (the output
+     *     is deterministic, so replay overwrites rather than duplicates).
+     */
+    if (cloud) {
+      const CLOUD_SHARD_BATCH = 4;
+      const batch = Math.floor(fileIndex / CLOUD_SHARD_BATCH);
+      if ((fileIndex + 1) % CLOUD_SHARD_BATCH === 0 || fileIndex === totalPartitions - 1) {
+        await shardWriter.flushToCloud(cloud, batch);
+      }
+      await cloud.releasePartition(entry);
+      await cloud.onPartition({
+        partitionsDone: processedPartitions,
+        partitionsTotal: totalPartitions,
+        rows: counters.rowsRead,
+        companies: counters.uniqueCompanies,
+        contacts: counters.uniqueContacts,
+        elapsedMs: Date.now() - mergeStart,
+      });
+    }
   }
   const mergeMs = Date.now() - mergeStart;
 
@@ -2605,45 +2825,17 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   emit({ stage: "indexing", message: "finalizing index shards" });
   const indexPathIndex = async (kind: ShardKind, shards: number) => {
     for (let shard = 0; shard < shards; shard += 1) {
-      const linesPath = join(shardDir, `${kind}/${String(shard).padStart(4, "0")}.lines`);
-      if (!existsSync(linesPath)) continue;
-      // Null-prototype on purpose: `term` is a company name fragment, so a plain
-      // object literal would resolve a company called "Constructor" to
-      // `Object.prototype.constructor` (truthy, but with no `.refs`) and crash the
-      // run mid-way — the same class of bug as the abbreviation lookup in
-      // `src/shared/normalize.ts`.
-      const terms = Object.create(null) as Record<string, Postings>;
-      const lastRef = new Map<string, number>();
-      // Read with the same `\n`-only splitter as the spool (see jsonl.ts).
-      // `readline` split on U+2028/U+2029, so a term that contained one produced a
-      // fragment with no `\u0001` in it — and the old `continue` below threw that
-      // posting away silently. It is now a hard error: a shard file that cannot be
-      // parsed means the postings for this shard are incomplete.
-      for await (const line of readJsonlLines(linesPath)) {
-        const first = line.text.indexOf("\u0001");
-        const second = first === -1 ? -1 : line.text.indexOf("\u0001", first + 1);
-        if (first === -1 || second === -1) {
-          throw new Error(
-            `Index shard ${kind}/${String(shard).padStart(4, "0")} has a malformed posting record at line ${line.line} ` +
-              `(byte offset ${line.byteOffset}, file ${line.byteLength === 0 ? "unknown" : "present"}). The shard is incomplete; re-run to rebuild it.`,
-          );
-        }
-        const term = line.text.slice(0, first);
-        const ref = Number(line.text.slice(first + 1, second));
-        const quality = Number(line.text.slice(second + 1)) || 0;
-        if (!Number.isFinite(ref)) {
-          throw new Error(`Index shard ${kind}/${String(shard).padStart(4, "0")} has a non-numeric ref at line ${line.line}; re-run to rebuild it.`);
-        }
-        if (lastRef.get(term) === ref) continue; // same company already recorded
-        lastRef.set(term, ref);
-        const postings = terms[term] ?? { refs: [], q: [] };
-        postings.refs.push(ref);
-        postings.q!.push(quality);
-        terms[term] = postings;
-      }
-      const payload: ShardPayload = { terms };
-      await writer.writeJson(folderFor("indexes", config.datasetVersion, `${kind}/${String(shard).padStart(4, "0")}.json`), payload);
-      await rm(linesPath, { force: true });
+      const name = String(shard).padStart(4, "0");
+      const linesPath = join(shardDir, `${kind}/${name}.lines`);
+      if (!cloud && !existsSync(linesPath)) continue;
+      // Read with the same `\n`-only splitter as the spool (see jsonl.ts):
+      // `readline` split on U+2028/U+2029, so a term containing one produced a
+      // fragment with no `\u0001` and the old code discarded the posting silently.
+      const payload = cloud
+        ? await companyShardPayload(linesFromParts(cloud.readShardParts(kind, shard)), `${kind}/${name}`)
+        : await companyShardPayload(readJsonlLines(linesPath), `${kind}/${name}`);
+      await writer.writeJson(folderFor("indexes", config.datasetVersion, `${kind}/${name}.json`), payload);
+      if (!cloud) await rm(linesPath, { force: true });
     }
   };
 
@@ -2656,35 +2848,14 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
    */
   const indexContactShard = async (kind: ShardKind, shards: number) => {
     for (let shard = 0; shard < shards; shard += 1) {
-      const linesPath = join(shardDir, `${kind}/${String(shard).padStart(4, "0")}.lines`);
-      if (!existsSync(linesPath)) continue;
-      const terms = Object.create(null) as Record<string, ContactPostings>;
-      const lastId = new Map<string, string>();
-      for await (const line of readJsonlLines(linesPath)) {
-        const first = line.text.indexOf("\u0001");
-        const second = first === -1 ? -1 : line.text.indexOf("\u0001", first + 1);
-        if (first === -1 || second === -1) {
-          throw new Error(
-            `Contact index shard ${kind}/${String(shard).padStart(4, "0")} has a malformed posting record at line ${line.line}. ` +
-              "The index is incomplete; re-run the build.",
-          );
-        }
-        const term = line.text.slice(0, first);
-        const id = line.text.slice(first + 1, second);
-        const quality = Number(line.text.slice(second + 1)) || 0;
-        if (!id) {
-          throw new Error(`Contact index shard ${kind}/${String(shard).padStart(4, "0")} has an empty contact id at line ${line.line}.`);
-        }
-        if (lastId.get(term) === id) continue;
-        lastId.set(term, id);
-        const postings = terms[term] ?? { ids: [], q: [] };
-        postings.ids.push(id);
-        postings.q!.push(quality);
-        terms[term] = postings;
-      }
-      const payload: ContactShardPayload = { terms };
-      await writer.writeJson(folderFor("indexes", config.datasetVersion, `${kind}/${String(shard).padStart(4, "0")}.json`), payload);
-      await rm(linesPath, { force: true });
+      const name = String(shard).padStart(4, "0");
+      const linesPath = join(shardDir, `${kind}/${name}.lines`);
+      if (!cloud && !existsSync(linesPath)) continue;
+      const payload = cloud
+        ? await contactShardPayload(linesFromParts(cloud.readShardParts(kind, shard)), `${kind}/${name}`)
+        : await contactShardPayload(readJsonlLines(linesPath), `${kind}/${name}`);
+      await writer.writeJson(folderFor("indexes", config.datasetVersion, `${kind}/${name}.json`), payload);
+      if (!cloud) await rm(linesPath, { force: true });
     }
   };
 
@@ -2790,13 +2961,20 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   emit({ stage: "validating", message: "validating generated objects" });
   const missing: string[] = [];
   for (const object of writer.objects) {
-    const path = join(config.outputDir, object.key);
-    const info = await stat(path).catch(() => null);
-    if (!info) {
+    let body: Buffer | null;
+    if (cloud) {
+      // Read the object back from R2: local validation only proves what is in the
+      // writer's memory, not what a search will actually fetch.
+      body = await cloud.readObject(object.key).catch(() => null);
+    } else {
+      const path = join(config.outputDir, object.key);
+      const info = await stat(path).catch(() => null);
+      body = info ? await readFile(path) : null;
+    }
+    if (!body) {
       missing.push(object.key);
       continue;
     }
-    const body = await readFile(path);
     const sha256 = createHash("sha256").update(body).digest("hex");
     if (sha256 !== object.sha256) missing.push(object.key);
   }

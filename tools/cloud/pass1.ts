@@ -136,6 +136,7 @@ export async function runPass1(options: RunPass1Options): Promise<Pass1Result> {
     startedAt,
     updatedAt: startedAt,
     mode,
+    partitions: options.partitions,
     sources: options.sources.map((source) => emptySourceState(source, 0)),
     totals: { rowsRead: 0, rowsRejected: 0, rowsIndexed: 0, segments: 0, segmentBytes: 0, sourceBytesRead: 0 },
     rate: { rowsPerSecond: null, bytesPerSecond: null, etaSeconds: null },
@@ -144,6 +145,7 @@ export async function runPass1(options: RunPass1Options): Promise<Pass1Result> {
     errors: [],
   };
   state.mode = mode;
+  state.partitions = options.partitions;
   state.stage = "pass1";
   state.updatedAt = new Date(now()).toISOString();
   await store.putJson(cloudKeys.state(version), state);

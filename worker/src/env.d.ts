@@ -27,6 +27,13 @@ export interface Env {
   DEV_ALLOW_UNAUTHENTICATED?: string;
   MAX_SEARCHES_PER_MINUTE?: string;
   SEARCH_MAX_HYDRATE?: string;
+  /**
+   * Deployment-wide allowlist for the indexing control plane (`/api/cloud/*`). When
+   * empty, `ALLOWED_EMAILS` is used, because Access is already the outer gate.
+   */
+  INDEXING_ADMIN_EMAILS?: string;
+  /** Durable Object namespace that owns the indexing container (see wrangler.toml). */
+  INDEXER_CONTAINER?: DurableObjectNamespace;
 }
 
 export interface AccessIdentity {

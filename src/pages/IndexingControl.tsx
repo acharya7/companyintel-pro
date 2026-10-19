@@ -11,7 +11,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Activity, AlertTriangle, Cloud, Gauge, HardDrive, Pause, Play, RefreshCw, ShieldCheck, Square, Timer } from "lucide-react";
+import { Activity, AlertTriangle, Cloud, Database, Gauge, HardDrive, Layers, Pause, Play, RefreshCw, ShieldCheck, Square, Timer } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -142,6 +142,44 @@ export default function IndexingControl() {
       setVerifyOutput(result.output || (result.ok ? "READY" : "NOT READY"));
     } catch (caught) {
       setVerifyOutput(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const startPass2 = async () => {
+    if (!state) return;
+    if (!window.confirm(`Merge ${state.version} from its verified R2 segments into the index? No source object is modified.`)) return;
+    setBusy("pass2");
+    setNotice(null);
+    try {
+      const result = await admin<{ started: boolean; partitions: number }>(`/api/cloud/jobs/${encodeURIComponent(state.version)}/pass2`, {
+        method: "POST",
+        body: JSON.stringify({ confirm: "PASS2", partitions: state.partitions }),
+      });
+      setNotice(`Cloud Pass 2 started with ${result.partitions} partitions. It merges one partition at a time and writes the index to R2.`);
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const activate = async () => {
+    if (!state) return;
+    if (!window.confirm(`Activate ${state.version} for the application? The previous version stays in R2 as the rollback target.`)) return;
+    setBusy("activate");
+    setNotice(null);
+    try {
+      const result = await admin<{ ok: boolean; output: string }>(`/api/cloud/jobs/${encodeURIComponent(state.version)}/activate`, {
+        method: "POST",
+        body: JSON.stringify({ confirm: state.version }),
+      });
+      setVerifyOutput(result.output || (result.ok ? "Activated." : "Activation failed."));
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
       setBusy(null);
     }
@@ -331,6 +369,71 @@ export default function IndexingControl() {
                   <div className="mt-3 space-y-1 text-xs text-destructive">
                     {state.errors.slice(-3).map((entry, index) => (
                       <p key={`${entry.at}-${index}`}>
+                        {entry.stage}: {entry.message}
+                      </p>
+                    ))}
+                  </div>
+                ) : null}
+              </Section>
+
+              <Section
+                title="Cloud Pass 2 and activation"
+                description="Merges the verified segments directly from R2, one partition at a time. The whole spool and the whole index are never on local disk, and the source objects are read-only."
+                className="mt-6"
+              >
+                <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+                  <StatCard
+                    label="Pass 2 partitions"
+                    value={state.pass2 ? `${state.pass2.partitionsDone.toLocaleString()} / ${state.pass2.partitionsTotal.toLocaleString()}` : "—"}
+                    hint={state.pass2 ? `${(state.rate.rowsPerSecond ?? 0).toLocaleString()} rows/s · ETA ${formatDuration(state.rate.etaSeconds)}` : "not started"}
+                    icon={<Layers className="size-4" />}
+                  />
+                  <StatCard
+                    label="Index in R2"
+                    value={formatBytes(state.pass2?.indexBytes)}
+                    hint={`${(state.pass2?.indexObjects ?? 0).toLocaleString()} objects · ${(state.pass2?.shardParts ?? 0).toLocaleString()} shard parts`}
+                    icon={<Database className="size-4" />}
+                  />
+                  <StatCard
+                    label="Source rows"
+                    value={state.totals.rowsRead.toLocaleString()}
+                    hint={`${state.totals.rowsRejected.toLocaleString()} rejected · ${state.accounting.bytesRead ? formatBytes(state.accounting.bytesRead) : "no reads yet"} read from R2`}
+                    icon={<Activity className="size-4" />}
+                  />
+                  <StatCard
+                    label="Estimated spend"
+                    value={`$${(state.accounting.estimatedUsd + state.accounting.containerUsd).toFixed(3)}`}
+                    hint="R2 requests + container time · not a billing cap"
+                    icon={<Timer className="size-4" />}
+                  />
+                </div>
+
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <Button
+                    className="gap-2"
+                    disabled={busy !== null || !["pass1-complete", "pass2", "paused"].includes(state.stage)}
+                    onClick={() => void startPass2()}
+                  >
+                    <Cloud className="size-4" /> {busy === "pass2" ? "Starting…" : "Start / resume Cloud Pass 2"}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    className="gap-2"
+                    disabled={busy !== null || state.stage !== "complete" || state.mode !== "full"}
+                    onClick={() => void activate()}
+                  >
+                    <ShieldCheck className="size-4" /> {busy === "activate" ? "Activating…" : "Activate completed version"}
+                  </Button>
+                </div>
+                <p className="mt-3 text-xs text-muted-foreground">
+                  {state.mode !== "full"
+                    ? "This job is a bounded benchmark: it can build and verify an index, but activation is refused."
+                    : "Activation re-checks the uploaded manifest and validation report in R2. A paused Pass 2 replays from partition 1; every output is overwritten with identical bytes, so nothing is duplicated."}
+                </p>
+                {state.errors.length ? (
+                  <div className="mt-3 space-y-1 text-xs text-destructive">
+                    {state.errors.slice(-3).map((entry, index) => (
+                      <p key={`p2-${entry.at}-${index}`}>
                         {entry.stage}: {entry.message}
                       </p>
                     ))}

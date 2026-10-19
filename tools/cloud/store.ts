@@ -27,7 +27,8 @@ export interface BlobHead {
 export interface BlobStore {
   /** Read exactly `length` bytes at `offset` (fewer at end of object). */
   getRange(key: string, offset: number, length: number): Promise<Buffer>;
-  put(key: string, body: Buffer, contentType?: string): Promise<{ etag: string | null }>;
+  /** `contentEncoding` is required for gzip objects: the Worker keys decompression off it. */
+  put(key: string, body: Buffer, contentType?: string, contentEncoding?: string): Promise<{ etag: string | null }>;
   head(key: string): Promise<BlobHead>;
   /** Every object under a prefix, following pagination. */
   list(prefix: string): Promise<{ key: string; size: number }[]>;
@@ -61,9 +62,14 @@ export class R2BlobStore implements BlobStore {
     return buffer;
   }
 
-  async put(key: string, body: Buffer, contentType = "application/octet-stream"): Promise<{ etag: string | null }> {
+  async put(
+    key: string,
+    body: Buffer,
+    contentType = "application/octet-stream",
+    contentEncoding?: string,
+  ): Promise<{ etag: string | null }> {
     this.counters.classA += 1;
-    const result = await this.client.put(key, body, contentType);
+    const result = await this.client.put(key, body, contentType, 4, contentEncoding ? { contentEncoding } : undefined);
     this.counters.bytesWritten += body.length;
     return { etag: result.etag };
   }

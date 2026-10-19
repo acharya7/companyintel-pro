@@ -25,7 +25,7 @@ import { resolve } from "node:path";
 const root = resolve(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1"), "..");
 const port = Number(process.env.PORT ?? 8080);
 
-const ALLOWED_COMMANDS = new Set(["preflight", "run", "benchmark", "status", "jobs", "verify", "pause", "resume", "abort"]);
+const ALLOWED_COMMANDS = new Set(["preflight", "run", "benchmark", "pass2", "status", "jobs", "verify", "pause", "resume", "abort"]);
 
 function json(response, status, value) {
   response.statusCode = status;

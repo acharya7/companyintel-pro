@@ -79,6 +79,8 @@ export interface CloudJobState {
   finishedAt?: string;
   /** Full run vs bounded benchmark. */
   mode: "full" | "benchmark" | "custom";
+  /** Partition count this job was built with; Cloud Pass 2 must use the same one. */
+  partitions?: number;
   sources: CloudSourceState[];
   totals: {
     rowsRead: number;
@@ -96,6 +98,17 @@ export interface CloudJobState {
   accounting: CloudAccounting;
   /** Last durable checkpoint that a restart would use. */
   checkpoint: { at: string; sources: { id: string; nextOffset: number; nextLine: number }[] } | null;
+  /** Cloud Pass 2 progress, written after every merged partition. */
+  pass2?: {
+    partitionsDone: number;
+    partitionsTotal: number;
+    shardParts: number;
+    indexObjects: number;
+    indexBytes: number;
+    /** Measured on this run, not estimated. */
+    rowsPerSecond: number | null;
+    updatedAt: string;
+  };
   errors: { at: string; stage: CloudStage; message: string }[];
   note?: string;
 }

@@ -61,15 +61,30 @@ function startDetached(root, args) {
 const ACTIONS = new Set(["pause", "resume", "abort"]);
 
 /**
+ * Server-side authorisation for the control plane.
+ *
+ * The dev server is not a public deployment, but the controls are still gated by a
+ * server-held token rather than the presence of a route: set `CLOUD_ADMIN_TOKEN`
+ * and the browser must send the same value in `x-companyintel-cloud-admin`. The
+ * default only exists so `bun run dev` works locally; it is never used by the
+ * deployed Worker, which exposes no cloud-admin route at all.
+ */
+function authorised(request) {
+  const expected = process.env.CLOUD_ADMIN_TOKEN || "dev";
+  return request.headers["x-companyintel-cloud-admin"] === expected;
+}
+
+/**
  * Handle `/api/cloud/…`. Returns true when the request was handled.
  */
 export async function handleCloudAdmin(request, response, root = process.cwd()) {
   const url = new URL(request.url ?? "/", "http://localhost");
   if (!url.pathname.startsWith("/api/cloud/")) return false;
 
-  // A custom header means a cross-site form POST cannot reach these controls.
-  if (request.headers["x-companyintel-cloud-admin"] !== "dev") {
-    json(response, 403, { error: { code: "admin_header_required", message: "Missing x-companyintel-cloud-admin header." } });
+  // A custom header means a cross-site form POST cannot reach these controls; the
+  // value must match CLOUD_ADMIN_TOKEN when one is configured.
+  if (!authorised(request)) {
+    json(response, 403, { error: { code: "admin_auth_required", message: "Missing or invalid x-companyintel-cloud-admin token." } });
     return true;
   }
 
@@ -130,6 +145,82 @@ export async function handleCloudAdmin(request, response, root = process.cwd()) 
       }
       const pid = startDetached(root, ["run", "--version", version, "--max-source-mb", String(maxSourceMb), "--partitions", "16"]);
       json(response, 202, { started: true, version, maxSourceMb, pid });
+      return true;
+    }
+
+    if (parts[0] === "jobs" && parts.length === 3 && parts[2] === "pass2" && method === "POST") {
+      const body = await readBody(request);
+      if (body.confirm !== "PASS2") {
+        json(response, 400, { error: { code: "confirmation_required", message: "Send confirm: \"PASS2\"." } });
+        return true;
+      }
+      const version = parts[1];
+      const { state, control } = cliJson(root, ["status", "--version", version, "--json"]);
+      if (!state) {
+        json(response, 404, { error: { code: "no_such_job", message: `No cloud job ${version}.` } });
+        return true;
+      }
+      if (state.mode === "full" && !control?.approvedFullRun) {
+        json(response, 403, {
+          error: { code: "approval_required", message: "A full-corpus Pass 2 requires control.approvedFullRun." },
+        });
+        return true;
+      }
+      if (!["pass1-complete", "pass2", "paused"].includes(state.stage)) {
+        json(response, 409, {
+          error: { code: "wrong_stage", message: `Pass 2 needs pass1-complete; the job is ${state.stage}.` },
+        });
+        return true;
+      }
+      const partitions = Number(body.partitions ?? state.partitions ?? 256);
+      if (!Number.isInteger(partitions) || partitions < 1 || partitions > 256) {
+        json(response, 400, { error: { code: "invalid_partitions", message: "partitions must be 1..256." } });
+        return true;
+      }
+      const pid = startDetached(root, [
+        "pass2",
+        "--version",
+        version,
+        "--partitions",
+        String(partitions),
+        "--work-dir",
+        resolve(root, `.indexer-cloud-pass2-${version}`),
+      ]);
+      json(response, 202, { started: true, version, partitions, pid });
+      return true;
+    }
+
+    if (parts[0] === "jobs" && parts.length === 3 && parts[2] === "activate" && method === "POST") {
+      const body = await readBody(request);
+      const version = parts[1];
+      if (body.confirm !== version) {
+        json(response, 400, { error: { code: "confirmation_required", message: `Send confirm: \"${version}\".` } });
+        return true;
+      }
+      const { state } = cliJson(root, ["status", "--version", version, "--json"]);
+      if (!state) {
+        json(response, 404, { error: { code: "no_such_job", message: `No cloud job ${version}.` } });
+        return true;
+      }
+      // Bounded benchmarks are never activatable, and an unfinished version has no
+      // uploaded manifest to verify. `publish` re-checks both against R2.
+      if (state.mode !== "full") {
+        json(response, 409, { error: { code: "not_activatable", message: "A bounded benchmark can never be activated." } });
+        return true;
+      }
+      if (state.stage !== "complete") {
+        json(response, 409, { error: { code: "wrong_stage", message: `Version is ${state.stage}, not complete.` } });
+        return true;
+      }
+      const output = spawnSync("bun", ["tools/indexer/src/cli.ts", "publish", "--version", version, "--yes"], {
+        cwd: root,
+        encoding: "utf8",
+        timeout: 120_000,
+      });
+      json(response, output.status === 0 ? 200 : 422, {
+        ok: output.status === 0,
+        output: `${output.stdout ?? ""}${output.stderr ?? ""}`.trim().split("\n").slice(-20).join("\n"),
+      });
       return true;
     }
 

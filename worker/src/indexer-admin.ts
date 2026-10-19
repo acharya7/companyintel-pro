@@ -1,0 +1,384 @@
+/**
+ * Cloud indexing control plane (deployed).
+ *
+ * This is the Worker-side equivalent of the dev server's `/api/cloud/…` routes, and
+ * it exists so the `/indexing` panel works against a real deployment instead of only
+ * in the preview. Everything it promises follows from three rules:
+ *
+ *   1. **Authorisation is server-side.** Every route runs behind the same
+ *      `verifyAccess` middleware as the rest of `/api/*` (Cloudflare Access JWT
+ *      verified against the team's JWKS and the audience), plus an email allowlist
+ *      for the admin surface itself (`INDEXING_ADMIN_EMAILS`). The route path is not
+ *      the control: an unauthenticated request is 401 before any handler runs.
+ *   2. **Durable state lives in R2, not in the Worker.** Reads are the same
+ *      `cloud/jobs/<version>/state.json` and `control.json` objects the container
+ *      writes; controls write the same flags the engine checks between chunks.
+ *      Nothing is held in isolate memory, so a redeploy or an eviction changes
+ *      nothing an operator sees.
+ *   3. **Credentials never reach the browser.** The Worker never returns an R2 key,
+ *      nor any container environment variable. The container gets its R2
+ *      credentials from the platform's secret store.
+ *
+ * The polling endpoint never sees a raw S3 secret: the Worker has no S3 client at all.
+ * Activation uses the R2 binding (`publishVersion` with a `R2Bucket`-backed client).
+ */
+
+import type { Context } from "hono";
+import { Hono } from "hono";
+
+import {
+  CLOUD_CONTROL_VERSION,
+  cloudKeys,
+  type CloudControl,
+  type CloudJobState,
+} from "../../src/shared/cloud/types";
+import { publishVersion, verifyRemoteVersion } from "../indexer/src/build";
+import { verifyAccess, AccessError } from "./access";
+import type { AccessIdentity } from "./env";
+import type { EnvWithContainer } from "./indexer-container";
+
+type AdminContext = Context<{ Bindings: EnvWithContainer; Variables: { identity: AccessIdentity } }>;
+
+export const indexingAdmin = new Hono<{ Bindings: EnvWithContainer; Variables: { identity: AccessIdentity } }>();
+
+/* ------------------------------- access ---------------------------------- */
+
+indexingAdmin.use("*", async (c, next) => {
+  let identity: AccessIdentity;
+  try {
+    identity = await verifyAccess(c.req.raw, c.env);
+  } catch (error) {
+    const status = error instanceof AccessError ? error.status : 401;
+    return c.json({ error: { code: "unauthorized" as const, message: "Cloudflare Access verification failed" } }, status as 401 | 403);
+  }
+  // Admin surface: the Access application must also allow THIS identity to operate
+  // indexing. Unset means "the Access allowlist is the allowlist" (single-user
+  // deployments), which is why it is not a silent bypass in production.
+  const allowed = (c.env.INDEXING_ADMIN_EMAILS ?? c.env.ALLOWED_EMAILS ?? "")
+    .split(",")
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean);
+  if (allowed.length && !allowed.includes(identity.email.toLowerCase())) {
+    return c.json({ error: { code: "forbidden" as const, message: "This identity may not operate indexing" } }, 403);
+  }
+  c.set("identity", identity);
+  await next();
+});
+
+/* ------------------------------ helpers ---------------------------------- */
+
+async function readState(env: EnvWithContainer, version: string): Promise<CloudJobState | null> {
+  const object = await env.COMPANY_DATA.get(cloudKeys.state(version));
+  return object ? ((await object.json()) as CloudJobState) : null;
+}
+
+async function readControl(env: EnvWithContainer, version: string): Promise<CloudControl | null> {
+  const object = await env.COMPANY_DATA.get(cloudKeys.control(version));
+  return object ? ((await object.json()) as CloudControl) : null;
+}
+
+async function writeControl(env: EnvWithContainer, version: string, control: CloudControl): Promise<void> {
+  await env.COMPANY_DATA.put(cloudKeys.control(version), JSON.stringify(control), {
+    httpMetadata: { contentType: "application/json" },
+  });
+}
+
+const STATE_PREFIX = `${cloudKeys.jobRoot("")}`.replace(/\/$/, "");
+
+/** Every job's durable state, newest first. Listing `cloud/jobs/` is one Class A op. */
+async function listJobs(env: EnvWithContainer): Promise<{ state: CloudJobState; control: CloudControl | null }[]> {
+  const listed = await env.COMPANY_DATA.list({ prefix: `${STATE_PREFIX}/`, limit: 200 });
+  const keys = listed.objects.map((object) => object.key).filter((key) => key.endsWith("/state.json"));
+  const jobs = await Promise.all(
+    keys.map(async (key) => {
+      const object = await env.COMPANY_DATA.get(key);
+      if (!object) return null;
+      const state = (await object.json()) as CloudJobState;
+      return { state, control: await readControl(env, state.version) };
+    }),
+  );
+  return jobs.filter((job): job is { state: CloudJobState; control: CloudControl | null } => job !== null)
+    .sort((a, b) => (b.state.updatedAt ?? "").localeCompare(a.state.updatedAt ?? ""));
+}
+
+/**
+ * R2 binding as the write client `publishVersion` expects.
+ *
+ * The bucket binding needs no credentials, so the deployed activation path has no
+ * S3 secret anywhere in it — that is the whole point of doing it here rather than on
+ * a laptop with `R2_*` variables exported.
+ */
+const bindingClient = (bucket: R2Bucket) => ({
+  async get(key: string) {
+    const object = await bucket.get(key);
+    return {
+      ok: Boolean(object),
+      json: async () => (object ? JSON.parse(await object.text()) : null),
+    };
+  },
+  async putJson(key: string, value: unknown) {
+    await bucket.put(key, JSON.stringify(value), { httpMetadata: { contentType: "application/json" } });
+  },
+  async put(key: string, body: Uint8Array | ArrayBuffer | string, contentType: string) {
+    await bucket.put(key, body as ArrayBuffer, { httpMetadata: { contentType } });
+    return { etag: null };
+  },
+});
+
+/* ------------------------------- routes ---------------------------------- */
+
+/** All jobs, plus the bucket the panel is reading. */
+indexingAdmin.get("/jobs", async (c) => {
+  const jobs = await listJobs(c.env);
+  return c.json({ jobs, containerBound: Boolean(c.env.INDEXER_CONTAINER) });
+});
+
+/**
+ * Preflight: the plan and the measured source sizes, read from R2 (HEAD only).
+ * Nothing is written and nothing is scanned.
+ */
+indexingAdmin.post("/preflight", async (c) => {
+  const sources: { id: string; bytes: number | null; etag: string | null }[] = [];
+  let total = 0;
+  for (const [id, key] of Object.entries(SOURCE_OBJECTS)) {
+    const head = await c.env.COMPANY_DATA.head(key);
+    if (head) total += head.size;
+    sources.push({ id, bytes: head ? head.size : null, etag: head?.etag ?? null });
+  }
+  const ready = sources.every((source) => source.bytes !== null);
+  return c.json({
+    ok: ready,
+    bucket: BUCKET,
+    sources,
+    totalBytes: total,
+    containerBound: Boolean(c.env.INDEXER_CONTAINER),
+    output: ready
+      ? [
+          `${BUCKET}: both sources present (${(total / 1e9).toFixed(2)} GB).`,
+          "Pass 1 reads them in bounded ranged chunks; Pass 2 merges one partition at a time.",
+        ].join("\n")
+      : "One or more source objects are missing; nothing can run.",
+  });
+});
+
+/**
+ * Start or resume a cloud stage inside the container.
+ *
+ * `stage=pass1` runs the chunker and segment writer; `stage=pass2` merges the
+ * verified segments. A full run requires `control.approvedFullRun`, which only the
+ * `approve` route can set — a browser cannot start the 64 GB job by accident.
+ */
+indexingAdmin.post("/jobs/:version/start", async (c) => {
+  const version = sanitiseVersion(c.req.param("version"));
+  if (!version) return badRequest(c, "invalid_version", "A version id is required (letters, digits, . _ -).");
+  const body = (await c.req.json().catch(() => ({}))) as { stage?: string; confirm?: string; maxSourceMb?: number; partitions?: number };
+  if (body.confirm !== "START") return badRequest(c, "confirmation_required", 'Send confirm: "START".');
+
+  const stage = body.stage === "pass2" ? "pass2" : body.stage === "pass1" ? "pass1" : null;
+  if (!stage) return badRequest(c, "invalid_stage", "stage must be pass1 or pass2.");
+
+  const container = c.env.INDEXER_CONTAINER;
+  if (!container) return unavailable(c);
+
+  const state = await readState(c.env, version);
+  const control = (await readControl(c.env, version)) ?? defaultControl();
+  const mode = body.maxSourceMb ? "benchmark" : (state?.mode ?? "full");
+  if (!body.maxSourceMb && !control.approvedFullRun) {
+    return c.json(
+      {
+        error: {
+          code: "approval_required" as const,
+          message:
+            "A full-corpus run needs an approved forecast (the Approve button records it). Send maxSourceMb for a bounded benchmark instead.",
+        },
+      },
+      403,
+    );
+  }
+
+  const partitions = Number(body.partitions ?? state?.partitions ?? 256);
+  if (!Number.isInteger(partitions) || partitions < 1 || partitions > 256) {
+    return badRequest(c, "invalid_partitions", "partitions must be 1..256.");
+  }
+
+  if (stage === "pass2") {
+    if (!state) return notFound(c, version);
+    if (!["pass1-complete", "pass2", "paused"].includes(state.stage) && !(mode === "benchmark" && state.stage === "pass1")) {
+      return c.json({ error: { code: "wrong_stage" as const, message: `Pass 2 needs pass1-complete; the job is ${state.stage}.` } }, 409);
+    }
+  }
+
+  const args =
+    stage === "pass1"
+      ? [
+          "run",
+          "--version",
+          version,
+          "--partitions",
+          String(partitions),
+          ...(body.maxSourceMb ? ["--max-source-mb", String(body.maxSourceMb)] : ["--approve-full"]),
+        ]
+      : ["pass2", "--version", version, "--partitions", String(partitions), ...(mode === "benchmark" ? ["--allow-bounded"] : [])];
+
+  // The DO starts the container on the first request; the response is the CLI's
+  // NDJSON stream, which the panel renders as the live log. The instance name is
+  // stable per deployment, so a second start call reaches the same container and
+  // the CLI resumes from the durable R2 checkpoint instead of starting over.
+  const stub = container.get(container.idFromName(JOB_INSTANCE));
+  const response = await stub.fetch("http://container/job", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ args }),
+  });
+  return new Response(response.body, {
+    status: response.status,
+    headers: { "content-type": response.headers.get("content-type") ?? "application/x-ndjson", "cache-control": "no-store" },
+  });
+});
+
+/** Pause / resume / abort / approve — the same flags the engine checks. */
+indexingAdmin.post("/jobs/:version/control", async (c) => {
+  const version = sanitiseVersion(c.req.param("version"));
+  if (!version) return badRequest(c, "invalid_version", "Invalid version id.");
+  const body = (await c.req.json().catch(() => ({}))) as { action?: string };
+  const action = String(body.action ?? "");
+  if (!["pause", "resume", "abort", "approve"].includes(action)) {
+    return badRequest(c, "invalid_action", "action must be pause, resume, abort or approve.");
+  }
+  const existing = (await readControl(c.env, version)) ?? defaultControl();
+  const next: CloudControl = { ...existing, updatedAt: new Date().toISOString() };
+  if (action === "pause") next.pause = true;
+  if (action === "resume") {
+    next.pause = false;
+    next.abort = false;
+  }
+  if (action === "abort") next.abort = true;
+  if (action === "approve") next.approvedFullRun = true;
+  await writeControl(c.env, version, next);
+  return c.json({ ok: true, version, action, control: next });
+});
+
+/** Independent segment verification (Pass 1 output), summarised for the panel. */
+indexingAdmin.post("/jobs/:version/verify", async (c) => {
+  const version = sanitiseVersion(c.req.param("version"));
+  if (!version) return badRequest(c, "invalid_version", "Invalid version id.");
+  const problems: string[] = [];
+  let chunks = 0;
+  let rows = 0;
+  let segments = 0;
+  const manifestKeys = (
+    await c.env.COMPANY_DATA.list({ prefix: `${cloudKeys.jobRoot(version)}/chunks/`, limit: 1000 })
+  ).objects.filter((object) => object.key.endsWith(".json"));
+  for (const object of manifestKeys) {
+    const body = await c.env.COMPANY_DATA.get(object.key);
+    if (!body) {
+      problems.push(`${object.key}: unreadable`);
+      continue;
+    }
+    const manifest = (await body.json()) as {
+      chunk: number;
+      rows: number;
+      segments: { key: string; bytes: number; rows: number }[];
+    };
+    chunks += 1;
+    rows += manifest.rows;
+    let segmentRows = 0;
+    for (const segment of manifest.segments) {
+      const head = await c.env.COMPANY_DATA.head(segment.key);
+      if (!head || head.size !== segment.bytes) {
+        problems.push(`${segment.key}: ${head ? `size ${head.size} != ${segment.bytes}` : "missing"}`);
+        continue;
+      }
+      segments += 1;
+      segmentRows += segment.rows;
+    }
+    if (segmentRows !== manifest.rows) problems.push(`${object.key}: rows ${manifest.rows} vs segments ${segmentRows}`);
+  }
+  const ok = problems.length === 0 && chunks > 0;
+  return c.json(
+    {
+      ok,
+      output: [
+        `chunks ${chunks.toLocaleString()} · rows ${rows.toLocaleString()} · segments ${segments.toLocaleString()}`,
+        ok ? "PASS — every segment exists with the recorded size and row count." : `FAIL: ${problems.slice(0, 20).join("; ") || "no chunk manifests"}`,
+      ].join("\n"),
+    },
+    ok ? 200 : 422,
+  );
+});
+
+/**
+ * Activate a completed version.
+ *
+ * Three gates, all re-checked here rather than trusted from the browser: the job is
+ * a full run, its state is `complete`, and R2 actually holds a passed validation
+ * report for this version (`verifyRemoteVersion`). The previous version stays in R2
+ * as the rollback target.
+ */
+indexingAdmin.post("/jobs/:version/activate", async (c) => {
+  const version = sanitiseVersion(c.req.param("version"));
+  if (!version) return badRequest(c, "invalid_version", "Invalid version id.");
+  const body = (await c.req.json().catch(() => ({}))) as { confirm?: string };
+  if (body.confirm !== version) return badRequest(c, "confirmation_required", `Send confirm: "${version}".`);
+  const state = await readState(c.env, version);
+  if (!state) return notFound(c, version);
+  if (state.mode !== "full") {
+    return c.json({ error: { code: "not_activatable" as const, message: "A bounded benchmark can never be activated." } }, 409);
+  }
+  if (state.stage !== "complete") {
+    return c.json({ error: { code: "wrong_stage" as const, message: `Version is ${state.stage}, not complete.` } }, 409);
+  }
+  try {
+    const client = bindingClient(c.env.COMPANY_DATA);
+    await verifyRemoteVersion(client, version);
+    const { previousVersion } = await publishVersion(version, undefined, client);
+    return c.json({
+      ok: true,
+      version,
+      previousVersion,
+      output: `Activated ${version}.${previousVersion ? ` ${previousVersion} remains the rollback target.` : ""}`,
+    });
+  } catch (error) {
+    return c.json(
+      { error: { code: "activation_failed" as const, message: error instanceof Error ? error.message : String(error) } },
+      422,
+    );
+  }
+});
+
+/* ------------------------------ small helpers ---------------------------- */
+
+const BUCKET = "company-intel-data";
+/** The two source objects the indexer config names; HEAD only, never read here. */
+const SOURCE_OBJECTS: Record<string, string> = { csv1: "raw/file1.csv", csv2: "raw/file2.csv" };
+/** One container instance per job; the instance name is the job id. */
+const JOB_INSTANCE = "indexer";
+
+function sanitiseVersion(value: string | undefined): string | null {
+  if (!value) return null;
+  return /^[a-z0-9][a-z0-9._-]{2,60}$/i.test(value) ? value : null;
+}
+
+function defaultControl(): CloudControl {
+  return { version: CLOUD_CONTROL_VERSION, pause: false, abort: false, approvedFullRun: false, updatedAt: new Date().toISOString() };
+}
+
+function badRequest(c: AdminContext, code: string, message: string) {
+  return c.json({ error: { code, message } }, 400);
+}
+
+function notFound(c: AdminContext, version: string) {
+  return c.json({ error: { code: "no_such_job" as const, message: `No cloud job ${version}.` } }, 404);
+}
+
+function unavailable(c: AdminContext) {
+  return c.json(
+    {
+      error: {
+        code: "indexing_container_unavailable" as const,
+        message: "No INDEXER_CONTAINER binding is deployed; the control plane can read state but not start a run.",
+      },
+    },
+    503,
+  );
+}

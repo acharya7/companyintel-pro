@@ -23,7 +23,8 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 
 import { R2Client, credentialsFromEnv } from "../indexer/src/r2";
 import type { IndexerConfig } from "../indexer/src/build";
@@ -37,6 +38,7 @@ import {
 import { assembleRun } from "./assemble";
 import { forecast, type BenchmarkMeasurement } from "./cost";
 import { cloudSourcesFromConfig, runPass1, verifyRun } from "./pass1";
+import { runCloudPass2 } from "./pass2";
 import { R2BlobStore } from "./store";
 
 const root = resolve(dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "../..");
@@ -360,6 +362,52 @@ async function assemble(store: R2BlobStore): Promise<void> {
   );
 }
 
+/**
+ * Cloud Pass 2: merge the verified Pass 1 segments without a full local spool.
+ *
+ * Only a job whose Pass 1 reached `pass1-complete` and whose version has no
+ * manifest yet is accepted. Bounded benchmarks must pass the same `--partitions`
+ * they were built with; partition count is part of the spool identity.
+ */
+async function pass2(store: R2BlobStore): Promise<void> {
+  const id = version();
+  const { config } = loadConfig();
+  const partitions = num("partitions") ?? config.partitions;
+  // The container's writable layer is small; scratch lives in its temp volume and
+  // holds only the partition currently being merged.
+  const workDir =
+    typeof flag("work-dir") === "string" ? resolve(root, String(flag("work-dir"))) : join(tmpdir(), `companyintel-pass2-${id}`);
+  console.log(`\nCloud Pass 2 — ${id}`);
+  console.log(`  partitions             ${partitions}`);
+  console.log(`  scratch                ${workDir} (one partition at a time)`);
+  const before = store.countersSnapshot();
+  const started = Date.now();
+  const result = await runCloudPass2({
+    store,
+    version: id,
+    config: { ...config, partitions, datasetVersion: id },
+    workDir,
+    allowBounded: Boolean(flag("allow-bounded")),
+    onLog: (line) => console.log(`  ${line}`),
+    onProgress: (event) => {
+      if (event.stage === "pass2-merge" || event.stage === "validating") console.log(`  [${event.stage}] ${event.message}`);
+    },
+  });
+  const after = store.countersSnapshot();
+  const seconds = (Date.now() - started) / 1000;
+  console.log("\nCloud Pass 2 result");
+  console.log(`  stage                  ${result.stopped}`);
+  console.log(`  partitions             ${result.partitions}`);
+  console.log(`  rows                   ${result.rows.toLocaleString()}`);
+  console.log(`  companies / contacts   ${result.companies.toLocaleString()} / ${result.contacts.toLocaleString()}`);
+  console.log(`  index objects          ${result.indexObjects.toLocaleString()} (${gb(result.indexBytes)})`);
+  console.log(`  shard objects          ${result.shardParts.toLocaleString()}`);
+  console.log(`  time                   ${seconds.toFixed(1)} s`);
+  console.log(`  R2 Class A / Class B   ${(after.classA - before.classA).toLocaleString()} / ${(after.classB - before.classB).toLocaleString()}`);
+  console.log(`  R2 bytes read / wrote  ${gb(after.bytesRead - before.bytesRead)} / ${gb(after.bytesWritten - before.bytesWritten)}`);
+  if (result.stopped !== "complete") process.exitCode = 2;
+}
+
 async function verify(store: R2BlobStore): Promise<void> {
   const id = version();
   const { config } = loadConfig();
@@ -387,6 +435,7 @@ async function main(): Promise<void> {
         "  jobs      [--json]",
         "  pause | resume | abort | approve --version <id>",
         "  verify    --version <id> --config <cfg>",
+        "  pass2     --version <id> --config <cfg> [--partitions <n>] [--work-dir <dir>] [--allow-bounded]",
         "  assemble  --version <id> [--work-dir <dir>] [--partitions <n>]",
         "",
         "Sources must be r2://<bucket>/<key>; the bucket comes from the credentials.",
@@ -402,6 +451,7 @@ async function main(): Promise<void> {
   if (command === "jobs") return listJobs(store);
   if (command === "verify") return verify(store);
   if (command === "assemble") return assemble(store);
+  if (command === "pass2") return pass2(store);
   if (command === "pause" || command === "resume" || command === "abort" || command === "approve") return control(store, command);
   throw new Error(`Unknown command: ${command}`);
 }
