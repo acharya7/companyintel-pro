@@ -259,6 +259,15 @@ export default function IndexingControl() {
         }
       />
 
+      {staging ? (
+        <div className="mb-4 flex items-start gap-2 rounded-lg border border-chart-3/40 bg-chart-3/10 p-3 text-xs text-chart-3">
+          <ShieldCheck className="mt-0.5 size-4 shrink-0" />
+          <span>
+            Staging deployment. Version ids must start with <code className="font-mono">stg-</code>, full-corpus runs are refused, and activation
+            writes <code className="font-mono">staging/active.json</code> — the production index pointer is never touched from here.
+          </span>
+        </div>
+      ) : null}
       {error ? (
         <div className="mb-4 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-xs text-destructive">
           <AlertTriangle className="mt-0.5 size-4 shrink-0" />
@@ -452,7 +461,7 @@ export default function IndexingControl() {
                   <StatCard
                     label="Estimated spend"
                     value={`$${(state.accounting.estimatedUsd + state.accounting.containerUsd).toFixed(3)}`}
-                    hint="R2 requests + container time · not a billing cap"
+                    hint={`R2 requests + container time · ${state.accounting.budgetUsd ? `budget $${state.accounting.budgetUsd} for the whole job · ` : ""}not a billing cap`}
                     icon={<Timer className="size-4" />}
                   />
                 </div>

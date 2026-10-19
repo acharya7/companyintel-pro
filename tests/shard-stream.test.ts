@@ -42,9 +42,10 @@ describe("streamed shard serialization", () => {
 
   test("releases each term as it is written", async () => {
     const terms: Record<string, unknown> = { a: { refs: [1], q: [1] }, b: { refs: [2], q: [2] }, c: { refs: [3], q: [3] } };
-    for await (const _part of shardJsonParts(terms)) {
-      // Nothing to assert per part; the mutation below is checked afterwards.
-    }
+    // Draining the generator is what releases each term; the assertion is after it.
+    const parts: string[] = [];
+    for await (const part of shardJsonParts(terms)) parts.push(part.toString("utf8"));
+    expect(parts.length).toBeGreaterThan(0);
     expect(Object.keys(terms).length).toBe(0);
   });
 });

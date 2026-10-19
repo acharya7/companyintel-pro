@@ -100,6 +100,16 @@ owner). `bun test` runs them.
 7. Add a WAF rate-limiting rule for `/api/*` if you want a hard cap beyond the in-isolate
    limiter.
 8. Rotate R2 S3 credentials if they were ever exposed; the Worker does not use them at all.
+9. Create the Access application for the **staging** Worker hostname too, before its first
+   request, and set its `CF_ACCESS_*` secrets. Staging shares the R2 bucket and can read the
+   real sources, so it must be behind the same outer gate as production.
+10. Deploy the container to the staging Worker first (`wrangler.staging.toml`) and keep
+    production's `ACTIVE_MANIFEST_KEY` unset. Staging isolation — separate pointer, `stg-`
+    version prefix, no full-corpus starts, own DO namespace and container app — is listed in
+    `docs/staging.md` §2, and each rule is asserted in the Worker rather than documented only.
+11. Keep the deployment credential and the `R2_*` runtime credential separate: the
+    deployment token needs Workers Scripts + Containers, while `R2_*` should be an
+    **Object Read & Write** token scoped to `company-intel-data` alone (`docs/staging.md` §5).
 
 ## Residual risks (stated honestly)
 

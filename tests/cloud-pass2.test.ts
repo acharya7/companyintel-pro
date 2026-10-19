@@ -16,6 +16,7 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { gunzipSync } from "node:zlib";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -97,9 +98,34 @@ function configFor(version: string, workDir: string): IndexerConfig {
   };
 }
 
-async function seedPass1(version = "cloud-p2", partitions = 8) {
+/**
+ * A store that can be made to fail at a chosen instant, and that counts the
+ * Pass 1 segment reads a run performs. Used to prove that a restart after a
+ * completed merge rebuilds only the index — it must read zero segments.
+ */
+class FaultInjectingStore extends MemoryBlobStore {
+  failIndexWrites = false;
+  segmentReads = 0;
+
+  override async put(key: string, body: Buffer): Promise<{ etag: string | null }> {
+    if (this.failIndexWrites && key.startsWith("indexes/")) {
+      throw new Error("simulated interruption while writing the index shards");
+    }
+    return super.put(key, body);
+  }
+
+  override async getRange(key: string, offset: number, length: number): Promise<Buffer> {
+    if (key.includes("/segments/")) this.segmentReads += 1;
+    return super.getRange(key, offset, length);
+  }
+}
+
+async function seedPass1(version = "cloud-p2", partitions = 8, store = new MemoryBlobStore()) {
   const data = corpus();
-  const store = new MemoryBlobStore({ "raw/file1.csv": data.company, "raw/file2.csv": data.contact });
+  if (!store.bytes("raw/file1.csv")) {
+    await store.put("raw/file1.csv", data.company);
+    await store.put("raw/file2.csv", data.contact);
+  }
   const pass1 = await runPass1({
     store,
     version,
@@ -133,6 +159,120 @@ function outputKeys(store: MemoryBlobStore, version: string): string[] {
 }
 
 describe("cloud Pass 2", () => {
+  test("a restart after the merge rebuilds only the index, without re-reading a segment", async () => {
+    const store = new FaultInjectingStore();
+    const { data } = await seedPass1("cloud-p2-resume", 8, store);
+    const dir = mkdtempSync(join(tmpdir(), "cloud-pass2-resume-"));
+    try {
+      const workDir = join(dir, "work");
+      // Interrupt the FIRST run after the merge is finished: every write into
+      // `indexes/` fails, which is exactly the finalize phase.
+      store.failIndexWrites = true;
+      await expect(
+        runCloudPass2({ store, version: "cloud-p2-resume", config: configFor("cloud-p2-resume", workDir), workDir }),
+      ).rejects.toThrow(/simulated interruption/);
+
+      const checkpoint = await store.getJson<{ mergeComplete: boolean; partitionsDone: number; shardParts: number }>(
+        cloudKeys.pass2Checkpoint("cloud-p2-resume"),
+      );
+      expect(checkpoint?.mergeComplete).toBe(true);
+      expect(checkpoint?.partitionsDone).toBe(8);
+      expect(checkpoint?.shardParts).toBeGreaterThan(0);
+      // The merge survived: no manifest was written, so the version is not activatable.
+      expect((await store.head("manifests/cloud-p2-resume/manifest.json")).exists).toBe(false);
+
+      // Restart: the merge must NOT be repeated.
+      store.failIndexWrites = false;
+      store.segmentReads = 0;
+      const resumed = await runCloudPass2({
+        store,
+        version: "cloud-p2-resume",
+        config: configFor("cloud-p2-resume", workDir),
+        workDir,
+      });
+
+      expect(resumed.stopped).toBe("complete");
+      expect(store.segmentReads).toBe(0);
+      expect(resumed.rows).toBe(data.companyRows + data.contactRows);
+      const manifest = await store.getJson<{ validationPassed: boolean; counters: { uniqueCompanies: number } }>(
+        "manifests/cloud-p2-resume/manifest.json",
+      );
+      expect(manifest?.validationPassed).toBe(true);
+      expect(manifest?.counters.uniqueCompanies).toBe(resumed.companies);
+
+      // And the index it produced is byte-identical to a single uninterrupted run.
+      const clean = new FaultInjectingStore();
+      await seedPass1("cloud-p2-resume-clean", 8, clean);
+      const cleanDir = join(dir, "clean");
+      const cleanResult = await runCloudPass2({
+        store: clean,
+        version: "cloud-p2-resume-clean",
+        config: configFor("cloud-p2-resume-clean", cleanDir),
+        workDir: cleanDir,
+      });
+      expect(cleanResult.stopped).toBe("complete");
+      const resumedKeys = outputKeys(store, "cloud-p2-resume");
+      const cleanKeys = outputKeys(clean, "cloud-p2-resume-clean");
+      expect(resumedKeys.length).toBe(cleanKeys.length);
+      // Two different version ids are written, so the comparison replaces each run's own
+      // version with a placeholder and ignores the build timestamp. Every other byte of
+      // every object must match, which is what proves the skipped merge changed nothing.
+      const canon = (bytes: Buffer, version: string, key: string): string => {
+        const body = bytes[0] === 0x1f && bytes[1] === 0x8b ? gunzipSync(bytes) : bytes;
+        const text = body.toString("utf8");
+        if (!key.endsWith("/directory.json")) return text.split(version).join("<version>");
+        const parsed = JSON.parse(text) as Record<string, unknown>;
+        delete parsed.createdAt;
+        parsed.version = "<version>";
+        return JSON.stringify(parsed);
+      };
+      const mismatched = resumedKeys.filter((key, index) => {
+        const other = cleanKeys[index]!.replace("cloud-p2-resume-clean", "cloud-p2-resume");
+        if (other !== key) return true;
+        return canon(store.bytes(key)!, "cloud-p2-resume", key) !== canon(clean.bytes(cleanKeys[index]!)!, "cloud-p2-resume-clean", other);
+      });
+      expect(mismatched).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("the combined job budget pauses Pass 2 at a partition boundary", async () => {
+    const { store } = await seedPass1("cloud-p2-budget");
+    const dir = mkdtempSync(join(tmpdir(), "cloud-pass2-budget-"));
+    try {
+      const workDir = join(dir, "work");
+      process.env.CLOUD_JOB_BUDGET_USD = "0.000001";
+      try {
+        const paused = await runCloudPass2({
+          store,
+          version: "cloud-p2-budget",
+          config: configFor("cloud-p2-budget", workDir),
+          workDir,
+        });
+        expect(paused.stopped).toBe("paused");
+        const current = await store.getJson<{
+          stage: string;
+          note?: string;
+          accounting: { budgetUsd?: number; combinedUsd?: number; containerSeconds: number };
+        }>(cloudKeys.state("cloud-p2-budget"));
+        expect(current?.stage).toBe("paused");
+        expect(current?.note).toContain("combined estimate");
+        expect(current?.accounting.budgetUsd).toBe(0.000001);
+        expect(current?.accounting.combinedUsd).toBeGreaterThanOrEqual(0.000001);
+        // Container time counts toward the same budget, from the same stage.
+        expect(current?.accounting.containerSeconds).toBeGreaterThanOrEqual(0);
+        // The checkpoint is durable, so raising the limit resumes instead of restarting.
+        const checkpoint = await store.getJson<{ partitionsDone: number }>(cloudKeys.pass2Checkpoint("cloud-p2-budget"));
+        expect(checkpoint?.partitionsDone).toBeGreaterThan(0);
+      } finally {
+        delete process.env.CLOUD_JOB_BUDGET_USD;
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   test("merges R2 segments into the same index bytes as a local merge, one partition on disk", async () => {
     const { store, data } = await seedPass1();
     const dir = mkdtempSync(join(tmpdir(), "cloud-pass2-"));

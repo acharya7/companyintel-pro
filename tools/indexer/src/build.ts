@@ -1272,7 +1272,7 @@ export interface CloudMergeIo {
    * before the index shards are built. The driver stores this so a restart during
    * the (long, R2-bound) finalize and validation phases can skip the merge.
    */
-  onMergeComplete?(snapshot: CloudMergeSnapshot): Promise<void>;
+  onMergeComplete?(snapshot: CloudMergeResume): Promise<void>;
 }
 
 /**
@@ -1300,12 +1300,7 @@ export interface CloudMergeResume {
   objects: WrittenObject[];
 }
 
-export interface CloudMergeSnapshot extends CloudMergeResume {
-  totalPartitions: number;
-  /** Posting-shard objects written, and their total bytes (for restart checks). */
-  shardParts: number;
-  shardPartBytes: number;
-}
+
 
 export interface RunOptions {
   /** Hard cap on records per source (sample runs). */
@@ -3020,9 +3015,6 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       contactDetailPartitions,
       globalRef,
       objects: writer.objects,
-      totalPartitions,
-      shardParts: shardWriter.stats.cloudParts,
-      shardPartBytes: shardWriter.stats.cloudPartBytes,
     });
   }
 

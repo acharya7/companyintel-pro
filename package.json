@@ -14,6 +14,7 @@
     "wrangler:dry-run": "wrangler deploy --dry-run --containers-rollout=none",
     "bench:shard-memory": "bun scripts/benchmark-shard-memory.mjs",
     "typecheck": "tsc -b --noEmit && tsc -p worker/tsconfig.json --noEmit && tsc -p tools/indexer/tsconfig.json --noEmit && tsc -p probe/tsconfig.json --noEmit",
+    "verify": "bun run typecheck && bun run lint && bun test",
     "test": "bun test",
     "check": "bun scripts/check.mjs",
     "bench": "bun scripts/benchmark-search.mjs",

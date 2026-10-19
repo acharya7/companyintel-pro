@@ -14,10 +14,11 @@ Everything in this document is checked into the workspace. Nothing is deployed y
 | Cloud Pass 1 (R2 chunker + segments + checkpoints) | implemented, tested, verified against real R2 |
 | Cloud Pass 2 (partition reduce + streaming shard merge) | implemented, tested, verified against real R2 |
 | Production build (`tsc -b && vite build`) | passes in this workspace (`dist/` built) |
-| Test suite | `596 pass, 0 fail` (49 files) |
+| Test suite | `612 pass, 0 fail` (51 files), run twice after the final edit |
 | Lint / typechecks (app, worker, indexer, probe) | pass |
 | `wrangler deploy --dry-run` (production and staging) | pass; container + bindings resolve |
-| Staging Worker config (`wrangler.staging.toml`) | written, dry-run validated |
+| Staging Worker config (`wrangler.staging.toml`) | written, dry-run validated (`companyintel-staging` + `INDEXER_CONTAINER` + `COMPANY_DATA` + `staging/active.json` all resolve) |
+| Staging isolation tests | `tests/staging-isolation.test.ts` (drives the real admin router) and `tests/staging-config.test.ts` |
 | GitHub synchronization | **blocked in this environment** (`git` commands are refused); see §3 |
 | Actual Cloudflare deploy | **not done** (no API token, no Docker here) |
 | Full 64.26 GB indexing | **not started, not authorised** |
@@ -51,6 +52,17 @@ Staging shares the bucket deliberately: an isolated bucket would not benchmark t
 sources or produce a real index, and a copy of 64 GB would cost more than the benchmark.
 Sharing is safe because every write is under a `stg-` version and the pointer is separate.
 
+### A defect these tests found (fixed)
+
+Writing the isolation tests exposed a real production defect: `indexingAdmin` registered
+its routes as `/jobs`, `/preflight`, … while the Worker entrypoint dispatches the full path
+`/api/cloud/…`. Every deployed admin request would have answered **404** — the preview only
+worked because the dev server serves those routes itself. The router is now mounted with
+`basePath("/api/cloud")`, and `tests/staging-isolation.test.ts` drives the routes with their
+real URLs so it cannot regress silently. These tests also caught that a staging deployment
+answered `503` (no container bound) before it answered `403` (policy refusal) for a
+full-corpus start; policy checks now run first.
+
 ## 3. Getting this exact code onto GitHub (the one real blocker)
 
 `git` and GitHub commands are refused in this environment, and there is no push
@@ -67,7 +79,7 @@ routes moves it:
    ```
 
    Verified output from this workspace: `index-reports/companyintel-source-<date>.tar.gz`,
-   **307 entries, 0.90 MB**, sha256 printed by the script, containing `tools/cloud`,
+   **310 entries, 0.92 MB**, sha256 printed by the script, containing `tools/cloud`,
    `tools/indexer`, `cloud/`, `worker/`, `src/`, `tests/`, `docs/`, `scripts/`,
    `package.json`, `bun.lock`, `Dockerfile`, `wrangler.toml`, `wrangler.staging.toml`.
    It excludes `node_modules`, `dist`, `.git`, indexing spools/outputs, `index-reports`,
@@ -114,6 +126,12 @@ connecting the repository first, then choosing the Worker name):
 | Non-production deploy command | leave empty / `bunx wrangler versions upload` (it will not deploy containers — that is expected) |
 | Production branch | `main` (or the branch the PR merged into) |
 | API token | created by Cloudflare for Workers Builds (§5) |
+
+Verification that runs in the build itself: `bun run verify` = four typechecks + ESLint +
+the full suite (612 tests, including the staging-isolation and secret-placement guards).
+It fails the build rather than deploying a broken Worker, and it never touches production
+resources. `wrangler deploy` only runs after it passes, so a failed build cannot alter the
+production Worker.
 
 `bun run verify` runs the typechecks, the linter and the full test suite, then `bun run
 build` produces `dist/` which the Worker serves through the `ASSETS` binding. If the whole
@@ -185,6 +203,18 @@ bunx wrangler secret put R2_SECRET_ACCESS_KEY  -c wrangler.staging.toml
 `CF_ACCESS_TEAM_DOMAIN` and `CF_ACCESS_AUD` come from a **Cloudflare Access application
 that covers the staging hostname** — create it before the first request, the API fails
 closed until it exists.
+
+Verify the bindings without ever printing a value:
+
+```
+bunx wrangler secret list -c wrangler.staging.toml   # names and types only, never values
+bunx wrangler secret list                            # the production Worker
+```
+
+Locally (no credentials needed), `tests/staging-config.test.ts` asserts that neither Wrangler
+config contains a secret name or value, that only variable *names* are declared, and that the
+budget is wired through one variable. `tests/worker-r2-binding.test.ts` asserts the `R2_*`
+names appear only in the container bridge, exactly once each.
 
 ## 6. The controlled benchmark
 

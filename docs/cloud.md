@@ -118,9 +118,22 @@ output key is overwritten with the same bytes, so a replay cannot duplicate a co
 contact or a posting. A version whose `manifests/<v>/manifest.json` already exists is
 refused outright.
 
-Known limitation: replay rebuilds every shard, so an interruption late in Pass 2 costs
-the work since the last completed partition batch. A future optimization could checkpoint
-completed shards, but correctness does not depend on it.
+Restart is now checkpointed, not blind:
+
+* `cloud/jobs/<version>/pass2/checkpoint.json` is written after every merged partition;
+* when the merge finishes, the same object records `mergeComplete: true` plus everything
+  the finalize phase needs (counters, stats, partition indices, the object list);
+* a restart after that point **verifies the posting shard parts exist in R2** (count and
+  total bytes) and then rebuilds only the index shards, manifests and validation — the
+  merge is not repeated;
+* a restart *during* the merge still replays from partition 1, because document refs are
+  assigned sequentially across partitions and a partial replay would produce a different
+  index. The checkpoint makes the cost visible and bounds the loss to the finalize tail.
+
+Only one output shard is serialised at a time, and it is streamed rather than stringified
+whole (`shardJsonParts` → incremental gzip): peak memory is the largest single term plus
+compressor state, not the payload plus two full copies of it. The measured worst case and
+its arithmetic are in `docs/staging.md` §7.
 
 ## Real benchmark (bounded, real R2)
 
@@ -202,12 +215,17 @@ Those durations inherit the sandbox's 0.7 MB/s and a deliberately conservative P
 multiplier (3× Pass 1, doubled in the high case). With container-local R2 latency and the
 measured 4,000–7,000 rows/s parse rate, Pass 1 for 99 M rows is **~1–2 hours on four
 containers**, and the expected total is closer to **$3–6**; the table above is the
-conservative planning bound. The high scenario exceeds the $30 preference, so the operating rule is: a
-**per-stage budget stop**, not a claim that Cloudflare enforces the alert. Pass 1 reads
-`CLOUD_BUDGET_USD` (30 in `wrangler.toml`) and pauses at the next durable chunk boundary
-when its running estimate reaches it; benchmarks are exempt. The estimate excludes R2
-storage and requests billed after the snapshot, so this is a guard, not a guaranteed cap
-— pause/abort remain authoritative. Cloudflare's budget alert is a notification only.
+conservative planning bound. The high scenario exceeds the $30 preference, so the operating rule is one **combined
+budget for the whole job**, not a claim that Cloudflare enforces the alert. Both stages
+read `CLOUD_JOB_BUDGET_USD` (30 in `wrangler.toml`, 5 on staging; the old
+`CLOUD_BUDGET_USD` name is still accepted as a deprecated alias) and compare it with
+`accounting.estimatedUsd + accounting.containerUsd` — R2 requests **and** measured
+container seconds, from Pass 1 and Pass 2 together. Pass 1 stops at the next chunk
+boundary, Pass 2 at the next partition boundary, and both leave a resumable checkpoint.
+Benchmarks are exempt. The estimate excludes R2 storage and any request Cloudflare bills
+after the snapshot, so this is a guard, not a guaranteed cap — pause/abort remain
+authoritative and are one click in `/indexing`. Cloudflare's budget alert is a
+notification only.
 
 What the forecast includes: container CPU/memory/disk beyond the monthly allowances, R2
 Class A/B beyond 1 M/10 M, intermediate spool storage (one month), and the final index.
@@ -251,10 +269,13 @@ through the admin route, and forwards `/health` and `POST /job`.
 **Not verified here:** Docker is not installed in this workspace, there is no Cloudflare
 API token, and nothing was deployed. The config matches Cloudflare's documented schema
 (instance types, DO binding, migration), but a real deploy has not been attempted. See
-`docs/deployment.md` for the exact commands.
+`docs/deployment.md` for the exact commands, and `docs/staging.md` for the isolated
+staging Worker (`wrangler.staging.toml`), the Workers Builds settings that remove the
+Docker requirement, and the controlled benchmark plan.
 
 ## Approval needed before the full run
 
+0. Run the staging benchmark first (`docs/staging.md` §6) on a real Cloudflare Container.
 1. Review `index-reports/cloud-benchmark-cloud-bench-e.json` (or rerun the benchmark at
    a larger size) and the forecast above.
 2. Approve the full-run budget (the expected case is under $30; the conservative high is

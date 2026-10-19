@@ -21,6 +21,11 @@
  *
  * The polling endpoint never sees a raw S3 secret: the Worker has no S3 client at all.
  * Activation uses the R2 binding (`publishVersion` with a `R2Bucket`-backed client).
+ *
+ * The router is mounted with `basePath("/api/cloud")`, which is the prefix the Worker
+ * entrypoint dispatches on. Without it every route below would be registered one level
+ * too shallow and answer 404 — `tests/staging-isolation.test.ts` drives these routes
+ * with their real URLs, so that cannot regress silently.
  */
 
 import type { Context } from "hono";
@@ -38,7 +43,9 @@ import type { EnvWithContainer } from "./indexer-container";
 
 type AdminContext = Context<{ Bindings: EnvWithContainer; Variables: { identity: AccessIdentity } }>;
 
-export const indexingAdmin = new Hono<{ Bindings: EnvWithContainer; Variables: { identity: AccessIdentity } }>();
+export const indexingAdmin = new Hono<{ Bindings: EnvWithContainer; Variables: { identity: AccessIdentity } }>().basePath(
+  "/api/cloud",
+);
 
 /* ------------------------------- access ---------------------------------- */
 
@@ -135,7 +142,7 @@ async function listJobs(env: EnvWithContainer): Promise<{ state: CloudJobState; 
     .map((object) => object.key)
     .filter((key) => key.endsWith("/state.json"))
     // Staging shows its own jobs only: a production job id has no `stg-` prefix.
-    .filter((key) => !isStaging(env) || key.includes("/cloud/jobs/stg-"));
+    .filter((key) => !isStaging(env) || key.startsWith(`${STATE_PREFIX}/stg-`));
   const jobs = await Promise.all(
     keys.map(async (key) => {
       const object = await env.COMPANY_DATA.get(key);
@@ -203,7 +210,13 @@ async function activateVersion(bucket: R2Bucket, activeKey: string, version: str
 /** All jobs, plus the bucket the panel is reading. */
 indexingAdmin.get("/jobs", async (c) => {
   const jobs = await listJobs(c.env);
-  return c.json({ jobs, containerBound: Boolean(c.env.INDEXER_CONTAINER) });
+  return c.json({
+    jobs,
+    containerBound: Boolean(c.env.INDEXER_CONTAINER),
+    // The panel shows the isolation rules when this is a staging deployment, so an
+    // operator is never unsure whether they are looking at production state.
+    staging: isStaging(c.env),
+  });
 });
 
 /**
@@ -252,12 +265,8 @@ indexingAdmin.post("/jobs/:version/start", async (c) => {
   const stage = body.stage === "pass2" ? "pass2" : body.stage === "pass1" ? "pass1" : null;
   if (!stage) return badRequest(c, "invalid_stage", "stage must be pass1 or pass2.");
 
-  const container = c.env.INDEXER_CONTAINER;
-  if (!container) return unavailable(c);
-
-  const state = await readState(c.env, version);
-  const control = (await readControl(c.env, version)) ?? defaultControl();
-  const mode = body.maxSourceMb ? "benchmark" : (state?.mode ?? "full");
+  // Policy checks come before the capability check: a staging deployment must answer
+  // "this deployment never runs the full corpus" whether or not a container is bound.
   if (!body.maxSourceMb && isStaging(c.env)) {
     return c.json(
       {
@@ -269,6 +278,13 @@ indexingAdmin.post("/jobs/:version/start", async (c) => {
       403,
     );
   }
+
+  const container = c.env.INDEXER_CONTAINER;
+  if (!container) return unavailable(c);
+
+  const state = await readState(c.env, version);
+  const control = (await readControl(c.env, version)) ?? defaultControl();
+  const mode = body.maxSourceMb ? "benchmark" : (state?.mode ?? "full");
   if (!body.maxSourceMb && !control.approvedFullRun) {
     return c.json(
       {

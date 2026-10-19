@@ -273,6 +273,8 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
   }
 
   let shardParts = 0;
+  /** Bytes actually stored for the posting shards (compressed), for restart checks. */
+  let shardPartBytes = 0;
   const stateControl = async (): Promise<CloudControl | null> => store.getJson<CloudControl>(cloudKeys.control(version));
 
   let accountingCursor = countersOf(store);
@@ -340,8 +342,10 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
             stage: "merge",
             partitionsDone: config.partitions,
             partitionsTotal: config.partitions,
-            shardParts: snapshot.shardParts,
-            shardPartBytes: snapshot.shardPartBytes,
+            shardParts,
+            // Stored bytes, counted by this driver: the snapshot's own counter is
+            // the pre-compression posting size and would not match R2.
+            shardPartBytes,
             rowsMerged: totalRows,
             updatedAt: new Date(now()).toISOString(),
             mergeComplete: true,
@@ -368,27 +372,36 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
               stream.write(body, (error) => (error ? rejectWrite(error) : resolveWrite()));
             });
           };
-          for (const { segment } of sources) {
-            const body = await store.getRange(segment.key, 0, segment.bytes);
-            if (body.length !== segment.bytes) {
-              throw new Error(`${segment.key}: expected ${segment.bytes} bytes, read ${body.length}. Nothing was merged from this partition.`);
+          try {
+            for (const { segment } of sources) {
+              const body = await store.getRange(segment.key, 0, segment.bytes);
+              if (body.length !== segment.bytes) {
+                throw new Error(`${segment.key}: expected ${segment.bytes} bytes, read ${body.length}. Nothing was merged from this partition.`);
+              }
+              const actual = createHash("sha256").update(body).digest("hex");
+              if (actual !== segment.sha256) {
+                throw new Error(`${segment.key}: checksum mismatch (segment changed after Pass 1 verified it). Refusing to merge it.`);
+              }
+              // Each segment is one gzip frame; its ledger entry is exactly the frame
+              // the merge will verify, so a changed segment cannot slip through the
+              // partition checksum either.
+              await writeFrame(body, segment.rows, segment.sha256);
             }
-            const actual = createHash("sha256").update(body).digest("hex");
-            if (actual !== segment.sha256) {
-              throw new Error(`${segment.key}: checksum mismatch (segment changed after Pass 1 verified it). Refusing to merge it.`);
+            if (!frames) {
+              // An empty partition is legal. The merge expects a gzip member; write one
+              // empty member and record it, exactly as local assembly does.
+              const empty = gzipSync(Buffer.alloc(0));
+              await writeFrame(empty, 0, createHash("sha256").update(empty).digest("hex"));
             }
-            // Each segment is one gzip frame; its ledger entry is exactly the frame
-            // the merge will verify, so a changed segment cannot slip through the
-            // partition checksum either.
-            await writeFrame(body, segment.rows, segment.sha256);
+            await new Promise<void>((resolveEnd, rejectEnd) => stream.end((error?: Error | null) => (error ? rejectEnd(error) : resolveEnd())));
+          } catch (error) {
+            // A refused segment (checksum mismatch, short read) must not leave an open
+            // handle or a half-written partition behind: the stream is destroyed here so
+            // cleanup cannot race a pending write, and the caller removes the file.
+            stream.destroy();
+            rmSync(target, { force: true });
+            throw error;
           }
-          if (!frames) {
-            // An empty partition is legal. The merge expects a gzip member; write one
-            // empty member and record it, exactly as local assembly does.
-            const empty = gzipSync(Buffer.alloc(0));
-            await writeFrame(empty, 0, createHash("sha256").update(empty).digest("hex"));
-          }
-          await new Promise<void>((resolveEnd, rejectEnd) => stream.end((error?: Error | null) => (error ? rejectEnd(error) : resolveEnd())));
           const onDisk = statSync(target).size;
           if (onDisk !== bytes) throw new Error(`Materialised ${target} is ${onDisk} bytes, expected ${bytes}.`);
           writeFileSync(
@@ -427,7 +440,7 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
             partitionsDone: info.partitionsDone,
             partitionsTotal: info.partitionsTotal,
             shardParts,
-            shardPartBytes: 0,
+            shardPartBytes,
             rowsMerged: info.rows,
             updatedAt: current.updatedAt,
             mergeComplete: false,
@@ -467,8 +480,10 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
           // GET an HTTP-level decompression of a byte range (which is not a gzip
           // stream) and the read-back fails with a ZlibError. The driver gunzips
           // these itself; the Worker never reads them.
-          await store.put(key, gzipSync(body, { level: 6 }), "application/gzip");
+          const stored = gzipSync(body, { level: 6 });
+          await store.put(key, stored, "application/gzip");
           shardParts += 1;
+          shardPartBytes += stored.length;
           void batch;
         },
 
@@ -578,7 +593,7 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
     partitionsDone: config.partitions,
     partitionsTotal: config.partitions,
     shardParts,
-    shardPartBytes: 0,
+    shardPartBytes,
     rowsMerged: current.totals.rowsIndexed,
     updatedAt: current.updatedAt,
     mergeComplete: true,

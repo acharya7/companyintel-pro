@@ -28,7 +28,8 @@ bun install
 bun run check          # typechecks (frontend, worker, indexer) + full test suite
 ```
 
-Expected: `103 pass` and no TypeScript errors. If this fails, fix it before deploying.
+Expected: `612 pass` and no TypeScript errors (`bun run verify` runs all four typechecks, the
+linter and the suite). If this fails, fix it before deploying.
 
 ## 2. Log in to Cloudflare from the command line
 
@@ -211,6 +212,13 @@ first deploy; later deploys push only changed layers.
  container (see `docs/cloud.md`). Treat the first real deploy as unverified until it
  appears in the Cloudflare dashboard.
 
+**Do not deploy the container to production first.** Stand it up as the isolated staging
+Worker from `wrangler.staging.toml` and run the bounded benchmark there: that deployment
+cannot move the production index pointer, refuses full-corpus starts, and requires every
+version id to start with `stg-`. Cloudflare Workers Builds can build the container image
+inside Cloudflare, so neither Docker nor a local indexing machine is required — settings,
+permissions and the benchmark plan are in `docs/staging.md`.
+
 ## 11. Rollback
 
 Dataset Management (`/dataset`) lists known versions and lets you re-point the active version
@@ -228,12 +236,13 @@ Nothing in the old version is deleted when a new one is published, so rollback i
 ## Preserving the code without GitHub
 
 If repository synchronization is unavailable, the workspace is still the authoritative
-copy. A non-destructive archive you can store anywhere:
-
-```powershell
-tar --exclude node_modules --exclude .git --exclude ".indexer*" `
-    --exclude ".r2-credentials.json" -czf companyintel-source.tgz .
-```
+copy. `bun scripts/source-archive.mjs` writes a verified, non-destructive archive of the
+current source tree (310 entries / 0.92 MB as of this revision) into
+`index-reports/companyintel-source-<date>.tar.gz`, printing its sha256 and entry count. It
+excludes `node_modules`, `dist`, `.git`, indexing spools and outputs, raw samples, logs and
+every `.env*` / `.r2-credentials*.json`; the working tree is not modified. It is also the
+route to GitHub when this environment's `git` access is unavailable — see `docs/staging.md`
+§3.
 
 Deploy directly from this workspace with `bun run build` and `bunx wrangler deploy`; the
 container image is built from the root `Dockerfile` during that deploy. No indexing job

@@ -818,3 +818,38 @@ preview, not estimated.
 | Workers Free CPU ceiling | Needs production measurement | Documented; decision deferred to you |
 | Cold search latency is round-trip-bound | 64 small partitions + ~13 shards per search; on this 1-vCPU sandbox that is 2–5 s cold, 0.1 s warm. A real Worker's RTT is far lower, but the number is unmeasured there. Per-partition score bounds (a future format change) would end the climb sooner without risking recall. | warm path proven (156 bytes); cold cost reported honestly |
 | R2 eventually consistent writes | Two tabs, different objects | ETag preconditions + repair path |
+
+## Phase M — Cloudflare staging preparation and the controlled benchmark (this cycle)
+
+Executed here, in this workspace. Nothing was deployed and no full-corpus job was started.
+
+| Check | Result | How |
+| --- | --- | --- |
+| Production build | **PASS** — `tsc -b` + Vite, 43 assets, no errors | `bun run build` |
+| Complete test suite | **PASS — 612 pass, 0 fail** across 51 files (run twice after the final edit) | `bun test` |
+| Lint | **PASS** — 0 problems | `bun run lint` |
+| Typechecks (app, worker, indexer, probe) | **PASS** | `bun run typecheck` |
+| Wrangler configuration + Worker dry-run (production) | **PASS** — binds `INDEXER_CONTAINER`, `COMPANY_DATA`, `ASSETS`, `CLOUD_JOB_BUDGET_USD`; lists `companyintel-indexercontainer` | `bunx wrangler deploy --dry-run --containers-rollout=none` |
+| Wrangler configuration + Worker dry-run (staging) | **PASS** — `companyintel-staging`, `STAGING_MODE`, `ACTIVE_MANIFEST_KEY=staging/active.json`, `companyintel-staging-indexercontainer` | `bunx wrangler deploy -c wrangler.staging.toml --dry-run --containers-rollout=none` |
+| Container image build | **NOT RUN HERE** — Docker is not installed in this workspace. Workers Builds builds Dockerfiles inside Cloudflare, which is the intended first build. | — |
+| Secret-binding validation without values | **PASS (static)** — `tests/staging-config.test.ts` asserts neither Wrangler config contains a secret name or value; `tests/worker-r2-binding.test.ts` asserts `R2_*` appears only in the container bridge, exactly once each. `wrangler secret list` is the post-deploy check (needs a token). | same tests |
+| Staging isolation | **PASS** — `tests/staging-isolation.test.ts` drives the real admin router: an unauthenticated, unconfigured request is refused (no Access application, no dev bypass), non-`stg-` version refused (400), full-corpus start refused (403), staging lists only `stg-` jobs, activation writes `staging/active.json` while `manifests/active.json` stays byte-identical, production still activates `manifests/active.json`, and an unverifiable version cannot be activated | same test |
+| Pass 2 finalize-phase resume | **PASS** — with the finalize phase interrupted, a restart reads **0** Pass 1 segments, completes, and produces objects byte-identical to an uninterrupted run (version ids normalised) | `tests/cloud-pass2.test.ts` |
+| Combined job budget | **PASS** — `CLOUD_JOB_BUDGET_USD` pauses Pass 2 at a partition boundary using R2 + container cost; `CLOUD_BUDGET_USD` still works as a deprecated alias | `tests/cloud-budget.test.ts`, `tests/cloud-pass2.test.ts` |
+| Streamed shard serialization | **PASS** — bytes identical to `JSON.stringify` (including U+2028 and a term named `constructor`), each term released as it streams | `tests/shard-stream.test.ts` |
+| Pass 2 shard memory | **MEASURED** — `bun run bench:shard-memory`: 500 k / 2 M / 8 M postings → 10.7 / 29.0 / 300 MB peak RSS; fitted ≈ 47 B RSS and ≈ 2.27 B gzip per posting; a realistic worst case (4 M postings in one term) projects ≈ 181 MB against a 4 GiB instance | `scripts/benchmark-shard-memory.mjs` |
+| Source preservation | **PASS** — `bun scripts/source-archive.mjs`: 310 entries, 0.92 MB, sha256 `5c35f1c6…` printed, no `node_modules`, no credentials/secrets/data, working tree unmodified | script output |
+
+Two real defects were found and fixed while adding these tests:
+
+1. **`/api/cloud/*` would have answered 404 on a deployed Worker.** The admin router registered
+   `/jobs`, `/preflight`, … while the entrypoint dispatches the full path; the preview worked only
+   because the dev server serves those routes itself. Fixed with `basePath("/api/cloud")` and
+   covered by `tests/staging-isolation.test.ts`.
+2. **A refused Pass 2 partition leaked an open file handle.** A checksum mismatch destroyed the
+   merge but left the write stream open, so cleanup raced a pending write (an unhandled `ENOENT`
+   that failed a later test). `preparePartition` now destroys the stream and removes the partial
+   file before rethrowing.
+
+Remaining unverified: the Cloudflare deploy itself, the container image build, Access against a
+real deployment, every benchmark number (estimates until measured), and the full corpus.
