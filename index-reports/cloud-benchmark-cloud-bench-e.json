@@ -1,0 +1,153 @@
+{
+  "version": "cloud-bench-e",
+  "generatedAt": "2026-10-19T09:33:12.094Z",
+  "mode": "bounded real-R2 benchmark",
+  "perSourceBytes": 16777216,
+  "measurement": {
+    "sourceBytes": 33556054,
+    "seconds": 45.199,
+    "rows": 36432,
+    "rejected": 954,
+    "segmentBytes": 10544166,
+    "segments": 512,
+    "classA": 720,
+    "classB": 1360,
+    "bytesRead": 53011494,
+    "bytesWritten": 10602786,
+    "benchmarkPartitions": 16,
+    "productionPartitions": 256,
+    "objectCountsScaledBy": 16,
+    "rowsPerSecond": 806.0355317595522,
+    "sourceMbPerSecond": 0.7424070001548707,
+    "spoolRatio": 0.3142254449822974,
+    "segmentsPer1000Rows": 14.053579270970577,
+    "classAPer1000Rows": 19.76284584980237,
+    "classBPer1000Rows": 37.32981993851559,
+    "verificationOk": true,
+    "coverageNote": "bounded prefix (expected)"
+  },
+  "corpus": {
+    "bytes": 64261999620,
+    "projectedRows": 69769621
+  },
+  "forecasts": [
+    {
+      "scenario": "low",
+      "containers": 4,
+      "pass1": {
+        "sourceBytes": 64261999620,
+        "spoolBytes": 20192755426.046726,
+        "segments": 980513,
+        "wallSeconds": 14426.498225051431,
+        "vcpuSeconds": 28852.996450102863,
+        "gibSeconds": 230823.9716008229,
+        "diskGbSeconds": 461647.9432016458,
+        "classA": 1378847,
+        "classB": 2604488
+      },
+      "pass2": {
+        "wallSeconds": 86558.98935030859,
+        "vcpuSeconds": 173117.97870061718,
+        "gibSeconds": 1038707.872203703,
+        "diskGbSeconds": 2077415.744407406,
+        "inputBytes": 20192755426.046726,
+        "outputBytes": 20300000000,
+        "classA": 16240,
+        "classB": 5076
+      },
+      "storageGbMonths": 60.68551085209345,
+      "grossUsd": 8.496442377415637,
+      "billableUsd": 8.496442377415637,
+      "breakdown": {
+        "computeUsd": 5.8632491125257165,
+        "r2RequestsUsd": 1.7778915000000002,
+        "storageUsd": 0.7602826627814018
+      },
+      "notes": [
+        "Pass 1: 4 × standard-1 (0.5 vCPU / 4 GiB / 8 GB disk), 64.26 GB at 1.1 MB/s per container (measured in this sandbox, not in a container).",
+        "Measured rows/s: 806; spool expansion 31.4% of source bytes.",
+        "Pass 2: 2 × standard-2 (1 vCPU / 6 GiB / 12 GB), assumed 3× Pass 1 wall time.",
+        "Assumes the published Workers Paid monthly allowances are still available to this job."
+      ]
+    },
+    {
+      "scenario": "expected",
+      "containers": 4,
+      "pass1": {
+        "sourceBytes": 64261999620,
+        "spoolBytes": 20192755426.046726,
+        "segments": 980513,
+        "wallSeconds": 21639.747337577148,
+        "vcpuSeconds": 43279.494675154296,
+        "gibSeconds": 346235.95740123437,
+        "diskGbSeconds": 692471.9148024687,
+        "classA": 1378847,
+        "classB": 2604488
+      },
+      "pass2": {
+        "wallSeconds": 129838.48402546288,
+        "vcpuSeconds": 259676.96805092576,
+        "gibSeconds": 1558061.8083055546,
+        "diskGbSeconds": 3116123.616611109,
+        "inputBytes": 20192755426.046726,
+        "outputBytes": 20300000000,
+        "classA": 16240,
+        "classB": 5076
+      },
+      "storageGbMonths": 60.68551085209345,
+      "grossUsd": 12.175776484732754,
+      "billableUsd": 12.175776484732754,
+      "breakdown": {
+        "computeUsd": 9.469873668788575,
+        "r2RequestsUsd": 1.7778915000000002,
+        "storageUsd": 0.7602826627814018
+      },
+      "notes": [
+        "Pass 1: 4 × standard-1 (0.5 vCPU / 4 GiB / 8 GB disk), 64.26 GB at 0.7 MB/s per container (measured in this sandbox, not in a container).",
+        "Measured rows/s: 806; spool expansion 31.4% of source bytes.",
+        "Pass 2: 2 × standard-2 (1 vCPU / 6 GiB / 12 GB), assumed 3× Pass 1 wall time.",
+        "Assumes the published Workers Paid monthly allowances are still available to this job."
+      ]
+    },
+    {
+      "scenario": "high",
+      "containers": 4,
+      "pass1": {
+        "sourceBytes": 64261999620,
+        "spoolBytes": 26250582053.860744,
+        "segments": 980513,
+        "wallSeconds": 36066.24556262858,
+        "vcpuSeconds": 72132.49112525716,
+        "gibSeconds": 577059.9290020573,
+        "diskGbSeconds": 1154119.8580041146,
+        "classA": 1378847,
+        "classB": 2604488
+      },
+      "pass2": {
+        "wallSeconds": 432794.946751543,
+        "vcpuSeconds": 865589.893503086,
+        "gibSeconds": 5193539.361018516,
+        "diskGbSeconds": 10387078.722037032,
+        "inputBytes": 26250582053.860744,
+        "outputBytes": 20300000000,
+        "classA": 16240,
+        "classB": 5076
+      },
+      "storageGbMonths": 72.80116410772149,
+      "grossUsd": 35.257938779837005,
+      "billableUsd": 35.257938779837005,
+      "breakdown": {
+        "computeUsd": 31.8309459176183,
+        "r2RequestsUsd": 1.7778915000000002,
+        "storageUsd": 0.9420174616158223
+      },
+      "notes": [
+        "Pass 1: 4 × standard-1 (0.5 vCPU / 4 GiB / 8 GB disk), 64.26 GB at 0.4 MB/s per container (measured in this sandbox, not in a container).",
+        "Measured rows/s: 806; spool expansion 31.4% of source bytes.",
+        "Pass 2: 2 × standard-2 (1 vCPU / 6 GiB / 12 GB), assumed 6× Pass 1 wall time.",
+        "Assumes the published Workers Paid monthly allowances are still available to this job."
+      ]
+    }
+  ],
+  "note": "Sandbox timings (1 shared vCPU, network-bound R2 reads), NOT container timings. Pass 2 is an estimate, not a measurement. Allowances are the published Workers Paid monthly inclusions."
+}

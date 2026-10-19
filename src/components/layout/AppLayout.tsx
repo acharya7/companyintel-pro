@@ -11,6 +11,7 @@ import { NavLink, Outlet, useLocation, useNavigate } from "react-router";
 import { useTheme } from "next-themes";
 import {
   Building2,
+  Cloud,
   Database,
   FileDown,
   LayoutDashboard,
@@ -42,6 +43,7 @@ const NAV = [
   { to: "/saved-searches", label: "Saved Searches", icon: Library, hint: "Reusable queries" },
   { to: "/exports", label: "Exports", icon: FileDown, hint: "Generated CSV files" },
   { to: "/dataset", label: "Dataset", icon: Database, hint: "R2 index status and versions" },
+  { to: "/indexing", label: "Cloud Indexing", icon: Cloud, hint: "Container job state, checkpoints and cost" },
   { to: "/settings", label: "Settings", icon: SettingsIcon, hint: "Search, cache and privacy" },
 ] as const;
 

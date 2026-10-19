@@ -43,6 +43,8 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
+import { handleCloudAdmin } from "./cloud-admin.mjs";
+
 export const DEV_VERSION_ENV = "COMPANYINTEL_DEV_DATASET_VERSION";
 export const DEV_BUCKET_ENV = "COMPANYINTEL_DEV_BUCKET";
 
@@ -266,6 +268,14 @@ export function companyIntelDevApi(options = {}) {
       server.watcher.on("add", invalidate);
       server.middlewares.use(async (request, response, next) => {
         const url = request.url ?? "/";
+        /*
+         * The cloud indexing control plane is mounted BEFORE the Worker app: it
+         * talks to R2 `cloud/…` objects, which the read-only development binding
+         * deliberately cannot write. It is dev-only (this plugin is `apply: serve`).
+         */
+        if (url.startsWith("/api/cloud/")) {
+          if (await handleCloudAdmin(request, response, root)) return;
+        }
         if (!url.startsWith("/api/")) return next();
         if (process.env.COMPANYINTEL_DEV_API === "off") return next();
         try {

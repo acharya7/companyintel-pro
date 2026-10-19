@@ -23,6 +23,15 @@ export interface CsvRecord {
   fields: string[];
   /** 1-based physical line where the record started. */
   line: number;
+  /**
+   * UTF-8 byte offset of the record's terminating newline, relative to the
+   * parser's first character (absent for a record flushed by `end()`).
+   *
+   * The cloud indexer cuts a source object into independent chunks. A chunk may
+   * only end where a record ends, and this offset is what makes that boundary
+   * exact: a scan for `\n` alone would cut a quoted field that contains one.
+   */
+  endByte?: number;
 }
 
 export interface CsvParseOptions {
@@ -40,6 +49,8 @@ export class CsvParser {
   private recordStartLine = 1;
   private pendingQuote = false;
   private started = false;
+  /** UTF-8 bytes consumed so far (per code unit: ASCII 1, BMP 3, surrogate pair 4). */
+  private byte = 0;
 
   constructor(options: CsvParseOptions = {}) {
     this.delimiter = options.delimiter ?? ",";
@@ -56,6 +67,8 @@ export class CsvParser {
 
     for (let i = 0; i < chunk.length; i += 1) {
       const char = chunk[i];
+      const code = chunk.charCodeAt(i);
+      this.byte += code < 0x80 ? 1 : code < 0x800 ? 2 : code >= 0xd800 && code <= 0xdfff ? 2 : 3;
 
       if (this.pendingQuote) {
         this.pendingQuote = false;
@@ -88,7 +101,7 @@ export class CsvParser {
       if (char === "\r") continue; // handled with the following \n
       if (char === "\n") {
         this.fields.push(this.field);
-        const record: CsvRecord = { fields: this.fields, line: this.recordStartLine };
+        const record: CsvRecord = { fields: this.fields, line: this.recordStartLine, endByte: this.byte };
         this.fields = [];
         this.field = "";
         this.line += 1;
@@ -100,11 +113,31 @@ export class CsvParser {
     }
   }
 
+  /**
+   * True when no partial record is buffered.
+   *
+   * A chunk may only end here: resuming from a byte offset in the middle of a
+   * quoted field would make the parser treat that field as a new record.
+   */
+  get atRecordBoundary(): boolean {
+    return !this.inQuotes && !this.pendingQuote && this.field.length === 0 && this.fields.length === 0;
+  }
+
+  /** UTF-8 bytes fed to the parser so far. */
+  get bytesConsumed(): number {
+    return this.byte;
+  }
+
+  /** Physical lines consumed so far (newlines, including those inside quotes). */
+  get linesConsumed(): number {
+    return this.line - 1;
+  }
+
   /** Flush a trailing record when the file does not end with a newline. */
   *end(): Generator<CsvRecord> {
     if (this.field.length || this.fields.length) {
       this.fields.push(this.field);
-      const record: CsvRecord = { fields: this.fields, line: this.recordStartLine };
+      const record: CsvRecord = { fields: this.fields, line: this.recordStartLine, endByte: this.byte };
       this.fields = [];
       this.field = "";
       yield record;

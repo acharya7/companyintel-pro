@@ -20,6 +20,7 @@ const SavedLeads = lazy(() => import("./pages/SavedLeads.tsx"));
 const SavedSearches = lazy(() => import("./pages/SavedSearches.tsx"));
 const Exports = lazy(() => import("./pages/Exports.tsx"));
 const DatasetManagement = lazy(() => import("./pages/DatasetManagement.tsx"));
+const IndexingControl = lazy(() => import("./pages/IndexingControl.tsx"));
 const Settings = lazy(() => import("./pages/Settings.tsx"));
 const NotFound = lazy(() => import("./pages/NotFound.tsx"));
 
@@ -135,6 +136,7 @@ createRoot(document.getElementById("root")!).render(
                   <Route path="/saved-searches" element={<SavedSearches />} />
                   <Route path="/exports" element={<Exports />} />
                   <Route path="/dataset" element={<DatasetManagement />} />
+                  <Route path="/indexing" element={<IndexingControl />} />
                   <Route path="/settings" element={<Settings />} />
                 </Route>
                 <Route path="*" element={<NotFound />} />
