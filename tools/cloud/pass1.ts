@@ -53,6 +53,19 @@ export const R2_PRICES = {
   storagePerGbMonth: 0.015,
 } as const;
 
+/**
+ * The single budget for a whole indexing job (Pass 1 + Pass 2).
+ *
+ * `CLOUD_JOB_BUDGET_USD` is the current name; `CLOUD_BUDGET_USD` is accepted as a
+ * deprecated alias so an existing deployment does not silently lose its guard.
+ * Zero, empty or non-numeric means "no automatic stop" — pause/abort still work.
+ */
+export function cloudJobBudgetUsd(): number | null {
+  const raw = process.env.CLOUD_JOB_BUDGET_USD ?? process.env.CLOUD_BUDGET_USD ?? "";
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
 /** Container standard-1 (0.5 vCPU, 4 GiB): provisioned CPU + memory per second. */
 export const CONTAINER_PRICE = {
   vcpuPerSecond: 0.00002,
@@ -338,21 +351,23 @@ export async function runPass1(options: RunPass1Options): Promise<Pass1Result> {
       /*
        * Conservative budget guard, not a hard billing cap.
        *
-       * `CLOUD_BUDGET_USD` (30 by default in wrangler.toml) stops a full run at the
-       * next chunk once the RUNNING ESTIMATE reaches it. The estimate excludes R2
-       * storage and any request Cloudflare bills after the snapshot, so this is an
-       * operator protection, not a guarantee — pause/abort remain authoritative.
-       * Benchmarks are never stopped by it.
+       * `CLOUD_JOB_BUDGET_USD` (30 by default in wrangler.toml) stops a full run at
+       * the next chunk once the COMBINED running estimate (R2 + container, Pass 1
+       * and Pass 2) reaches it. The estimate excludes R2 storage and any request
+       * Cloudflare bills after the snapshot, so this is an operator protection, not
+       * a guarantee — pause/abort remain authoritative. Benchmarks are never
+       * stopped by it.
        */
-      const budget = Number(process.env.CLOUD_BUDGET_USD ?? "");
+      const budget = cloudJobBudgetUsd();
       const spent = state.accounting.estimatedUsd + state.accounting.containerUsd;
-      if (mode === "full" && Number.isFinite(budget) && budget > 0 && spent >= budget) {
+      if (mode === "full" && budget !== null && spent >= budget) {
         await pauseState(
           store,
           state,
           "paused",
           now(),
-          `budget guard: estimated spend $${spent.toFixed(2)} reached CLOUD_BUDGET_USD=$${budget}. Raise the limit or resume deliberately.`,
+          `budget guard: combined estimate $${spent.toFixed(2)} (R2 + container, Pass 1 and Pass 2) ` +
+            `reached CLOUD_JOB_BUDGET_USD=$${budget}. Raise the limit or resume deliberately.`,
         );
         stopped = "paused";
         checkpoints.push(checkpoint);

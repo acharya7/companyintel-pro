@@ -1,0 +1,87 @@
+# CompanyIntel — STAGING deployment (real-cloud benchmark only).
+#
+# This is a SEPARATE Worker (`companyintel-staging`) with its own Durable Object
+# namespace, its own Container application and its own migration tag. It is not the
+# application and it must never be promoted by renaming it.
+#
+# Deploy:   bunx wrangler deploy -c wrangler.staging.toml
+# Logs:     bunx wrangler tail companyintel-staging
+#
+# Isolation, in order of importance:
+#   1. ACTIVE_MANIFEST_KEY = "staging/active.json" — activation writes that object,
+#      never `manifests/active.json`. Production search is therefore untouched.
+#   2. STAGING_MODE = "true" — the admin API refuses full-corpus starts, refuses a
+#      non-`stg-` version id, and only lists `stg-…` jobs. Every object a staging
+#      job writes is under its own `stg-…` version, so no production index object
+#      is overwritten.
+#   3. The container has its own DO class instance and `max_instances = 1`; it never
+#      shares an instance with production.
+#   4. `raw/` is read-only here: the container only ever GETs source ranges.
+#
+# The R2 bucket is shared on purpose: the benchmark must read the REAL sources and
+# write a real index. Sharing the bucket is safe because every write is versioned
+# (`indexes/stg-…`, `manifests/stg-…`, `cloud/jobs/stg-…`) and the pointer is
+# separate. Nothing in this file can delete or rewrite `raw/` or an existing
+# production version.
+#
+# Secrets (never in this file; set once per staging Worker):
+#   bunx wrangler secret put CF_ACCESS_TEAM_DOMAIN -c wrangler.staging.toml
+#   bunx wrangler secret put CF_ACCESS_AUD         -c wrangler.staging.toml
+#   bunx wrangler secret put ALLOWED_EMAILS        -c wrangler.staging.toml
+#   bunx wrangler secret put INDEXING_ADMIN_EMAILS -c wrangler.staging.toml
+#   bunx wrangler secret put R2_ACCOUNT_ID         -c wrangler.staging.toml
+#   bunx wrangler secret put R2_ACCESS_KEY_ID      -c wrangler.staging.toml
+#   bunx wrangler secret put R2_SECRET_ACCESS_KEY  -c wrangler.staging.toml
+
+name = "companyintel-staging"
+main = "worker/src/index.ts"
+compatibility_date = "2025-09-01"
+compatibility_flags = ["nodejs_compat"]
+
+# A staging hostname is needed to reach the panel. Cloudflare Access must cover
+# this exact hostname BEFORE any request is served: every /api route verifies the
+# Access JWT itself and fails closed, so a missing Access application means 401,
+# never open data. See docs/staging.md.
+workers_dev = true
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+
+# Same bucket, private, binding-only. No S3 keys in the Worker.
+[[r2_buckets]]
+binding = "COMPANY_DATA"
+bucket_name = "company-intel-data"
+
+# Own Container application; the class name must match the Worker's export.
+[[containers]]
+class_name = "IndexerContainer"
+image = "./Dockerfile"
+instance_type = "standard-1"
+max_instances = 1
+
+[[durable_objects.bindings]]
+name = "INDEXER_CONTAINER"
+class_name = "IndexerContainer"
+
+# A distinct tag from production (`v1-indexer-container`). Migrations are tracked
+# per Worker script, so this cannot collide with the production script's history.
+[[migrations]]
+tag = "v1-staging-indexer-container"
+new_sqlite_classes = ["IndexerContainer"]
+
+[vars]
+ENVIRONMENT = "staging"
+APP_VERSION = "0.1.0-staging"
+STAGING_MODE = "true"
+ACTIVE_MANIFEST_KEY = "staging/active.json"
+# One budget for the WHOLE staging job (Pass 1 + Pass 2). A staging benchmark is
+# expected to cost well under $1; $5 is a stop, not a spending cap.
+CLOUD_JOB_BUDGET_USD = "5"
+MAX_SEARCHES_PER_MINUTE = "120"
+SEARCH_MAX_HYDRATE = "16"
+
+[observability]
+enabled = true
+head_sampling_rate = 1

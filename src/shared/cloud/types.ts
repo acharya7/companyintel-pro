@@ -67,6 +67,13 @@ export interface CloudAccounting {
   /** Container wall time and the conservative compute estimate at that time. */
   containerSeconds: number;
   containerUsd: number;
+  /**
+   * The one budget configured for the WHOLE job (`CLOUD_JOB_BUDGET_USD`), and the
+   * combined running estimate that is compared against it. Both stages share it;
+   * there is no separate Pass 1 / Pass 2 allowance. It is a guard, not a cap.
+   */
+  budgetUsd?: number;
+  combinedUsd?: number;
 }
 
 export interface CloudJobState {
@@ -113,6 +120,35 @@ export interface CloudJobState {
   note?: string;
 }
 
+/**
+ * Durable Pass 2 checkpoint.
+ *
+ * Written after every merged batch (`stage: "merge"`) and once more when the
+ * whole merge is finished (`mergeComplete: true`). A restart in the *finalize* or
+ * *validation* phase can therefore skip the merge — which is the part that costs
+ * hours — and rebuild only the index shards and manifests from the parts already
+ * in R2. A restart during the merge itself still replays from partition 1: the
+ * document refs are assigned sequentially across partitions, so a partial replay
+ * would produce a different index. That limitation is explicit, not hidden.
+ */
+export interface CloudPass2Checkpoint {
+  version: string;
+  stage: "merge" | "finalize" | "complete";
+  partitionsDone: number;
+  partitionsTotal: number;
+  /** Posting-shard batch objects written so far (count and total bytes). */
+  shardParts: number;
+  shardPartBytes: number;
+  rowsMerged: number;
+  updatedAt: string;
+  /**
+   * Everything the finalize phase needs, recorded once the merge has finished.
+   * Present only when `mergeComplete` is true.
+   */
+  mergeComplete: boolean;
+  resume?: unknown;
+}
+
 export interface CloudSegmentRef {
   partition: number;
   key: string;
@@ -152,7 +188,7 @@ export const cloudKeys = {
   chunkManifest: (version: string, sourceId: string, chunk: number) =>
     `${CLOUD_PREFIX}/jobs/${version}/chunks/${sourceId}/${String(chunk).padStart(6, "0")}.json`,
   segment: (version: string, sourceId: string, chunk: number, partition: number) =>
-    `${CLOUD_PREFIX}/jobs/${version}/segments/${sourceId}/${String(chunk).padStart(6, "0")}/part-${String(partition).padStart(4, "0")}.jsonl.gz`,
-  rejected: (version: string, sourceId: string, chunk: number) =>
-    `${CLOUD_PREFIX}/jobs/${version}/rejected/${sourceId}/${String(chunk).padStart(6, "0")}.jsonl.gz`,
+    `${CLOUD_PREFIX}/jobs/${version}/segments/${sourceId}/${String(chunk).padStart(6, "0")}/part-${String(partition).padStart(4, "0")}.jsonl.gz`,  rejected: (version: string, sourceId: string, chunk: number) => `${CLOUD_PREFIX}/jobs/${version}/rejected/${sourceId}/${String(chunk).padStart(6, "0")}.jsonl.gz`,
+  pass2Checkpoint: (version: string) => `${CLOUD_PREFIX}/jobs/${version}/pass2/checkpoint.json`,
+  pass2ShardRoot: (version: string) => `${CLOUD_PREFIX}/jobs/${version}/pass2/shards/`,
 } as const;

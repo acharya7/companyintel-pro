@@ -28,6 +28,20 @@ export interface Env {
   MAX_SEARCHES_PER_MINUTE?: string;
   SEARCH_MAX_HYDRATE?: string;
   /**
+   * The mutable dataset pointer this deployment reads and writes.
+   *
+   * Production leaves it unset (`manifests/active.json`). A staging deployment
+   * sets `staging/active.json`, so activating a staging benchmark can never move
+   * the production pointer — see `wrangler.staging.toml`.
+   */
+  ACTIVE_MANIFEST_KEY?: string;
+  /**
+   * "true" on the staging Worker only. It refuses full-corpus job starts, requires
+   * every indexing version id to start with `stg-`, and (with
+   * `ACTIVE_MANIFEST_KEY`) keeps activation isolated.
+   */
+  STAGING_MODE?: string;
+  /**
    * Deployment-wide allowlist for the indexing control plane (`/api/cloud/*`). When
    * empty, `ALLOWED_EMAILS` is used, because Access is already the outer gate.
    */
@@ -46,8 +60,12 @@ export interface Env {
   R2_ACCOUNT_ID?: string;
   R2_ACCESS_KEY_ID?: string;
   R2_SECRET_ACCESS_KEY?: string;
-  /** Forwarded to the container; Pass 1 pauses when its running estimate reaches it. */
-  CLOUD_BUDGET_USD?: string;
+  /**
+   * One budget for the WHOLE indexing job (Pass 1 and Pass 2 together). Forwarded
+   * to the container; either stage pauses at its next durable boundary when the
+   * combined running estimate reaches it. This is a guard, not a billing cap.
+   */
+  CLOUD_JOB_BUDGET_USD?: string;
 }
 
 export interface AccessIdentity {

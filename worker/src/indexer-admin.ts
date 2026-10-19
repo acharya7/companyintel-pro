@@ -72,6 +72,44 @@ indexingAdmin.use("*", async (c, next) => {
 
 /* ------------------------------ helpers ---------------------------------- */
 
+/**
+ * Staging isolation is enforced here, not in configuration review.
+ *
+ * The staging Worker shares the R2 bucket (it must, to benchmark the real
+ * sources), so it is kept away from production state by three rules that are
+ * checked on every relevant request:
+ *
+ *   1. every version id starts with `stg-`, so its outputs live under
+ *      `indexes/stg-…`, `companies/stg-…`, `manifests/stg-…` and no production
+ *      versioned object can be overwritten;
+ *   2. a full-corpus start is refused (only bounded benchmarks);
+ *   3. activation writes `staging/active.json` (`ACTIVE_MANIFEST_KEY`), never
+ *      `manifests/active.json`.
+ */
+function isStaging(env: EnvWithContainer): boolean {
+  return (env.STAGING_MODE ?? "").toLowerCase() === "true";
+}
+
+function stagingVersionError(env: EnvWithContainer, version: string): Response | null {
+  if (!isStaging(env)) return null;
+  if (version.startsWith("stg-")) return null;
+  return new Response(
+    JSON.stringify({
+      error: {
+        code: "staging_version_prefix_required" as const,
+        message: 'The staging deployment only accepts version ids that start with "stg-".',
+      },
+    }),
+    { status: 400, headers: { "content-type": "application/json" } },
+  );
+}
+
+/** The mutable dataset pointer for this deployment. */
+function activeKeyFor(env: EnvWithContainer): string {
+  const key = env.ACTIVE_MANIFEST_KEY;
+  return key && key.trim() ? key : "manifests/active.json";
+}
+
 async function readState(env: EnvWithContainer, version: string): Promise<CloudJobState | null> {
   const object = await env.COMPANY_DATA.get(cloudKeys.state(version));
   return object ? ((await object.json()) as CloudJobState) : null;
@@ -93,7 +131,11 @@ const STATE_PREFIX = `${cloudKeys.jobRoot("")}`.replace(/\/$/, "");
 /** Every job's durable state, newest first. Listing `cloud/jobs/` is one Class A op. */
 async function listJobs(env: EnvWithContainer): Promise<{ state: CloudJobState; control: CloudControl | null }[]> {
   const listed = await env.COMPANY_DATA.list({ prefix: `${STATE_PREFIX}/`, limit: 200 });
-  const keys = listed.objects.map((object) => object.key).filter((key) => key.endsWith("/state.json"));
+  const keys = listed.objects
+    .map((object) => object.key)
+    .filter((key) => key.endsWith("/state.json"))
+    // Staging shows its own jobs only: a production job id has no `stg-` prefix.
+    .filter((key) => !isStaging(env) || key.includes("/cloud/jobs/stg-"));
   const jobs = await Promise.all(
     keys.map(async (key) => {
       const object = await env.COMPANY_DATA.get(key);
@@ -140,16 +182,16 @@ async function verifyVersionInR2(bucket: R2Bucket, version: string): Promise<voi
 }
 
 /** Flip `manifests/active.json`, preserving the current version as the rollback target. */
-async function activateVersion(bucket: R2Bucket, version: string, actor: string): Promise<string | null> {
+async function activateVersion(bucket: R2Bucket, activeKey: string, version: string, actor: string): Promise<string | null> {
   let previousVersion: string | null = null;
-  const current = await bucket.get("manifests/active.json");
+  const current = await bucket.get(activeKey);
   if (current) {
     const pointer = (await current.json()) as { version?: string; previousVersion?: string | null };
     if (pointer.version && pointer.version !== version) previousVersion = pointer.version;
     else if (pointer.previousVersion && pointer.previousVersion !== version) previousVersion = pointer.previousVersion;
   }
   await bucket.put(
-    "manifests/active.json",
+    activeKey,
     JSON.stringify({ version, previousVersion, activatedAt: new Date().toISOString(), activatedBy: actor }),
     { httpMetadata: { contentType: "application/json" } },
   );
@@ -202,6 +244,8 @@ indexingAdmin.post("/preflight", async (c) => {
 indexingAdmin.post("/jobs/:version/start", async (c) => {
   const version = sanitiseVersion(c.req.param("version"));
   if (!version) return badRequest(c, "invalid_version", "A version id is required (letters, digits, . _ -).");
+  const stagingError = stagingVersionError(c.env, version);
+  if (stagingError) return stagingError;
   const body = (await c.req.json().catch(() => ({}))) as { stage?: string; confirm?: string; maxSourceMb?: number; partitions?: number };
   if (body.confirm !== "START") return badRequest(c, "confirmation_required", 'Send confirm: "START".');
 
@@ -214,6 +258,17 @@ indexingAdmin.post("/jobs/:version/start", async (c) => {
   const state = await readState(c.env, version);
   const control = (await readControl(c.env, version)) ?? defaultControl();
   const mode = body.maxSourceMb ? "benchmark" : (state?.mode ?? "full");
+  if (!body.maxSourceMb && isStaging(c.env)) {
+    return c.json(
+      {
+        error: {
+          code: "staging_bounded_only" as const,
+          message: "The staging deployment runs bounded benchmarks only; full-corpus indexing is refused.",
+        },
+      },
+      403,
+    );
+  }
   if (!body.maxSourceMb && !control.approvedFullRun) {
     return c.json(
       {
@@ -301,11 +356,16 @@ async function startInContainer(
 indexingAdmin.post("/jobs/:version/pass2", async (c) => {
   const version = sanitiseVersion(c.req.param("version"));
   if (!version) return badRequest(c, "invalid_version", "Invalid version id.");
+  const stagingError = stagingVersionError(c.env, version);
+  if (stagingError) return stagingError;
   const body = (await c.req.json().catch(() => ({}))) as { confirm?: string; partitions?: number };
   if (body.confirm !== "PASS2") return badRequest(c, "confirmation_required", 'Send confirm: "PASS2".');
   const state = await readState(c.env, version);
   if (!state) return notFound(c, version);
   const control = (await readControl(c.env, version)) ?? defaultControl();
+  if (state.mode === "full" && isStaging(c.env)) {
+    return c.json({ error: { code: "staging_bounded_only" as const, message: "The staging deployment never merges a full-corpus job." } }, 403);
+  }
   if (state.mode === "full" && !control.approvedFullRun) {
     return c.json({ error: { code: "approval_required" as const, message: "A full-corpus Pass 2 requires approvedFullRun." } }, 403);
   }
@@ -331,6 +391,8 @@ indexingAdmin.post("/jobs/benchmark", async (c) => {
   if (body.confirm !== "BENCHMARK") return badRequest(c, "confirmation_required", 'Send confirm: "BENCHMARK".');
   const version = sanitiseVersion(body.version);
   if (!version) return badRequest(c, "invalid_version", "A version id is required (letters, digits, . _ -).");
+  const stagingError = stagingVersionError(c.env, version);
+  if (stagingError) return stagingError;
   const maxSourceMb = Number(body.maxSourceMb ?? 16);
   const partitions = Number(body.partitions ?? 16);
   if (!Number.isFinite(maxSourceMb) || maxSourceMb <= 0 || maxSourceMb > 256) {
@@ -357,6 +419,8 @@ indexingAdmin.post("/jobs/benchmark", async (c) => {
 indexingAdmin.post("/jobs/:version/control", async (c) => {
   const version = sanitiseVersion(c.req.param("version"));
   if (!version) return badRequest(c, "invalid_version", "Invalid version id.");
+  const stagingError = stagingVersionError(c.env, version);
+  if (stagingError) return stagingError;
   const body = (await c.req.json().catch(() => ({}))) as { action?: string };
   const action = String(body.action ?? "");
   if (!["pause", "resume", "abort", "approve"].includes(action)) {
@@ -379,6 +443,8 @@ indexingAdmin.post("/jobs/:version/control", async (c) => {
 indexingAdmin.post("/jobs/:version/verify", async (c) => {
   const version = sanitiseVersion(c.req.param("version"));
   if (!version) return badRequest(c, "invalid_version", "Invalid version id.");
+  const stagingError = stagingVersionError(c.env, version);
+  if (stagingError) return stagingError;
   const problems: string[] = [];
   let chunks = 0;
   let rows = 0;
@@ -435,6 +501,8 @@ indexingAdmin.post("/jobs/:version/verify", async (c) => {
 indexingAdmin.post("/jobs/:version/activate", async (c) => {
   const version = sanitiseVersion(c.req.param("version"));
   if (!version) return badRequest(c, "invalid_version", "Invalid version id.");
+  const stagingError = stagingVersionError(c.env, version);
+  if (stagingError) return stagingError;
   const body = (await c.req.json().catch(() => ({}))) as { confirm?: string };
   if (body.confirm !== version) return badRequest(c, "confirmation_required", `Send confirm: "${version}".`);
   const state = await readState(c.env, version);
@@ -447,7 +515,8 @@ indexingAdmin.post("/jobs/:version/activate", async (c) => {
   }
   try {
     await verifyVersionInR2(c.env.COMPANY_DATA, version);
-    const previousVersion = await activateVersion(c.env.COMPANY_DATA, version, c.get("identity").email);
+    // Staging flips `staging/active.json`; production keeps `manifests/active.json`.
+    const previousVersion = await activateVersion(c.env.COMPANY_DATA, activeKeyFor(c.env), version, c.get("identity").email);
     return c.json({
       ok: true,
       version,

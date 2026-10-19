@@ -79,6 +79,8 @@ app.use("*", async (c, next) => {
     new R2Store(c.env.COMPANY_DATA, {
       cache: searchCacheFor(c.env.COMPANY_DATA),
       metrics: c.get("metrics"),
+      // Unset in production; `staging/active.json` on the staging Worker.
+      activeManifestKey: c.env.ACTIVE_MANIFEST_KEY,
     }),
   );
   await next();

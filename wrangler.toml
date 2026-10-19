@@ -1,6 +1,7 @@
 # CompanyIntel — Cloudflare Workers + R2 deployment configuration.
 #
 # Deploy:   bunx wrangler deploy
+# Staging:  bunx wrangler deploy -c wrangler.staging.toml   (see wrangler.staging.toml)
 # Preview:  bunx wrangler dev            (local, synthetic data allowed)
 #
 # Secrets are NEVER stored in this file. Set them once with:
@@ -73,10 +74,11 @@ ENVIRONMENT = "production"
 APP_VERSION = "0.1.0"
 # Per-identity API rate limit (requests per minute per route group).
 MAX_SEARCHES_PER_MINUTE = "180"
-# Conservative, non-binding guard: Pass 1 pauses at the next chunk when its running
-# estimate reaches this many dollars. It is not a hard billing cap (storage and
+# ONE budget for the whole indexing job, Pass 1 and Pass 2 together. Either stage
+# pauses at its next durable boundary (chunk / partition batch) when the combined
+# running estimate reaches it. It is not a hard billing cap (storage and
 # post-snapshot requests are excluded); pause/abort remain authoritative.
-CLOUD_BUDGET_USD = "30"
+CLOUD_JOB_BUDGET_USD = "30"
 
 # Search hydration dial: company profile partitions read per search. Each read
 # costs ~25 KB, so this is the query's byte ceiling (see docs/architecture.md).

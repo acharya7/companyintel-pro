@@ -10,7 +10,7 @@
  * from a browser control.
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Activity, AlertTriangle, Cloud, Database, Gauge, HardDrive, Layers, Pause, Play, RefreshCw, ShieldCheck, Square, Timer } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -19,7 +19,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { EmptyState, PageHeader, Section, StatCard, StatusPill } from "@/components/common";
 import type { CloudControl, CloudJobState } from "@/shared/cloud/types";
 
-type JobsResponse = { jobs: { state: CloudJobState; control: CloudControl | null }[] };
+type JobsResponse = { jobs: { state: CloudJobState; control: CloudControl | null }[]; containerBound?: boolean; staging?: boolean };
 
 async function admin<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -65,7 +65,9 @@ export default function IndexingControl() {
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [verifyOutput, setVerifyOutput] = useState<string | null>(null);
+  const [staging, setStaging] = useState(false);
   const [benchVersion, setBenchVersion] = useState(`bench-${new Date().toISOString().slice(0, 10)}`);
+  const stagingPrefixApplied = useRef(false);
   const [benchMb, setBenchMb] = useState("16");
   const [benchPartitions, setBenchPartitions] = useState("16");
 
@@ -74,6 +76,13 @@ export default function IndexingControl() {
       const data = await admin<JobsResponse>("/api/cloud/jobs");
       setJobs(data.jobs);
       setSelected((current) => current ?? data.jobs[0]?.state.version ?? null);
+      setStaging(Boolean(data.staging));
+      // A staging deployment only accepts `stg-` version ids; default the benchmark
+      // field to one so the first attempt is not a 400.
+      if (data.staging && !stagingPrefixApplied.current) {
+        stagingPrefixApplied.current = true;
+        setBenchVersion((current) => (current.startsWith("stg-") ? current : `stg-${current}`));
+      }
       setError(null);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));

@@ -26,7 +26,7 @@ import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, type Wri
 import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { cpus, freemem, totalmem } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
-import { gunzipSync, gzipSync } from "node:zlib";
+import { createGzip, gunzipSync, gzipSync } from "node:zlib";
 
 import type { AssociationCounts, Company, Contact, DatasetStats, DatasetVersionSummary, FacetBucket, IndexingCounters, SourceRef, UnassignedContact } from "../../../src/shared/models";
 import { NO_CLAIM_REF, associateContact, type AssociationCandidate, type AssociationRecord } from "../../../src/shared/association";
@@ -785,6 +785,10 @@ export interface ShardWriteStats {
   peakBufferedBytes: number;
   /** Highest number of file handles open at once. */
   peakOpenHandles: number;
+  /** Bytes of posting-shard objects flushed to R2 (Cloud Pass 2 only). */
+  cloudPartBytes: number;
+  /** Posting-shard objects flushed to R2 (Cloud Pass 2 only). */
+  cloudParts: number;
 }
 
 /**
@@ -828,6 +832,8 @@ class ShardWriter {
     flushes: 0,
     peakBufferedBytes: 0,
     peakOpenHandles: 0,
+    cloudPartBytes: 0,
+    cloudParts: 0,
   };
 
   constructor(
@@ -893,7 +899,10 @@ class ShardWriter {
       const lines = this.groups.get(key)!;
       const kind = SHARD_KINDS[Math.floor(key / SHARD_KEY_STRIDE)];
       const shard = key % SHARD_KEY_STRIDE;
-      await io.writeShardPart(batch, kind, shard, Buffer.from(lines.join(""), "utf8"));
+      const body = Buffer.from(lines.join(""), "utf8");
+      await io.writeShardPart(batch, kind, shard, body);
+      this.stats.cloudPartBytes += body.length;
+      this.stats.cloudParts += 1;
     }
     this.groups.clear();
     this.bufferedBytes = 0;
@@ -951,6 +960,37 @@ interface WrittenObject {
   gzip: boolean;
 }
 
+/**
+ * Serialise a shard payload as a stream of JSON fragments.
+ *
+ * WHY THIS EXISTS (the Pass 2 memory bound)
+ * -----------------------------------------
+ * `JSON.stringify(payload)` builds the WHOLE shard as one JavaScript string, and
+ * `gzipSync` then holds it plus the raw Buffer plus the compressed output at once —
+ * roughly 2.2x the payload in peak memory, on top of the payload itself. A
+ * `token`/`contactToken` shard for a very common term is the worst case, and it is
+ * exactly the case that would be measured last.
+ *
+ * This generator emits one term at a time, and frees each term's arrays as it
+ * goes, so the peak is the largest SINGLE term plus the compressor state instead
+ * of the largest whole shard plus two copies of it. The bytes are identical: the
+ * `terms` object keys are emitted in insertion (posting) order, which JSON does
+ * not care about, and every string goes through `JSON.stringify` so a term
+ * containing a quote, a backslash or U+2028 stays correctly escaped.
+ */
+export async function* shardJsonParts(terms: Record<string, unknown>): AsyncIterable<Buffer> {
+  const keys = Object.keys(terms);
+  yield Buffer.from('{"terms":{', "utf8");
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index]!;
+    const value = terms[key];
+    // Released before the next term is written: the payload shrinks as it streams.
+    delete terms[key];
+    yield Buffer.from(`${index ? "," : ""}${JSON.stringify(key)}:${JSON.stringify(value)}`, "utf8");
+  }
+  yield Buffer.from("}}", "utf8");
+}
+
 class ObjectWriter {
   readonly objects: WrittenObject[] = [];
 
@@ -963,6 +1003,32 @@ class ObjectWriter {
     private readonly outputDir: string,
     private readonly put?: (key: string, body: Buffer, gzip: boolean) => Promise<void>,
   ) {}
+
+  /**
+   * Write a JSON document assembled from fragments, compressing as it streams.
+   *
+   * Same destination, same bytes and same accounting as `writeJson`, but the peak
+   * memory is the compressor plus one fragment instead of the whole document (see
+   * `shardJsonParts`). Used for the index shards, which are the only objects whose
+   * size is driven by data the run cannot pre-size.
+   */
+  async writeJsonParts(key: string, parts: AsyncIterable<Buffer>, gzip = true): Promise<WrittenObject> {
+    const body = gzip ? await gzipBufferFrom(parts) : Buffer.concat(await collectBuffers(parts));
+    if (this.put) await this.put(key, body, gzip);
+    else {
+      const path = join(this.outputDir, key);
+      await mkdir(dirname(path), { recursive: true });
+      await writeFile(path, body);
+    }
+    const object: WrittenObject = {
+      key,
+      bytes: body.length,
+      sha256: createHash("sha256").update(body).digest("hex"),
+      gzip,
+    };
+    this.objects.push(object);
+    return object;
+  }
 
   async writeJson(key: string, value: unknown, gzip = true): Promise<WrittenObject> {
     const raw = Buffer.from(JSON.stringify(value), "utf8");
@@ -995,6 +1061,30 @@ class ObjectWriter {
     this.objects.push(object);
     return object;
   }
+}
+
+/** Stream a sequence of buffers through gzip and return the compressed bytes. */
+async function gzipBufferFrom(parts: AsyncIterable<Buffer>): Promise<Buffer> {
+  const stream = createGzip({ level: 6 });
+  const chunks: Buffer[] = [];
+  stream.on("data", (chunk: Buffer) => chunks.push(chunk));
+  const finished = new Promise<void>((resolveDone, rejectDone) => {
+    stream.on("end", () => resolveDone());
+    stream.on("error", rejectDone);
+  });
+  for await (const part of parts) {
+    // Respect backpressure so the compressor's own buffers stay bounded.
+    if (!stream.write(part)) await new Promise<void>((resolveDrain) => stream.once("drain", () => resolveDrain()));
+  }
+  stream.end();
+  await finished;
+  return Buffer.concat(chunks);
+}
+
+async function collectBuffers(parts: AsyncIterable<Buffer>): Promise<Buffer[]> {
+  const chunks: Buffer[] = [];
+  for await (const part of parts) chunks.push(part);
+  return chunks;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1177,6 +1267,44 @@ export interface CloudMergeIo {
   writeObject(key: string, body: Buffer, gzip: boolean): Promise<void>;
   /** Read one written object back for validation. */
   readObject(key: string): Promise<Buffer>;
+  /**
+   * Called when the merge has finished and every posting shard has been flushed,
+   * before the index shards are built. The driver stores this so a restart during
+   * the (long, R2-bound) finalize and validation phases can skip the merge.
+   */
+  onMergeComplete?(snapshot: CloudMergeSnapshot): Promise<void>;
+}
+
+/**
+ * Everything the finalize phase needs after the merge, serialisable to R2.
+ *
+ * Document refs are assigned sequentially while merging, so the merge itself
+ * cannot be resumed half-way without producing a different index. Once the merge
+ * has finished, though, the expensive part is behind us: this snapshot is the
+ * whole input of finalize + validation, and a restart from it is exact.
+ */
+export interface CloudMergeResume {
+  counters: IndexingCounters;
+  companyStats: { byIndustry: [string, number][]; byCountry: [string, number][]; bySize: [string, number][] };
+  contactStats: { byDesignation: [string, number][]; byDepartment: [string, number][]; bySeniority: [string, number][] };
+  coverage: { email: number; linkedin: number; phone: number; neither: number };
+  companyBuffer: Company[];
+  companyBufferStart: number;
+  contactBuffer: [number, Contact[]][];
+  contactBufferBucket: number;
+  companyPartitionIndex: number;
+  contactPartitionIndex: number;
+  companyDetailPartitions: number;
+  contactDetailPartitions: number;
+  globalRef: number;
+  objects: WrittenObject[];
+}
+
+export interface CloudMergeSnapshot extends CloudMergeResume {
+  totalPartitions: number;
+  /** Posting-shard objects written, and their total bytes (for restart checks). */
+  shardParts: number;
+  shardPartBytes: number;
 }
 
 export interface RunOptions {
@@ -1218,6 +1346,13 @@ export interface RunOptions {
    * full local spool or index. Set only by `tools/cloud/pass2.ts`.
    */
   cloud?: CloudMergeIo;
+  /**
+   * Resume a Cloud Pass 2 whose merge already finished: skip the partition loop and
+   * rebuild only the index shards, manifests and validation from the R2 state the
+   * snapshot records. Set only by `tools/cloud/pass2.ts` from its durable
+   * checkpoint, and only after the shard parts have been verified to exist.
+   */
+  cloudResume?: CloudMergeResume;
 }
 
 export interface RunResult {
@@ -2161,6 +2296,46 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   let companyDetailPartitions = 0;
   let contactDetailPartitions = 0;
 
+  /*
+   * Resume after a completed merge.
+   *
+   * The snapshot is only accepted when the driver has already verified that every
+   * shard part it names is present in R2. Everything the finalize phase reads is
+   * restored here, so finalize + validation produce exactly the objects a single
+   * uninterrupted run would have produced, and the merge is not repeated.
+   */
+  const mergeResume = options.cloudResume;
+  if (mergeResume) {
+    Object.assign(counters, mergeResume.counters);
+    companyStats.byIndustry = new Map(mergeResume.companyStats.byIndustry);
+    companyStats.byCountry = new Map(mergeResume.companyStats.byCountry);
+    companyStats.bySize = new Map(mergeResume.companyStats.bySize);
+    contactStats.byDesignation = new Map(mergeResume.contactStats.byDesignation);
+    contactStats.byDepartment = new Map(mergeResume.contactStats.byDepartment);
+    contactStats.bySeniority = new Map(mergeResume.contactStats.bySeniority);
+    coverage.email = mergeResume.coverage.email;
+    coverage.linkedin = mergeResume.coverage.linkedin;
+    coverage.phone = mergeResume.coverage.phone;
+    coverage.neither = mergeResume.coverage.neither;
+    companyBuffer = mergeResume.companyBuffer ?? [];
+    companyBufferStart = mergeResume.companyBufferStart ?? 0;
+    contactBuffer = new Map(mergeResume.contactBuffer ?? []);
+    contactBufferBucket = mergeResume.contactBufferBucket ?? 0;
+    companyPartitionIndex = mergeResume.companyPartitionIndex;
+    contactPartitionIndex = mergeResume.contactPartitionIndex;
+    companyDetailPartitions = mergeResume.companyDetailPartitions;
+    contactDetailPartitions = mergeResume.contactDetailPartitions;
+    globalRef = mergeResume.globalRef;
+    writer.objects.push(...mergeResume.objects);
+    emit({
+      stage: "pass2-merge",
+      message:
+        `pass 2: resuming after a completed merge — ${mergeResume.counters.uniqueCompanies.toLocaleString()} companies, ` +
+        `${mergeResume.counters.uniqueContacts.toLocaleString()} contacts and ${mergeResume.objects.length.toLocaleString()} objects were already ` +
+        "written; only the index shards, manifests and validation are rebuilt.",
+    });
+  }
+
   /**
    * Write one company partition as a SEARCH PROJECTION plus its detail object.
    *
@@ -2240,7 +2415,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   /** Timestamp of the last progress or heartbeat line, so heartbeats cannot spam. */
   let lastEmitAt = mergeStart;
 
-  for (let fileIndex = 0; fileIndex < spoolEntries.length; fileIndex += 1) {
+  for (let fileIndex = mergeResume ? spoolEntries.length : 0; fileIndex < spoolEntries.length; fileIndex += 1) {
     const entry = spoolEntries[fileIndex];
     const path = join(spoolDir, entry.file);
     const partitionStart = Date.now();
@@ -2819,6 +2994,38 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   shardWriter.close();
   await new Promise<void>((resolve) => rejected.end(resolve));
 
+  // The merge is finished and every shard part is in R2: record everything the
+  // finalize phase needs, so a restart from here never repeats the merge.
+  if (cloud?.onMergeComplete) {
+    await cloud.onMergeComplete({
+      counters,
+      companyStats: {
+        byIndustry: [...companyStats.byIndustry.entries()],
+        byCountry: [...companyStats.byCountry.entries()],
+        bySize: [...companyStats.bySize.entries()],
+      },
+      contactStats: {
+        byDesignation: [...contactStats.byDesignation.entries()],
+        byDepartment: [...contactStats.byDepartment.entries()],
+        bySeniority: [...contactStats.bySeniority.entries()],
+      },
+      coverage: { ...coverage },
+      companyBuffer,
+      companyBufferStart,
+      contactBuffer: [...contactBuffer.entries()],
+      contactBufferBucket,
+      companyPartitionIndex,
+      contactPartitionIndex,
+      companyDetailPartitions,
+      contactDetailPartitions,
+      globalRef,
+      objects: writer.objects,
+      totalPartitions,
+      shardParts: shardWriter.stats.cloudParts,
+      shardPartBytes: shardWriter.stats.cloudPartBytes,
+    });
+  }
+
   /* -------------------------------- finalize ------------------------------ */
 
   const finalizeStart = Date.now();
@@ -2834,7 +3041,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       const payload = cloud
         ? await companyShardPayload(linesFromParts(cloud.readShardParts(kind, shard)), `${kind}/${name}`)
         : await companyShardPayload(readJsonlLines(linesPath), `${kind}/${name}`);
-      await writer.writeJson(folderFor("indexes", config.datasetVersion, `${kind}/${name}.json`), payload);
+      await writer.writeJsonParts(folderFor("indexes", config.datasetVersion, `${kind}/${name}.json`), shardJsonParts(payload.terms));
       if (!cloud) await rm(linesPath, { force: true });
     }
   };
@@ -2854,7 +3061,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       const payload = cloud
         ? await contactShardPayload(linesFromParts(cloud.readShardParts(kind, shard)), `${kind}/${name}`)
         : await contactShardPayload(readJsonlLines(linesPath), `${kind}/${name}`);
-      await writer.writeJson(folderFor("indexes", config.datasetVersion, `${kind}/${name}.json`), payload);
+      await writer.writeJsonParts(folderFor("indexes", config.datasetVersion, `${kind}/${name}.json`), shardJsonParts(payload.terms));
       if (!cloud) await rm(linesPath, { force: true });
     }
   };

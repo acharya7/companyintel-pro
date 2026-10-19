@@ -9,6 +9,10 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "preview": "vite preview",
+    "deploy:staging": "wrangler deploy -c wrangler.staging.toml",
+    "deploy:production": "wrangler deploy",
+    "wrangler:dry-run": "wrangler deploy --dry-run --containers-rollout=none",
+    "bench:shard-memory": "bun scripts/benchmark-shard-memory.mjs",
     "typecheck": "tsc -b --noEmit && tsc -p worker/tsconfig.json --noEmit && tsc -p tools/indexer/tsconfig.json --noEmit && tsc -p probe/tsconfig.json --noEmit",
     "test": "bun test",
     "check": "bun scripts/check.mjs",
@@ -101,6 +105,7 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261015.1",
+    "wrangler": "^4.151.2",
     "@eslint/js": "^9.39.1",
     "@types/node": "^24.10.1",
     "@types/react": "^19.2.7",

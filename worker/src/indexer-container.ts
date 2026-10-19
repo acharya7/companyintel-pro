@@ -75,7 +75,8 @@ export class IndexerContainer implements DurableObject {
         if (this.env.R2_ACCOUNT_ID) env.R2_ACCOUNT_ID = this.env.R2_ACCOUNT_ID;
         if (this.env.R2_ACCESS_KEY_ID) env.R2_ACCESS_KEY_ID = this.env.R2_ACCESS_KEY_ID;
         if (this.env.R2_SECRET_ACCESS_KEY) env.R2_SECRET_ACCESS_KEY = this.env.R2_SECRET_ACCESS_KEY;
-        if (this.env.CLOUD_BUDGET_USD) env.CLOUD_BUDGET_USD = this.env.CLOUD_BUDGET_USD;
+        // One budget for Pass 1 and Pass 2 together (see docs/cloud.md).
+        if (this.env.CLOUD_JOB_BUDGET_USD) env.CLOUD_JOB_BUDGET_USD = this.env.CLOUD_JOB_BUDGET_USD;
         await container.start({ enableInternet: true, env: Object.keys(env).length ? env : undefined });
       }
     });

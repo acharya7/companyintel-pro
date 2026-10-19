@@ -33,12 +33,19 @@ import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rm
 import { join, resolve } from "node:path";
 import { gzipSync, gunzipSync } from "node:zlib";
 
-import { identityFor, runIndex, type IndexerConfig, type ProgressEvent } from "../indexer/src/build";
+import { identityFor, runIndex, type CloudMergeResume, type IndexerConfig, type ProgressEvent } from "../indexer/src/build";
 import type { SpoolManifest } from "../indexer/src/spool";
 import { spoolV2SidecarName, type SpoolFrameEntry, type SpoolSchema } from "../indexer/src/spool-v2";
-import { cloudKeys, type CloudChunkManifest, type CloudControl, type CloudJobState, type CloudSegmentRef } from "../../src/shared/cloud/types";
+import {
+  cloudKeys,
+  type CloudChunkManifest,
+  type CloudControl,
+  type CloudJobState,
+  type CloudPass2Checkpoint,
+  type CloudSegmentRef,
+} from "../../src/shared/cloud/types";
 
-import { R2_PRICES, type SourceCheckpoint } from "./pass1";
+import { CONTAINER_PRICE, R2_PRICES, cloudJobBudgetUsd, type SourceCheckpoint } from "./pass1";
 import type { BlobStore } from "./store";
 
 export interface CloudPass2Result {
@@ -56,8 +63,11 @@ export interface CloudPass2Result {
 
 /** Thrown between partitions when the operator asked the job to stop. */
 class CloudStop extends Error {
-  constructor(readonly kind: "paused" | "aborted") {
-    super(kind === "paused" ? "paused by operator" : "aborted by operator");
+  constructor(
+    readonly kind: "paused" | "aborted",
+    readonly reason?: string,
+  ) {
+    super(reason ?? (kind === "paused" ? "paused by operator" : "aborted by operator"));
   }
 }
 
@@ -265,10 +275,53 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
   let shardParts = 0;
   const stateControl = async (): Promise<CloudControl | null> => store.getJson<CloudControl>(cloudKeys.control(version));
 
-  const countersBefore = countersOf(store);
+  let accountingCursor = countersOf(store);
+  let accountingClock = startedMs;
   const outputDir = join(workDir, "out");
   mkdirSync(outputDir, { recursive: true });
   const projectConfig: IndexerConfig = { ...config, workDir, outputDir, datasetVersion: version };
+  /** Persist R2 + container cost for the partitions merged since the last call. */
+  const reconcileAccounting = async (current: CloudJobState): Promise<number> => {
+    const at = now();
+    await updateAccounting(store, current, accountingCursor, (at - accountingClock) / 1000);
+    accountingCursor = countersOf(store);
+    accountingClock = at;
+    return current.accounting.estimatedUsd + current.accounting.containerUsd;
+  };
+
+  /*
+   * Durable Pass 2 checkpoint.
+   *
+   * `stage: "merge"` records progress after every partition. When the merge has
+   * finished, `mergeComplete: true` plus the finalize snapshot is written: a
+   * restart after that point rebuilds only the index shards, manifests and
+   * validation, and skips the merge entirely — but only after the shard parts it
+   * refers to have been verified to exist with the recorded count and size. If
+   * anything disagrees the run falls back to the full deterministic replay, which
+   * overwrites every output with identical bytes.
+   */
+  const existingCheckpoint = await store.getJson<CloudPass2Checkpoint>(cloudKeys.pass2Checkpoint(version));
+  let resumeState: CloudMergeResume | null = null;
+  if (existingCheckpoint?.mergeComplete && existingCheckpoint.resume) {
+    const problems = await verifyShardParts(store, version, existingCheckpoint.shardParts, existingCheckpoint.shardPartBytes);
+    if (problems.length) {
+      log(
+        `pass 2: a previous merge completed, but its posting shards do not check out (${problems[0]}); ` +
+          "replaying the merge from partition 1 instead.",
+      );
+    } else {
+      resumeState = existingCheckpoint.resume as CloudMergeResume;
+      log(
+        `pass 2: restarting AFTER a completed merge (${existingCheckpoint.partitionsDone}/${existingCheckpoint.partitionsTotal} partitions, ` +
+          `${existingCheckpoint.shardParts.toLocaleString()} shard parts verified in R2). The merge is not repeated; ` +
+          "the index shards, manifests and validation are rebuilt.",
+      );
+    }
+  }
+
+  const writeCheckpoint = async (checkpoint: CloudPass2Checkpoint) => {
+    await store.putJson(cloudKeys.pass2Checkpoint(version), checkpoint);
+  };
 
   let stopped: CloudPass2Result["stopped"] = "complete";
   let result: Awaited<ReturnType<typeof runIndex>> | null = null;
@@ -279,7 +332,23 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
       importedRows: totalRows,
       diskFloorBytes: options.diskFloorBytes ?? 64 * 1024 * 1024,
       onProgress: options.onProgress,
+      ...(resumeState ? { cloudResume: resumeState } : {}),
       cloud: {
+        onMergeComplete: async (snapshot) => {
+          await writeCheckpoint({
+            version,
+            stage: "merge",
+            partitionsDone: config.partitions,
+            partitionsTotal: config.partitions,
+            shardParts: snapshot.shardParts,
+            shardPartBytes: snapshot.shardPartBytes,
+            rowsMerged: totalRows,
+            updatedAt: new Date(now()).toISOString(),
+            mergeComplete: true,
+            // Everything finalize needs, so a restart in that phase is exact.
+            resume: snapshot,
+          });
+        },
         preparePartition: async (entry) => {
           const target = join(spoolDir, entry.file);
           const sources = segmentsByPartition.get(entry.partition) ?? [];
@@ -352,6 +421,17 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
                 ? Math.round(((info.elapsedMs / info.partitionsDone) * (info.partitionsTotal - info.partitionsDone)) / 1000)
                 : 0,
           };
+          await writeCheckpoint({
+            version,
+            stage: "merge",
+            partitionsDone: info.partitionsDone,
+            partitionsTotal: info.partitionsTotal,
+            shardParts,
+            shardPartBytes: 0,
+            rowsMerged: info.rows,
+            updatedAt: current.updatedAt,
+            mergeComplete: false,
+          });
           const indexObjects = (await store.list(`indexes/${version}/`)).length;
           current.pass2 = {
             partitionsDone: info.partitionsDone,
@@ -362,6 +442,22 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
             rowsPerSecond: current.rate.rowsPerSecond,
             updatedAt: current.updatedAt,
           };
+          await store.putJson(cloudKeys.state(version), current);
+
+          // Combined job budget: R2 requests + container time, across BOTH stages.
+          // Checked at the partition boundary, which is also where a restart is
+          // safe. Benchmarks are never stopped by it.
+          const spent = await reconcileAccounting(current);
+          const budget = cloudJobBudgetUsd();
+          current.accounting.budgetUsd = budget ?? undefined;
+          current.accounting.combinedUsd = spent;
+          if (state.mode === "full" && budget !== null && spent >= budget) {
+            throw new CloudStop(
+              "paused",
+              `budget guard: combined estimate $${spent.toFixed(2)} (R2 + container, Pass 1 and Pass 2) ` +
+                `reached CLOUD_JOB_BUDGET_USD=$${budget}. Raise the limit or resume deliberately.`,
+            );
+          }
           await store.putJson(cloudKeys.state(version), current);
         },
 
@@ -411,10 +507,11 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
       current.updatedAt = new Date(now()).toISOString();
       current.note =
         error.kind === "paused"
-          ? "Paused between partitions. Resume re-runs Cloud Pass 2 from partition 1; outputs are deterministic and overwritten."
+          ? `${error.reason ?? "Paused by operator."} Resume replays Cloud Pass 2 from partition 1; outputs are deterministic and overwritten.`
           : "Aborted. Pass 1 segments are untouched; no activation happened.";
-      await store.putJson(cloudKeys.state(version), current);
-      await updateAccounting(store, current, countersBefore);
+      await reconcileAccounting(current);
+      current.accounting.budgetUsd = cloudJobBudgetUsd() ?? undefined;
+      current.accounting.combinedUsd = current.accounting.estimatedUsd + current.accounting.containerUsd;
       await store.putJson(cloudKeys.state(version), current);
       return {
         state: current,
@@ -437,8 +534,9 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
       { at: current.updatedAt, stage: "pass2" as const, message: error instanceof Error ? error.message : String(error) },
     ].slice(-10);
     current.note = "Cloud Pass 2 failed. Pass 1 segments are untouched; inspect the error, fix it, and re-run.";
-    await store.putJson(cloudKeys.state(version), current);
-    await updateAccounting(store, current, countersBefore);
+    await reconcileAccounting(current);
+    current.accounting.budgetUsd = cloudJobBudgetUsd() ?? undefined;
+    current.accounting.combinedUsd = current.accounting.estimatedUsd + current.accounting.containerUsd;
     await store.putJson(cloudKeys.state(version), current);
     throw error;
   }
@@ -470,9 +568,21 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
   current.note = result.manifest.validationPassed
     ? `Cloud Pass 2 complete: ${result.counters.uniqueCompanies.toLocaleString()} companies, ${result.counters.uniqueContacts.toLocaleString()} contacts. Version ${version} is built and verified but NOT activated.`
     : "Cloud Pass 2 wrote the index but validation reported problems; the version is not activatable.";
+  await reconcileAccounting(current);
+  current.accounting.budgetUsd = cloudJobBudgetUsd() ?? undefined;
+  current.accounting.combinedUsd = current.accounting.estimatedUsd + current.accounting.containerUsd;
   await store.putJson(cloudKeys.state(version), current);
-  await updateAccounting(store, current, countersBefore);
-  await store.putJson(cloudKeys.state(version), current);
+  await writeCheckpoint({
+    version,
+    stage: "complete",
+    partitionsDone: config.partitions,
+    partitionsTotal: config.partitions,
+    shardParts,
+    shardPartBytes: 0,
+    rowsMerged: current.totals.rowsIndexed,
+    updatedAt: current.updatedAt,
+    mergeComplete: true,
+  });
 
   log(
     `Cloud Pass 2 complete: ${result.counters.uniqueCompanies.toLocaleString()} companies, ` +
@@ -505,6 +615,27 @@ async function loadChunkManifests(store: BlobStore, version: string, checkpoints
     }
   }
   return out;
+}
+
+/**
+ * Verify the posting shards a checkpoint refers to are still in R2.
+ *
+ * The checkpoint is only usable for a finalize-only resume if every shard part it
+ * recorded is present with the recorded total count and bytes; a missing part would
+ * silently turn into an empty term list and a search that quietly returns nothing.
+ * A mismatch is reported (and the caller replays the merge) rather than trusted.
+ */
+async function verifyShardParts(store: BlobStore, version: string, expectParts: number, expectBytes: number): Promise<string[]> {
+  const problems: string[] = [];
+  const parts = await store.list(cloudKeys.pass2ShardRoot(version));
+  if (parts.length !== expectParts) {
+    problems.push(`${parts.length.toLocaleString()} posting-shard objects, expected ${expectParts.toLocaleString()}`);
+  }
+  const bytes = parts.reduce((total, part) => total + part.size, 0);
+  if (expectBytes > 0 && bytes !== expectBytes) {
+    problems.push(`${bytes.toLocaleString()} posting-shard bytes, expected ${expectBytes.toLocaleString()}`);
+  }
+  return problems;
 }
 
 const SCRATCH_MARKER = ".cloud-pass2-work.json";
@@ -575,15 +706,20 @@ function countersOf(store: BlobStore): StoreCounters | null {
   return null;
 }
 
-async function updateAccounting(store: BlobStore, state: CloudJobState, before: StoreCounters | null): Promise<void> {
+async function updateAccounting(store: BlobStore, state: CloudJobState, before: StoreCounters | null, seconds = 0): Promise<void> {
   const after = countersOf(store);
-  if (!before || !after) return;
-  const classA = Math.max(0, after.classA - before.classA);
-  const classB = Math.max(0, after.classB - before.classB);
-  state.accounting.classA += classA;
-  state.accounting.classB += classB;
-  state.accounting.bytesRead += Math.max(0, after.bytesRead - before.bytesRead);
-  state.accounting.bytesWritten += Math.max(0, after.bytesWritten - before.bytesWritten);
+  if (before && after) {
+    state.accounting.classA += Math.max(0, after.classA - before.classA);
+    state.accounting.classB += Math.max(0, after.classB - before.classB);
+    state.accounting.bytesRead += Math.max(0, after.bytesRead - before.bytesRead);
+    state.accounting.bytesWritten += Math.max(0, after.bytesWritten - before.bytesWritten);
+  }
+  // Container time is cumulative across attempts: a paused and resumed job still
+  // bills every second it ran.
+  state.accounting.containerSeconds += Math.max(0, seconds);
+  state.accounting.containerUsd =
+    state.accounting.containerSeconds *
+    (CONTAINER_PRICE.vcpu * CONTAINER_PRICE.vcpuPerSecond + CONTAINER_PRICE.gib * CONTAINER_PRICE.gibPerSecond);
   state.accounting.estimatedUsd =
     (state.accounting.classA / 1e6) * R2_PRICES.classAPerMillion + (state.accounting.classB / 1e6) * R2_PRICES.classBPerMillion;
 }

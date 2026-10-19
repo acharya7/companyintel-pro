@@ -52,6 +52,14 @@ export interface R2StoreOptions {
   cache?: ObjectCache;
   /** Counts the objects/bytes this store actually fetched from R2. */
   metrics?: ReadMetrics;
+  /**
+   * Mutable pointer this deployment treats as "the active dataset".
+   *
+   * Production uses the default (`manifests/active.json`). The staging Worker
+   * sets `staging/active.json`, so a staging activation cannot change what the
+   * production application serves even though both read the same indexes.
+   */
+  activeManifestKey?: string;
 }
 
 export class R2Store {
@@ -214,8 +222,13 @@ export class R2Store {
 
   /* ------------------------------ dataset --------------------------------- */
 
+  private activeKey(): string {
+    const key = this.options.activeManifestKey;
+    return key && key.trim() ? key : activeManifestKey();
+  }
+
   async getActivePointer(): Promise<ActivePointer | null> {
-    return this.getJson<ActivePointer>(activeManifestKey());
+    return this.getJson<ActivePointer>(this.activeKey());
   }
 
   async getDirectory(version: string): Promise<IndexDirectory | null> {
@@ -255,7 +268,7 @@ export class R2Store {
 
   /** Atomic publish: one tiny pointer object flips the whole dataset version. */
   async activateVersion(pointer: ActivePointer): Promise<void> {
-    await this.putJson(activeManifestKey(), pointer);
+    await this.putJson(this.activeKey(), pointer);
   }
 
   /* ------------------------------- index ---------------------------------- */

@@ -1,7 +1,7 @@
 /**
- * The budget guard is an operator protection, not a billing cap: when the running
- * estimate reaches `CLOUD_BUDGET_USD`, Pass 1 pauses at the next durable chunk
- * boundary instead of continuing to spend. The checkpoint stays usable.
+ * The budget guard is an operator protection, not a billing cap: when the combined
+ * running estimate reaches `CLOUD_JOB_BUDGET_USD`, a full run pauses at the next
+ * durable boundary instead of continuing to spend. The checkpoint stays usable.
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
@@ -21,12 +21,13 @@ const SOURCE: Pass1SourceSpec = {
 };
 
 afterEach(() => {
+  delete process.env.CLOUD_JOB_BUDGET_USD;
   delete process.env.CLOUD_BUDGET_USD;
 });
 
 describe("cloud budget guard", () => {
   test("pauses a full run at a chunk boundary instead of continuing to spend", async () => {
-    process.env.CLOUD_BUDGET_USD = "0.000001";
+    process.env.CLOUD_JOB_BUDGET_USD = "0.000001";
     const store = new MemoryBlobStore({ "raw/file1.csv": BODY });
     const result = await runPass1({
       store,
@@ -46,8 +47,23 @@ describe("cloud budget guard", () => {
     expect(checkpoint?.nextOffset).toBeLessThan(BODY.length);
   });
 
-  test("a benchmark is not stopped by the full-run budget", async () => {
+  test("the deprecated variable name still guards an existing deployment", async () => {
     process.env.CLOUD_BUDGET_USD = "0.000001";
+    const store = new MemoryBlobStore({ "raw/file1.csv": BODY });
+    const result = await runPass1({
+      store,
+      version: "budget-legacy",
+      sources: [SOURCE],
+      partitions: 2,
+      chunkBytes: 64,
+      sliceBytes: 16,
+      mode: "full",
+    });
+    expect(result.stopped).toBe("paused");
+  });
+
+  test("a benchmark is not stopped by the full-run budget", async () => {
+    process.env.CLOUD_JOB_BUDGET_USD = "0.000001";
     const store = new MemoryBlobStore({ "raw/file1.csv": BODY });
     const result = await runPass1({
       store,
