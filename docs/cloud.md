@@ -266,6 +266,11 @@ uses the root `Dockerfile`. `wrangler deploy` builds that image with Docker and 
 to Cloudflare's managed registry. The Worker exports `IndexerContainer`, starts it only
 through the admin route, and forwards `/health` and `POST /job`.
 
+Both images pin `oven/bun:1.4.3-slim`. `bun.lock` is lockfile format 2, and the previous
+`oven/bun:1.2-slim` image (Bun 1.2.23) refused it during the Container build with
+`Unknown lockfile version`. Keep the image on the Bun line the repository is tested with;
+`bun install --frozen-lockfile --production` is the only install the image performs.
+
 **Not verified here:** Docker is not installed in this workspace, there is no Cloudflare
 API token, and nothing was deployed. The config matches Cloudflare's documented schema
 (instance types, DO binding, migration), but a real deploy has not been attempted. See

@@ -14,7 +14,7 @@ Everything in this document is checked into the workspace. Nothing is deployed y
 | Cloud Pass 1 (R2 chunker + segments + checkpoints) | implemented, tested, verified against real R2 |
 | Cloud Pass 2 (partition reduce + streaming shard merge) | implemented, tested, verified against real R2 |
 | Production build (`tsc -b && vite build`) | passes in this workspace (`dist/` built) |
-| Test suite | `612 pass, 0 fail` (51 files), run twice after the final edit |
+| Test suite | `613 pass, 0 fail` (51 files) |
 | Lint / typechecks (app, worker, indexer, probe) | pass |
 | `wrangler deploy --dry-run` (production and staging) | pass; container + bindings resolve |
 | Staging Worker config (`wrangler.staging.toml`) | written, dry-run validated (`companyintel-staging` + `INDEXER_CONTAINER` + `COMPANY_DATA` + `staging/active.json` all resolve) |
@@ -128,7 +128,7 @@ connecting the repository first, then choosing the Worker name):
 | API token | created by Cloudflare for Workers Builds (§5) |
 
 Verification that runs in the build itself: `bun run verify` = four typechecks + ESLint +
-the full suite (612 tests, including the staging-isolation and secret-placement guards).
+the full suite (613 tests, including the staging-isolation and secret-placement guards).
 It fails the build rather than deploying a broken Worker, and it never touches production
 resources. `wrangler deploy` only runs after it passes, so a failed build cannot alter the
 production Worker.

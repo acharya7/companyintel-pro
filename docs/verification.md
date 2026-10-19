@@ -826,7 +826,7 @@ Executed here, in this workspace. Nothing was deployed and no full-corpus job wa
 | Check | Result | How |
 | --- | --- | --- |
 | Production build | **PASS** — `tsc -b` + Vite, 43 assets, no errors | `bun run build` |
-| Complete test suite | **PASS — 612 pass, 0 fail** across 51 files (run twice after the final edit) | `bun test` |
+| Complete test suite | **PASS — 613 pass, 0 fail** across 51 files | `bun test` |
 | Lint | **PASS** — 0 problems | `bun run lint` |
 | Typechecks (app, worker, indexer, probe) | **PASS** | `bun run typecheck` |
 | Wrangler configuration + Worker dry-run (production) | **PASS** — binds `INDEXER_CONTAINER`, `COMPANY_DATA`, `ASSETS`, `CLOUD_JOB_BUDGET_USD`; lists `companyintel-indexercontainer` | `bunx wrangler deploy --dry-run --containers-rollout=none` |
@@ -908,6 +908,58 @@ Ten consecutive runs of that test and four consecutive full-file runs pass.
 | Check | Result |
 | --- | --- |
 | `tests/cloud-pass2.test.ts` | **7 pass, 0 fail**, stable over repeated runs (the corrupted-segment path ran 10×) |
-| `bun run verify` (Bun 1.4.2) | **PASS** — typecheck, lint, **612 pass / 0 fail** across 51 files |
-| `bun run verify` (Bun 1.4.3, the Cloudflare build's version) | **PASS** — 612 pass / 0 fail |
+| `bun run verify` (Bun 1.4.2) | **PASS** — typecheck, lint, **613 pass / 0 fail** across 51 files |
+| `bun run verify` (Bun 1.4.3, the Cloudflare build's version) | **PASS** — 613 pass / 0 fail |
 | `bun run build` (Bun 1.4.2 and 1.4.3) | **PASS** — `tsc -b` + Vite |
+
+## Phase O — the Container image build's Bun/lockfile mismatch (executed)
+
+Build `#c54f2438` passed the Worker job (612 tests) and then failed in the Container
+image stage:
+
+```
+Dockerfile:22 — RUN bun install --frozen-lockfile --production
+error: Unknown lockfile version
+```
+
+### Root cause
+
+Both `Dockerfile` and `cloud/Dockerfile` used `oven/bun:1.2-slim`, which ships Bun
+1.2.23. `bun.lock` is lockfile format 2, written and parsed by Bun 1.4.x; 1.2.x refuses
+it before it installs anything. The image tags were older than the toolchain the
+repository is tested with.
+
+### Fix
+
+- Both Dockerfiles now use **`oven/bun:1.4.3-slim`** — the repository's verified Bun
+  version. The tag exists on Docker Hub for `linux/amd64` and `linux/arm64`
+  (`sha256:14a223fa35747ec728bce300ef85888bc5f7958164d15bbba6a54b22b52a3288` index,
+  amd64 digest `sha256:686427843343e931d31dcca0c95221040dec48a8b5a7374c7ae9fd7959f8234d`,
+  pushed 2026-10-10).
+- `bun install --frozen-lockfile --production` is unchanged; the lockfile is neither
+  regenerated nor downgraded.
+- `tests/cloud-admin-deploy.test.ts` now fails if either image stops pinning
+  `1.4.3-slim`, slips to `1.0`–`1.3`, or drops the frozen production install.
+
+### Dependency check for the container entrypoint
+
+`cloud/runner.mjs` imports only `node:child_process`, `node:http` and `node:path`, and
+spawns `bun tools/cloud/cli.ts`. The whole `tools/cloud`, `tools/indexer/src` and
+`src/shared` graph that CLI reaches imports **only Node built-ins and local files** — no
+bare npm specifier (`src/shared/api-contract.ts`'s `zod` is not reachable from it). The
+production install is therefore a superset of what Pass 1, Pass 2 and the R2 client need.
+Confirmed by bundling the real entrypoints:
+
+| Check | Result |
+| --- | --- |
+| `bunx bun@1.4.3 install --frozen-lockfile --production` on `package.json` + `bun.lock` in an empty directory | **PASS**, exit 0 — **227 packages**, 247 MB, no lockfile change |
+| `bunx bun@1.4.3 tools/cloud/cli.ts` against that production-only `node_modules` | **PASS**, prints the usage for `preflight`/`run`/`pass2`/… |
+| `bunx bun@1.4.3 build tools/cloud/cli.ts --target=bun` against it | **PASS**, 24 modules, no external imports |
+| `bunx bun@1.4.3 build cloud/runner.mjs --target=bun` | **PASS** |
+| Offline `R2Client.head` signature check against it (dummy credentials, stubbed `fetch`) | **PASS**, request signed and parsed |
+
+### Not verified here
+
+The image itself was **not** built: this workspace has no Docker daemon. Workers Builds is
+the first real builder; the build is not claimed to pass until Cloudflare reports it
+successful.

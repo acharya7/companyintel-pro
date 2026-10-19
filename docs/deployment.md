@@ -28,7 +28,7 @@ bun install
 bun run check          # typechecks (frontend, worker, indexer) + full test suite
 ```
 
-Expected: `612 pass` and no TypeScript errors (`bun run verify` runs all four typechecks, the
+Expected: `613 pass` and no TypeScript errors (`bun run verify` runs all four typechecks, the
 linter and the suite). If this fails, fix it before deploying.
 
 ## 2. Log in to Cloudflare from the command line

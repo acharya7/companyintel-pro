@@ -22,6 +22,7 @@ const admin = readFileSync(join(root, "worker/src/indexer-admin.ts"), "utf8");
 const container = readFileSync(join(root, "worker/src/indexer-container.ts"), "utf8");
 const runner = readFileSync(join(root, "cloud/runner.mjs"), "utf8");
 const dockerfile = readFileSync(join(root, "Dockerfile"), "utf8");
+const cloudDockerfile = readFileSync(join(root, "cloud", "Dockerfile"), "utf8");
 
 describe("Cloudflare Containers deployment config", () => {
   test("declares the container, its Durable Object and the migration", () => {
@@ -47,6 +48,17 @@ describe("Cloudflare Containers deployment config", () => {
     expect(dockerfile).toContain('CMD ["bun", "cloud/runner.mjs"]');
     expect(dockerfile).toContain("COPY tools ./tools");
     expect(dockerfile).not.toContain("vite build");
+  });
+
+  test("both images pin a Bun that can read this lockfile, and install frozen", () => {
+    // `bun.lock` is lockfile format 2. Bun 1.2.x cannot parse it ("Unknown
+    // lockfile version"), which failed the Container image build; a floating or
+    // older tag would reintroduce that failure silently.
+    for (const image of [dockerfile, cloudDockerfile]) {
+      expect(image).toContain("FROM oven/bun:1.4.3-slim");
+      expect(image).not.toMatch(/FROM oven\/bun:1\.[0-3](\.|-)/);
+      expect(image).toContain("bun install --frozen-lockfile --production");
+    }
   });
 
   test("the container runner accepts Cloud Pass 2 and detached starts", () => {

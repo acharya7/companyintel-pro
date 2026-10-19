@@ -7,7 +7,11 @@
 # It reads sources from R2 over the S3 API and writes compact segments and
 # checkpoints back to R2, so the container's own disk holds at most one chunk's
 # buffers (tens of MB) and never the spool.
-FROM oven/bun:1.2-slim
+#
+# Pinned to the Bun line the repository is tested and locked with. `bun.lock` is
+# lockfile format 2; `oven/bun:1.2-slim` ships Bun 1.2.23, which refuses it with
+# "Unknown lockfile version", so the image must not move back below 1.4.
+FROM oven/bun:1.4.3-slim
 
 WORKDIR /app
 
