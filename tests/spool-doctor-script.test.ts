@@ -69,6 +69,10 @@ async function buildSpool(dir: string): Promise<IndexerConfig> {
     outputDir: join(dir, "out"),
     partitions: 4,
     shards: { exact: 4, prefix: 4, token: 4, trigram: 4, ids: 4 },
+    // The doctor's --repair-manifest / damage-position path is the LEGACY one: a
+    // plain JSONL partition with no frame ledger. Format v2 has its own checks and
+    // is covered by the v2 suite; this fixture keeps the legacy contract tested.
+    spoolFormat: "jsonl",
   };
   await runIndex(config, {});
   rmSync(spoolManifestPathFor(config.workDir), { force: true });

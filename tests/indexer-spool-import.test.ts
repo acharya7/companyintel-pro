@@ -403,7 +403,7 @@ describe("source validation", () => {
     const copy = join(fixtures.root, "truncated-work");
     cpSync(fixtures.config.workDir, copy, { recursive: true });
     const spoolDir = spoolDirFor(copy);
-    const file = readdirSync(spoolDir).filter((name) => name.endsWith(".jsonl")).sort()[0];
+    const file = readdirSync(spoolDir).filter((name) => name.endsWith(".jsonl") || name.endsWith(".jsonl.gz")).sort()[0];
     const path = join(spoolDir, file);
     const bytes = readFileSync(path);
     writeFileSync(path, bytes.subarray(0, Math.max(0, bytes.length - 10)));
@@ -420,7 +420,7 @@ describe("source validation", () => {
     const copy = join(fixtures.root, "flipped-work");
     cpSync(fixtures.config.workDir, copy, { recursive: true });
     const spoolDir = spoolDirFor(copy);
-    const file = readdirSync(spoolDir).filter((name) => name.endsWith(".jsonl")).sort()[0];
+    const file = readdirSync(spoolDir).filter((name) => name.endsWith(".jsonl") || name.endsWith(".jsonl.gz")).sort()[0];
     const path = join(spoolDir, file);
     const bytes = Buffer.from(readFileSync(path));
     bytes[Math.floor(bytes.length / 2)] ^= 0xff;

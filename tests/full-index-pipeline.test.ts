@@ -117,6 +117,32 @@ describe("full-index pipeline (operator path, local sources)", () => {
     expect(existsSync(join(sandbox, "complete", "out", "manifests", version, "validation.json"))).toBe(true);
   });
 
+  test("--work-dir builds in the override directory and leaves the config's workDir absent", () => {
+    const overrideConfig = writeConfig("override", "t-override");
+    const configWork = join(sandbox, "override", "work");
+    const overrideWork = join(sandbox, "override", "work-v2");
+    const { status, output } = runPipeline([
+      "--config",
+      overrideConfig,
+      "--version",
+      "t-override",
+      "--work-dir",
+      overrideWork,
+      "--yes",
+      "--no-upload",
+      "--disk-floor",
+      "50",
+      "--report-dir",
+      join(sandbox, "override", "reports"),
+    ]);
+    // The override has to be visible BEFORE Pass 1: this is the flag that points a
+    // recovered run at its converted ledger instead of the legacy spool.
+    expect(output).toContain("--work-dir override");
+    expect(status).toBe(0);
+    expect(existsSync(join(overrideWork, "spool-manifest.json"))).toBe(true);
+    expect(existsSync(join(configWork, "spool-manifest.json"))).toBe(false);
+  });
+
   test("a --sample run is labelled PARTIAL, and its summary cannot claim completeness", () => {
     const sampleConfig = writeConfig("sample", "t-sample");
     const { status, output } = runPipeline([

@@ -95,7 +95,7 @@ bun tools/indexer/src/cli.ts publish   --config tools/indexer/indexer.config.jso
 | Resource | Requirement | Basis |
 | --- | --- | --- |
 | RAM | 16 GB comfortable, 8 GB workable | Bounded one-partition-at-a-time design; measured 1.25 s / 102 MB heap to build a 50,000-company index in-process. Less RAM costs speed, not correctness |
-| Free disk | **182 GB** (spool 71.06 + Mode B staging 54.04 + index 20.30 + bookkeeping 0.27, ×1.25) — **93.6 GB** with `"rawCacheDir": null` | `bun run index:profile` preflight against the real bucket. The staging file and the generated index are alive at the same time as the spool. `workDir` must be on the fastest disk; `"rawCacheDir": null` removes the largest single term and costs a re-download on resume |
+| Free disk | **≈134 GB** (spool upper bound 33.4 + Mode B staging 54.04 + index 20.30 + bookkeeping 0.27, ×1.25) — **≈67 GB** with `"rawCacheDir": null` | `bun run index:profile` preflight against the real bucket. Format v2's spool is measured at 0.423×/0.346× the source bytes (≈23 GB expected), replacing the 71 GB estimate that the first full run exceeded by 3×. The staging file and the generated index are alive at the same time as the spool. `"rawCacheDir": null` removes the largest single term and costs a re-download on resume |
 | Cores | 4+ | One run saturates ~1 core for CSV parsing plus I/O; never run two full jobs at once |
 | Network | Steady upload | Upload is per-object with retry and skips objects already in R2, so a dropped connection costs time, not a restart |
 

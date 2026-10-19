@@ -75,9 +75,16 @@ function printReport(inspection) {
   console.log(`CompanyIntel spool doctor — ${inspection.workDir}`);
   console.log("");
   console.log(`  verdict            ${inspection.verdict.toUpperCase()}`);
+  console.log(`  spool format       ${inspection.format}${inspection.format === 2 ? " (compact rows, framed gzip, resumable)" : " (legacy jsonl)"}`);
   console.log(`  partition files    ${inspection.totals.files}`);
   console.log(`  spool size         ${formatBytes(inspection.totals.bytes)}`);
   console.log(`  records            ${inspection.totals.records.toLocaleString()} (${inspection.totals.parsed.toLocaleString()} parsed as JSON)`);
+  if (inspection.progress) {
+    console.log(`  progress ledger    ${inspection.progress.status} — ${inspection.progress.rows.toLocaleString()} rows, ${formatBytes(inspection.progress.bytes)} committed`);
+    for (const source of inspection.progress.sources) {
+      console.log(`    ${source.id}             ${source.rowsRead.toLocaleString()} rows read${source.complete ? " (complete)" : ""}`);
+    }
+  }
   const checkpoint = inspection.checkpoint;
   console.log(
     `  checkpoint         ${checkpoint.present ? `stage=${checkpoint.stage}${checkpoint.hasIdentity ? "" : " (NO run identity)"}` : "absent"}`,
@@ -129,6 +136,14 @@ function printGuidance(inspection, { repaired }) {
   }
   if (inspection.verdict === "incomplete") {
     if (repaired) return;
+    if (inspection.format === 2 && inspection.progress) {
+      console.log("This spool is INCOMPLETE but resumable: the format-2 progress ledger records which source rows and");
+      console.log("which partition frames are durable. Re-run the SAME indexer command (no --no-resume, no repair):");
+      console.log("Pass 1 continues after the last committed row and truncates only the uncommitted tail.");
+      console.log("");
+      console.log(`    ${inspection.progress.rows.toLocaleString()} rows are committed in ${inspection.totals.files} partition file(s).`);
+      return;
+    }
     const adoptable = Boolean(inspection.checkpoint.identity);
     console.log("The partitions look intact but pass 1 never recorded them (no spool-manifest.json), so the");
     console.log("indexer will refuse to merge them.");
@@ -142,25 +157,30 @@ function printGuidance(inspection, { repaired }) {
       console.log("If you would rather not adopt it: re-run the indexer with --no-resume.");
     } else {
       // No checkpoint (or no run identity in it): there is nothing that says which
-      // run these partitions belong to, so they cannot be adopted and do not need
-      // to be. A normal re-run treats an unclaimed spool as stale and clears it.
+      // run these partitions belong to, so they cannot be adopted. They are also
+      // NOT stale: a fresh run now refuses to touch them.
       console.log(
         adoptable
           ? "At least one partition above is damaged, so it cannot be adopted."
           : "There is no checkpoint next to it naming the run it belongs to, so it cannot be adopted.",
       );
-      console.log("Nothing needs to be done by hand: simply re-run the indexer. An unclaimed spool is treated as");
-      console.log("stale, cleared before pass 1, and rebuilt from the sources.");
+      console.log("The indexer will NOT delete it. Decide with evidence:");
+      console.log("");
+      console.log("    bun tools/indexer/src/cli.ts recover-spool --assess --work-dir \"<this directory>\"");
+      console.log("");
+      console.log("That reads the rows (source id + source row) and proves whether each source is one contiguous prefix.");
+      console.log("If it is, `recover-spool --apply` converts it into a new v2 work directory and Pass 1 resumes after it.");
+      console.log("If it is not provable, recovery refuses; only then use an explicit --discard-spool to start clean.");
     }
     return;
   }
   console.log("At least one partition is damaged or does not match what pass 1 recorded. Its rows cannot be");
-  console.log("recovered from the spool, and merging the rest would silently drop them, so:");
+  console.log("recovered from the spool, and merging the rest would silently drop them.");
   console.log("");
-  console.log("    bun tools/indexer/src/cli.ts run --config <cfg> ... --no-resume");
+  console.log("    bun tools/indexer/src/cli.ts recover-spool --assess --work-dir \"<this directory>\"");
   console.log("");
-  console.log("--no-resume discards the spool and rebuilds it from the sources. Pass-2 output already written is");
-  console.log("left alone (versions are separate directories) and nothing was uploaded.");
+  console.log("If the assessment says the sources are not one contiguous prefix, a clean restart is the safe answer,");
+  console.log("and it must be explicit: --no-resume --discard-spool. Nothing is removed by a plain re-run.");
 }
 
 if (has("help")) {
@@ -193,6 +213,12 @@ if (has("json")) {
     if (inspection.verdict === "clean") {
       console.log(`Nothing to repair: ${spoolManifestPathFor(workDir)} already exists and matches.`);
     } else {
+      if (inspection.format === 2) {
+        console.error("Refusing --repair-manifest: this is a format-2 spool, and its progress ledger is the proof of");
+        console.error("what was committed. A missing or damaged ledger cannot be reconstructed from the frames alone:");
+        console.error("the ledger is what names the source rows. Nothing was written.");
+        process.exit(1);
+      }
       const identity = inspection.checkpoint.identity;
       if (!identity) {
         console.error("Refusing to repair: the checkpoint carries no run identity, so the spool has no provenance.");

@@ -167,6 +167,42 @@ the hydration bound (~20 ms in Bun on a sandbox vCPU, ~0.45 MB read, ~20 candida
 close enough to that line that only a `wrangler tail` measurement on real hardware can settle
 it. Drop `SEARCH_MAX_HYDRATE` to 8 if a deployment measures too high.
 
+## Intermediate (Pass 1) spool storage
+
+The revised indexer keeps the intermediate spool **local**, and **no intermediate object is
+uploaded to R2**. That is a deliberate decision, not an oversight:
+
+- the compact format makes the complete spool **23.02 GB expected / 33.71 GB upper** for 64.26 GB
+  of source, which fits the ~87 GB the failed machine had free;
+- Pass 2 reads the spool once, sequentially, immediately after Pass 1; mirroring it would upload
+  and then re-download the same bytes, roughly doubling the wall-clock time for no benefit;
+- local disk is already bounded by the preflight (which refuses an unsafe volume) and by
+  `spoolMaxBytes` / `--spool-max-gb` (Pass 1 stops cleanly at the ceiling with a resumable
+  ledger), so a cloud tier is not needed to make the run fit.
+
+There is therefore **no `--spool-upload` flag and no R2 staging prefix in this build**. If a later
+version needs one (a machine with less free space than the spool), the arithmetic at R2 Standard
+prices would be:
+
+| Item | Size / count | Cost |
+| --- | --- | --- |
+| intermediate objects stored | 23.0 GB expected (33.7 GB upper) | **$0.35/month** (~$0.50 at the upper bound) |
+| Class A writes, one object per sealed partition | 256 PUTs | **<$0.01** |
+| Class A writes, if every 1 MiB frame were its own object | ~22,000 PUTs | **~$0.10** |
+| Class B reads to stream the spool back for Pass 2 | 256 GETs (one per partition) | **<$0.01** |
+
+Egress from R2 is free; the upload from the laptop consumes your own upstream bandwidth. At 256
+objects neither the Class A nor the Class B count is material against the 1 M / 10 M free
+allowances — the transfer time is what would dominate. These are **projections for a design that
+is not implemented**, not billable measurements.
+
+A repeated full build adds another ~23 GB of intermediate storage **only if you keep it**; the
+local ledger is deleted with the work directory in a step you perform explicitly. Final index
+versions remain ~20 GB each ($0.30/month) and are independent of this.
+
+Checkpointing has no R2 cost at all: the ledger is a small local JSON file written with
+`fsync` + rename every 100,000 rows (about 1,000 writes over a full run).
+
 ## Total monthly estimate
 
 | Scenario | Storage | Operations | Workers | Total |

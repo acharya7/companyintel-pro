@@ -34,7 +34,7 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 const root = resolve(dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..");
@@ -57,6 +57,17 @@ const noUpload = Boolean(flag("no-upload"));
 const sample = typeof flag("sample") === "string" ? Number(flag("sample")) : null;
 const diskFloor = typeof flag("disk-floor") === "string" ? Number(flag("disk-floor")) : null;
 const reportDir = resolve(root, String(flag("report-dir") ?? "index-reports"));
+/*
+ * `--work-dir` overrides the config's work directory for this run.
+ *
+ * It exists for the recovery path: `recover-spool --apply` writes the converted v2
+ * ledger into a NEW directory (the legacy spool is read-only), so the run that
+ * continues Pass 1 must be pointed at that directory. Passing it here — rather
+ * than editing the shared config and then forgetting to change it back — is what
+ * keeps the legacy spool, and every benchmark's work directory, untouched.
+ */
+const workDirFlag = typeof flag("work-dir") === "string" ? resolve(root, flag("work-dir")) : null;
+const workDirPath = () => workDirFlag ?? resolve(root, config.workDir ?? ".indexer-work");
 
 if (flag("help")) {
   console.log(
@@ -77,6 +88,8 @@ if (flag("help")) {
       "  --verify-batch <n> objects read back per remote-verification call (default 400).",
       "  --disk-floor <mb>  free-space floor the merge stops at (default 512 MB). Lower it only when",
       "                     the volume is tight and the output is known to be small.",
+      "  --work-dir <dir>   use this work directory instead of the config's (required after",
+      "                     recover-spool --apply, which writes the converted ledger to a NEW dir).",
       "  --config <path>    indexer config (default tools/indexer/indexer.config.json).",
       "  --report-dir <dir> where the run log and JSON summary are written (default index-reports).",
       "",
@@ -207,12 +220,64 @@ function sourceVersion() {
  * `elapsed` dropping later is explained rather than surprising.
  */
 function resumeStatus() {
-  const workDir = resolve(root, config.workDir ?? ".indexer-work");
+  const workDir = workDirPath();
   const checkpointPath = join(workDir, "checkpoint.json");
   const manifestFile = join(workDir, "spool-manifest.json");
+  const spoolDir = join(workDir, "spool");
+  const progressPath = join(spoolDir, "progress.json");
+  const spoolFiles = existsSync(spoolDir)
+    ? readdirSync(spoolDir).filter((name) => /^part-\d{4}\.jsonl(\.gz)?$/.test(name))
+    : [];
+
+  /*
+   * A format-2 ledger is the authoritative progress record: it names the run, the
+   * schema and the exact source rows committed. Report it before anything reads.
+   */
+  if (existsSync(progressPath)) {
+    let ledger = null;
+    try {
+      ledger = JSON.parse(readFileSync(progressPath, "utf8"));
+    } catch {
+      ledger = null;
+    }
+    if (ledger) {
+      const rows = Object.values(ledger.partitions ?? {}).reduce((total, entry) => total + (entry.rows ?? 0), 0);
+      note(
+        `progress ledger found: ${ledger.status}, version ${ledger.identity?.version ?? "?"}, ` +
+          `${rows.toLocaleString()} committed row(s) in ${Object.keys(ledger.partitions ?? {}).length} partition(s) (${
+            (Object.values(ledger.partitions ?? {}).reduce((total, entry) => total + (entry.bytes ?? 0), 0) / 1e9).toFixed(2)
+          } GB)`,
+      );
+      for (const source of ledger.schema?.sources ?? []) {
+        const state = ledger.sources?.[source.id];
+        if (!state) continue;
+        note(`  ${source.id}: ${state.rowsRead.toLocaleString()} rows read${state.complete ? " (source complete)" : " — Pass 1 will continue after them"}`);
+      }
+      if (ledger.status === "pass1") note("  This run RESUMES Pass 1 from that row; no source row is re-spooled.");
+      return { found: true, format: 2, stage: ledger.status, sampleLimit: ledger.identity?.sampleLimit ?? null, blocked: false };
+    }
+  }
+
   if (!existsSync(checkpointPath)) {
-    note("no checkpoint: this run starts from Pass 1 (both sources are read end to end)");
-    return { found: false };
+    if (!spoolFiles.length) {
+      note("no checkpoint and no spool: this run starts at Pass 1, row 1 of each source");
+      return { found: false, blocked: false };
+    }
+    /*
+     * THE case that almost cost 66 million parsed rows: spool files with no
+     * checkpoint and no ledger. Do not read the sources and do not clear anything;
+     * run the read-only assessment and stop with its verdict.
+     */
+    note(`spool files found (${spoolFiles.length}) but NO checkpoint and NO progress ledger.`);
+    note("Running the READ-ONLY recovery assessment before anything else…");
+    const assessment = spawnSync(
+      "bun",
+      ["tools/indexer/src/cli.ts", "recover-spool", "--assess", "--work-dir", workDir, "--partitions", String(config.partitions ?? 256)],
+      { cwd: root, encoding: "utf8" },
+    );
+    const output = `${assessment.stdout ?? ""}${assessment.stderr ?? ""}`.trim();
+    if (output) note(output);
+    return { found: true, blocked: true, verdict: assessment.status === 0 ? "recoverable" : "unusable" };
   }
   let checkpoint = null;
   try {
@@ -234,7 +299,7 @@ function resumeStatus() {
         "(the existing spool is left untouched; use a separate workDir if you want to keep it).",
     );
   }
-  return { found: true, stage: checkpoint?.stage ?? null, sampleLimit: sample, partitions };
+  return { found: true, blocked: false, stage: checkpoint?.stage ?? null, sampleLimit: sample, partitions };
 }
 
 /**
@@ -283,9 +348,9 @@ function uploadedProgress() {
 
 /* --------------------------------- stages --------------------------------- */
 
-console.log(`CompanyIntel full index — version ${version}`);
-console.log(`  config   ${configPath}`);
-console.log(`  output   ${outputDir}`);
+console.log(`CompanyIntel full index — version ${version}`);  console.log(`  config   ${configPath}`);
+  console.log(`  work     ${workDirPath()}${workDirFlag ? " (--work-dir override)" : ""}`);
+  console.log(`  output   ${outputDir}`);
 console.log(`  report   ${reportPath}`);
 
 /* Stages 1–3 of the pipeline: dependencies, source version, cost expectation. */
@@ -297,6 +362,22 @@ note("\n-- 3/20 cost expectation");
 estimateLine();
 note("\n-- 4/20 resume state");
 const resume = resumeStatus();
+if (resume.blocked) {
+  note("");
+  note("Stopping BEFORE Pass 1. Nothing was read, written, truncated or deleted.");
+  if (resume.verdict === "recoverable") {
+    note("The spool is PROVABLY resumable. Convert it into a new work directory, then re-run this script with");
+    note("that directory as `workDir` in the config:");
+    note("");
+    note("  bun tools/indexer/src/cli.ts recover-spool --apply --config <cfg>");
+    note("    --work-dir <this work directory> --target-work-dir <new work directory> [--complete-sources csv1]");
+    note("then re-run this script with --work-dir <new work directory> (the converted ledger lives there).");
+  } else {
+    note("The spool is NOT provably resumable (read the findings above). A clean restart is safe but must be");
+    note("explicit: deleting it is a separate, deliberate decision (--discard-spool). This script will not do it.");
+  }
+  process.exit(3);
+}
 
 /*
  * Preflight first, always. It verifies R2 credentials and the source objects
@@ -305,6 +386,7 @@ const resume = resumeStatus();
  * learn that the 64 GB job would fail in hour three.
  */
 const preflightArgs = ["run", "--config", configPath, "--preflight-only", "--version", version];
+if (workDirFlag) preflightArgs.push("--work-dir", workDirFlag);
 // The preflight estimate has to describe the run that will follow: without this, a
 // smoke test would be measured as if it were the 64 GB job and refuse to start.
 if (sample !== null) preflightArgs.push("--sample", String(sample));
@@ -339,7 +421,8 @@ if (diskFloor !== null && (!Number.isFinite(diskFloor) || diskFloor <= 0)) {
 if (!confirmed && !uploadOnly) {
   note(
     "\nRefusing to start the full run without --yes.\n" +
-      "  A full pass reads both source files end to end (~64 GB), writes a Pass 1 spool of comparable size,\n" +
+      "  A full pass reads both source files end to end (~64 GB) and writes a compact Pass 1 spool\n" +
+      "  (measured ~0.36 of the source size: about 23 GB for this corpus),\n" +
       "  and uploads the generated index to R2. Re-run with --yes once you are ready for that.",
   );
   process.exit(1);
@@ -352,6 +435,7 @@ if (!uploadOnly) {
    * checkpoint (Pass 1) and the merge checkpoint (Pass 2) both resume.
    */
   const runArgs = ["run", "--config", configPath, "--version", version];
+  if (workDirFlag) runArgs.push("--work-dir", workDirFlag);
   if (sample !== null) runArgs.push("--sample", String(sample));
   if (diskFloor !== null) runArgs.push("--disk-floor", String(diskFloor));
   if (!(await stage("index (Pass 1 + Pass 2 + local validation)", runArgs))) {
@@ -382,7 +466,7 @@ if (!uploadOnly) {
  */
 let coverage = { complete: false, sampleLimit: null };
 {
-  const workDir = resolve(root, config.workDir ?? ".indexer-work");
+  const workDir = workDirPath();
   const checkpointPath = join(workDir, "checkpoint.json");
   if (existsSync(checkpointPath)) {
     try {
@@ -421,7 +505,9 @@ if (noUpload) {
  * the loop below makes that explicit and bounded.
  */
 for (let attempt = 1; attempt <= 3 && !noUpload; attempt += 1) {
-  if (!(await stage(`upload to R2 (attempt ${attempt})`, ["run", "--config", configPath, "--version", version, "--upload"]))) {
+  const uploadArgs = ["run", "--config", configPath, "--version", version, "--upload"];
+  if (workDirFlag) uploadArgs.push("--work-dir", workDirFlag);
+  if (!(await stage(`upload to R2 (attempt ${attempt})`, uploadArgs))) {
     note("\nUpload failed. It is resumable: re-run this script (or the same command) to continue where it stopped.");
     process.exit(1);
   }

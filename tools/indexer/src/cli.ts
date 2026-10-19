@@ -47,6 +47,7 @@ import {
   type SpoolImportPlan,
 } from "./spool-import";
 import { createSourceContext, credentialsHelp, missingCredentialBuckets, parseR2Source, sourceProfile, type SourceContext } from "./source";
+import { assessLegacySpool, recoverLegacySpool, type RecoveryAssessment } from "./spool-recover";
 
 function parseArgs(argv: string[]): { command: string; flags: Record<string, string | boolean> } {
   const [command = "help", ...rest] = argv;
@@ -90,15 +91,21 @@ function printPreflight(report: Awaited<ReturnType<typeof preflight>>): void {
   }
   console.log(`  input total          ${gb(report.totalInputBytes)}`);
   console.log(`  free disk            ${gb(report.freeDiskBytes)}`);
-  console.log(`  temporary space need ${gb(report.estimatedWorkBytes)}`);
+  console.log(`  temporary space need ${gb(report.estimatedWorkBytes)}  (upper bound)`);
   // Every term, because "free some space" is useless advice when one term (the
-  // Mode B staging file) dominates and can be removed by a config change.
+  // Mode B staging file) dominates and can be removed by a config change. The
+  // spool shows both bounds: the decision uses the upper one, and an operator who
+  // sees only the expected number would think the check is stricter than it is.
   const estimate = report.estimate;
-  console.log(`    spool               ${gb(estimate.spoolBytes)}  (canonical rows written by pass 1)`);
+  console.log(`    spool               ${gb(estimate.spoolBytes)} expected / ${gb(estimate.spoolBytesUpper)} upper  (v2 segments written by pass 1)`);
   console.log(`    raw cache staging   ${gb(estimate.rawCachePeakBytes)}  (largest Mode B .part alive at once)`);
   console.log(`    index output        ${gb(estimate.outputBytes)}  (written during pass 2, same volume by default)`);
   console.log(`    run bookkeeping     ${gb(estimate.overheadBytes)}  (checkpoint, spool manifest, rejected/objects lists)`);
-  console.log(`    safety margin       x${estimate.safetyMargin} applied to the four terms above`);
+  console.log(`    safety margin       x${estimate.safetyMargin} applied to the four terms above, using the spool UPPER bound`);
+  const expectedTotal = Math.ceil(
+    (estimate.spoolBytes + estimate.rawCachePeakBytes + estimate.outputBytes + estimate.overheadBytes) * estimate.safetyMargin,
+  );
+  console.log(`  expected total       ${gb(expectedTotal)}  (same terms with the expected spool)`);
   console.log(`  estimated output     ${gb(report.estimatedOutputBytes)}`);
   console.log(`  memory free / total  ${gb(report.memoryBytes.free)} / ${gb(report.memoryBytes.total)}`);
   console.log(`  cpu cores            ${report.cpuCount}`);
@@ -360,6 +367,29 @@ async function cmdRun(config: IndexerConfig, flags: Record<string, string | bool
   // build.ts).
   const noResume = Boolean(flags["no-resume"]);
   /*
+   * Deleting an existing spool is its own, explicit decision. `--no-resume`
+   * alone no longer removes anything: a work directory holding 217 GB of parsed
+   * rows must be inspected or recovered, not cleared by a resume command.
+   */
+  const discardSpool = Boolean(flags["discard-spool"]);
+  const spoolMaxGb = Number(flags["spool-max-gb"]);
+  if (Number.isFinite(spoolMaxGb) && spoolMaxGb > 0) {
+    config = { ...config, spoolMaxBytes: Math.round(spoolMaxGb * 1e9) };
+  }
+  /*
+   * `--work-dir <path>` overrides the config's workDir for THIS run.
+   *
+   * `recover-spool --apply` deliberately writes into a NEW directory rather than
+   * the legacy spool's, so the converted ledgers live in e.g. `.indexer-work-v2`.
+   * Without this flag the next `run` would look at the config's `.indexer-work`
+   * (the untouched legacy spool) and refuse — or worse, if that spool were ever
+   * cleared, rebuild Pass 1 from zero. Resuming therefore has to be expressible on
+   * the command line without editing the shared config.
+   */
+  if (typeof flags["work-dir"] === "string") {
+    config = { ...config, workDir: resolve(String(flags["work-dir"])) };
+  }
+  /*
    * `--disk-floor <mb>` lowers the free-space floor pass 2 stops at.
    *
    * The default (512 MB) is a comfortable margin for a full 60 GB run, but it is a
@@ -411,7 +441,7 @@ async function cmdRun(config: IndexerConfig, flags: Record<string, string | bool
     () =>
       runIndex(
         { ...config, datasetVersion: version, upload: { enabled: upload, bucket: config.upload?.bucket ?? "company-intel-data" } },
-        { sampleLimit: sample, resume: !noResume, onProgress: progressLogger(), diskFloorBytes },
+        { sampleLimit: sample, resume: !noResume, discardSpool, onProgress: progressLogger(), diskFloorBytes },
       ),
   );
 
@@ -662,6 +692,107 @@ async function cmdPass2FromSpool(config: IndexerConfig, flags: Record<string, st
  * It modifies nothing unless `--repair-manifest` is passed explicitly, and that
  * only ever writes `spool-manifest.json`, and only when every partition verifies.
  */
+/**
+ * `recover-spool` — assess (and, with --apply, convert) a legacy Pass 1 spool
+ * that has no checkpoint and no manifest.
+ *
+ * Assessment is read-only and can be run on a machine whose sources are
+ * unreachable. `--apply` writes ONLY into a new, empty target work directory and
+ * positions its ledger at the proven continuation row; the legacy spool is never
+ * modified.
+ */
+async function cmdRecoverSpool(flags: Record<string, string | boolean>): Promise<void> {
+  const workDir = resolve(String(flags["work-dir"] ?? ".indexer-work"));
+  const partitions = Number(flags.partitions ?? 256);
+  if (!Number.isInteger(partitions) || partitions <= 0) throw new Error("--partitions must be a positive whole number.");
+  const assessment = await assessLegacySpool(workDir, { partitions });
+  printRecoveryAssessment(assessment);
+
+  if (!flags.apply) {
+    process.exitCode = assessment.verdict === "recoverable" ? 0 : 1;
+    return;
+  }
+  if (assessment.verdict !== "recoverable" || !assessment.schema) {
+    console.error("\nRefusing to apply: the spool is not provably resumable (see the verdict and findings above). Nothing was written.");
+    process.exitCode = 1;
+    return;
+  }
+  if (!flags["target-work-dir"]) {
+    console.error("\n--apply needs --target-work-dir <new empty directory>, e.g. .indexer-work-v2. Nothing was written.");
+    process.exitCode = 1;
+    return;
+  }
+  if (!flags.config) {
+    console.error(
+      "\n--apply needs --config <the same indexer config the interrupted run used>: the recovered ledger must carry that\n" +
+        "  run's identity (source paths, delimiters, override counts), or the resumed run would refuse it. Nothing was written.",
+    );
+    process.exitCode = 1;
+    return;
+  }
+  const config = await loadConfig(String(flags.config));
+  const version = typeof flags.version === "string" ? flags.version : config.datasetVersion;
+  const sample = flags.sample ? Number(flags.sample) : undefined;
+  const targetIdentity = identityFor({ ...config, datasetVersion: version }, sample);
+  const completeSources = typeof flags["complete-sources"] === "string" ? String(flags["complete-sources"]).split(",").map((id) => id.trim()).filter(Boolean) : [];
+
+  const result = await recoverLegacySpool({
+    sourceWorkDir: workDir,
+    targetWorkDir: String(flags["target-work-dir"]),
+    targetIdentity,
+    partitions,
+    assessment,
+    completeSources,
+    onProgress: (message) => console.log(`  ${message}`),
+  });
+
+  console.log(`\nRecovered into ${result.targetWorkDir}`);
+  console.log(`  rows written        ${result.converted.rows.toLocaleString()} (${result.converted.duplicatesSkipped.toLocaleString()} duplicate source row(s) skipped)`);
+  console.log(`  v2 spool            ${(result.progress.totals.bytes / 1e9).toFixed(2)} GB in ${result.progress.totals.files} partition(s), ${result.progress.totals.rows.toLocaleString()} rows`);
+  for (const entry of Object.entries(result.progress.sources)) {
+    console.log(`  ${entry[0]}                 ${entry[1].rowsRead.toLocaleString()} proven row(s)${entry[1].complete ? " (source complete)" : " — Pass 1 resumes after them"}`);
+  }
+  console.log("\nThe original spool was opened for reading only and was not modified.\n");
+  console.log("Next (same config, same version — Pass 1 resumes from the proven row and reads only the remainder):");
+  console.log(`  bun tools/indexer/src/cli.ts run --config ${String(flags.config)} --version ${version} --work-dir ${result.targetWorkDir}`);
+  console.log("\nThe --work-dir flag is required: the recovered ledger belongs to the NEW directory, not the legacy spool's.");
+}
+
+function printRecoveryAssessment(assessment: RecoveryAssessment): void {
+  console.log(`\nLegacy spool recovery assessment (read-only) — ${assessment.workDir}`);
+  console.log(`  format               ${assessment.format}`);
+  console.log(`  partition files      ${assessment.totals.files}`);
+  console.log(`  spool size           ${(assessment.totals.bytes / 1e9).toFixed(2)} GB`);
+  console.log(`  records              ${assessment.totals.records.toLocaleString()}`);
+  console.log(`  duplicates           ${assessment.totals.duplicates.toLocaleString()}`);
+  console.log(`  partition mismatches ${assessment.totals.partitionMismatches.toLocaleString()}`);
+  for (const source of assessment.sources) {
+    console.log(
+      `  ${source.id}                  ${source.records.toLocaleString()} records · ${source.unique.toLocaleString()} unique · ` +
+        `${source.duplicates.toLocaleString()} duplicate(s) · prefix ${source.prefixRows.toLocaleString()} · ` +
+        `first gap ${source.firstGap === null ? "none" : source.firstGap.toLocaleString()}`,
+    );
+  }
+  console.log(`  verdict              ${assessment.verdict.toUpperCase()}`);
+  if (assessment.findings.length) {
+    console.log("  findings");
+    for (const finding of assessment.findings.slice(0, 30)) console.log(`    - ${finding}`);
+    if (assessment.findings.length > 30) console.log(`    … ${assessment.findings.length - 30} more`);
+  }
+  if (assessment.verdict === "recoverable") {
+    console.log("\n  Every source row present forms ONE contiguous prefix, with no gap, in the correct partition.");
+    console.log("  That is the evidence required to continue Pass 1 at the next row without losing or repeating a record.");
+    console.log("\n  Convert it into a new, isolated v2 work directory (the legacy spool stays untouched):");
+    console.log("    bun tools/indexer/src/cli.ts recover-spool --apply --config <cfg> --work-dir <legacy-work-dir> \\");
+    console.log("      --target-work-dir <new-work-dir> [--complete-sources csv1]");
+  } else if (assessment.verdict === "already-v2") {
+    console.log("\n  Nothing to recover: resume it with the ordinary run command.");
+  } else {
+    console.log("\n  This spool cannot be proven resumable. Recovery is refused; a clean restart is the safe answer.");
+  }
+  console.log("\nNo record content is included in this report, and nothing was modified.");
+}
+
 async function cmdSpool(workDir: string, flags: Record<string, string | boolean>): Promise<void> {
   const inspection = await inspectSpool(workDir, { checkHashes: Boolean(flags.hashes) });
   printSpoolInspection(inspection);
@@ -689,8 +820,15 @@ function printSpoolInspection(inspection: SpoolInspection): void {
   const gb = (bytes: number) => `${(bytes / 1e9).toFixed(2)} GB`;
   console.log(`\nSpool inspection (read-only) — ${inspection.workDir}`);
   console.log(`  verdict              ${inspection.verdict}`);
+  console.log(`  spool format         ${inspection.format}${inspection.format === 2 ? " (compact rows, framed gzip, resumable)" : " (legacy jsonl)"}`);
   console.log(`  partition files      ${inspection.totals.files}`);
   console.log(`  spool size           ${gb(inspection.totals.bytes)}`);
+  if (inspection.progress) {
+    console.log(`  progress ledger      ${inspection.progress.status} — ${inspection.progress.rows.toLocaleString()} rows, ${gb(inspection.progress.bytes)} committed`);
+    for (const source of inspection.progress.sources) {
+      console.log(`    ${source.id}               ${source.rowsRead.toLocaleString()} rows read${source.complete ? " (complete)" : ""}`);
+    }
+  }
   console.log(`  records              ${inspection.totals.records.toLocaleString()} (${inspection.totals.parsed.toLocaleString()} parsed)`);
   console.log(`  checkpoint           ${inspection.checkpoint.present ? `${inspection.checkpoint.stage}${inspection.checkpoint.hasIdentity ? "" : " (no run identity)"}` : "absent"}`);
   console.log(`  spool manifest       ${inspection.manifest ? (inspection.manifest.complete && inspection.manifest.matches ? `complete (${inspection.manifest.files} files)` : "present but not matching") : "absent"}`);
@@ -851,6 +989,10 @@ function usage(): void {
              nothing is uploaded or published.
   spool      Read-only: inspect an existing spool/checkpoint after a failed run
              (positions only — never record content; modifies nothing)
+  recover-spool
+             Read-only ASSESSMENT of a legacy spool that has no checkpoint or
+             manifest (proves the per-source contiguous prefix), and with --apply
+             converts it into a NEW v2 work directory. Never modifies the source.
   validate   Re-check the generated objects against their checksums
   publish    Flip the active-version pointer to a validated version
 
@@ -867,8 +1009,12 @@ Flags
                       pass2-from-spool: REQUIRED, and must differ from the source)
   --preflight-only    run: check auth, keys, TSV mapping, disk and RAM, then stop
                       (nothing is read in bulk, built or uploaded)
-  --no-resume         ignore the checkpoint and rebuild from the sources; clears
-                      the stale spool in workDir
+  --no-resume         ignore the checkpoint and start Pass 1 again; refuses to
+                      delete an existing spool (add --discard-spool for that)
+  --discard-spool     explicitly delete this work directory's spool before a
+                      rebuild. Only this flag removes partitions.
+  --spool-max-gb <n>  stop Pass 1 cleanly when the local spool reaches n GB
+                      (the ledger stays resumable; nothing is deleted)
   --disk-floor <mb>   run: free-space floor pass 2 stops at (default 512 MB). Lower
                       it only when the machine cannot hold that much free space and
                       the run's output is known to be small — it is a safety margin,
@@ -876,7 +1022,10 @@ Flags
   --repair-manifest   spool: record spool-manifest.json for an EXISTING spool whose
                       partitions all verify (the recovery path for a failed run
                       from a build that did not write a manifest)
-  --work-dir <path>   spool: inspect this directory instead of the config's workDir
+  --work-dir <path>   run: use this work directory instead of the config's workDir
+                      (required after recover-spool --apply, whose ledger lives in
+                      the NEW directory; the legacy spool is never the target)
+                      spool: inspect this directory instead of the config's workDir
                       pass2-from-spool: the NEW experimental directory for this
                       run's bookkeeping/shards (default: <source-work-dir>-<version>)
   --hashes            spool: also re-verify every partition checksum (re-reads it)
@@ -888,6 +1037,10 @@ Flags
                       limit (e.g. 1000000); the recorded value is used when omitted
   --check-only        pass2-from-spool: validate the spool and prepare the isolated
                       bookkeeping, then stop before merging anything
+  --target-work-dir   recover-spool --apply: the NEW empty directory for the v2
+                      spool (default: none; required)
+  --complete-sources  recover-spool --apply: comma-separated source ids the run's
+                      own log proves were read to the end (e.g. csv1)
   --upload            upload generated objects to R2
   --remote            validate: also read every object back FROM R2 and compare content
                       (with --offset/--limit to bound one call)
@@ -912,6 +1065,14 @@ async function main(): Promise<void> {
    * is on local disk. It therefore needs no config (the workDir from the config is
    * used when one is given) and never touches R2.
    */
+  if (command === "recover-spool") {
+    if (flags.help) {
+      usage();
+      return;
+    }
+    await cmdRecoverSpool(flags);
+    return;
+  }
   if (command === "spool") {
     // `spool --help` must not fall through to inspecting the default workDir.
     if (flags.help && !flags["work-dir"] && !flags.config) {

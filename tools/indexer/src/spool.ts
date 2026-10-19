@@ -35,6 +35,7 @@ import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from "node:
 import { join } from "node:path";
 
 import { scanJsonlFile, type JsonlProblem } from "./jsonl";
+import { readFrameLedger, readProgress, SPOOL_PROGRESS_FILE, SPOOL_V1_FILE_RE, SPOOL_V2_FILE_RE, spoolV2SidecarName } from "./spool-v2";
 
 export const SPOOL_DIR_NAME = "spool";
 export const SPOOL_MANIFEST_FILE = "spool-manifest.json";
@@ -49,16 +50,22 @@ export interface SpoolIdentity {
 }
 
 export interface SpoolManifestEntry {
-  /** File name inside the spool directory (`part-0007.jsonl`). */
+  /** File name inside the spool directory (`part-0007.jsonl` or `.jsonl.gz`). */
   file: string;
   /** Partition number parsed out of the file name. */
   partition: number;
   bytes: number;
   lines: number;
   sha256: string;
+  /** Committed frames (format 2 only). */
+  frames?: number;
 }
 
 export interface SpoolManifest {
+  /** Absent means format 1 (`part-####.jsonl` written by an older build). */
+  format?: 1 | 2;
+  /** Column mapping + captured labels, required to decode format 2 rows. */
+  schema?: unknown;
   identity: SpoolIdentity;
   /** Only ever written as `true`, and only after every stream has been flushed. */
   complete: true;
@@ -135,6 +142,8 @@ export async function hashFile(path: string): Promise<string> {
 export interface SpoolPartitionReport {
   file: string;
   partition: number | null;
+  /** 1 for `part-####.jsonl`, 2 for framed `part-####.jsonl.gz`. */
+  format: 1 | 2;
   bytes: number;
   /** Records the reader could delimit. */
   records: number;
@@ -173,6 +182,12 @@ export type SpoolVerdict = "clean" | "damaged" | "incomplete" | "empty";
 export interface SpoolInspection {
   workDir: string;
   spoolDir: string;
+  /** 2 when a resumable v2 progress ledger is present, else 1. */
+  format: 1 | 2;
+  /** v2 only: what the durable progress ledger says, when it is readable. */
+  progress?: { status: string; rows: number; bytes: number; sources: { id: string; rowsRead: number; complete: boolean }[] };
+  /** v1 only: partition numbers that do not match the hash partition of their rows. */
+  partitionMismatches?: number;
   partitions: SpoolPartitionReport[];
   totals: { files: number; bytes: number; records: number; parsed: number };
   checkpoint: SpoolCheckpointReport;
@@ -194,7 +209,7 @@ export interface InspectSpoolOptions {
 }
 
 function partitionOfFile(file: string): number | null {
-  const match = /^part-(\d{4})\.jsonl$/.exec(file);
+  const match = SPOOL_V1_FILE_RE.exec(file) ?? SPOOL_V2_FILE_RE.exec(file);
   return match ? Number(match[1]) : null;
 }
 
@@ -207,21 +222,72 @@ export async function inspectSpool(workDir: string, options: InspectSpoolOptions
   const maxProblemsPerFile = options.maxProblemsPerFile ?? 10;
   const findings: string[] = [];
 
-  const files = (await readdir(spoolDir).catch(() => [] as string[]))
-    .filter((name) => name.startsWith("part-") && name.endsWith(".jsonl"))
-    .sort();
+  const names = (await readdir(spoolDir).catch(() => [] as string[])).sort();
+  const files = names.filter((name) => SPOOL_V1_FILE_RE.test(name) || SPOOL_V2_FILE_RE.test(name));
+  const v2 = files.some((name) => SPOOL_V2_FILE_RE.test(name));
+  const progress = v2 ? await readProgress(workDir).catch((error: unknown) => { findings.push(String(error instanceof Error ? error.message : error)); return null; }) : null;
 
   const partitions: SpoolPartitionReport[] = [];
   const totals = { files: 0, bytes: 0, records: 0, parsed: 0 };
 
   for (const file of files) {
     const path = join(spoolDir, file);
+    const size = (await stat(path).catch(() => null))?.size ?? 0;
+    if (SPOOL_V2_FILE_RE.test(file)) {
+      const partition = partitionOfFile(file);
+      const ledger = partition === null ? [] : await readFrameLedger(join(spoolDir, spoolV2SidecarName(partition))).catch(() => []);
+      const rows = ledger.reduce((total, frame) => total + frame.rows, 0);
+      const framedBytes = ledger.reduce((total, frame) => total + frame.bytes, 0);
+      let sha256: string | null = null;
+      if (options.checkHashes) {
+        const hash = createHash("sha256");
+        for (const frame of ledger) {
+          const handle = await import("node:fs");
+          const buffer = Buffer.allocUnsafe(frame.bytes);
+          const fd = handle.openSync(path, "r");
+          try {
+            let read = 0;
+            while (read < frame.bytes) {
+              const got = handle.readSync(fd, buffer, read, frame.bytes - read, frame.offset + read);
+              if (got <= 0) break;
+              read += got;
+            }
+            hash.update(buffer.subarray(0, read));
+          } finally {
+            handle.closeSync(fd);
+          }
+        }
+        sha256 = hash.digest("hex");
+      }
+      const committedMismatch = framedBytes !== size;
+      partitions.push({
+        file,
+        partition,
+        format: 2,
+        bytes: size,
+        records: rows,
+        parsed: rows,
+        // A frame is written whole or rolled back, so a frame covered by the
+        // ledger is complete. Bytes beyond the ledger are an uncommitted tail and
+        // are reported as not terminated rather than counted as rows.
+        terminated: !committedMismatch,
+        sha256,
+        problems: committedMismatch
+          ? [{ kind: "truncated", code: "truncated_final_line", file: path, line: rows + 1, byteOffset: framedBytes, recordBytes: null, fileSize: size }]
+          : [],
+      });
+      totals.files += 1;
+      totals.bytes += size;
+      totals.records += rows;
+      totals.parsed += rows;
+      continue;
+    }
     const hash = createHash("sha256");
     const scan = await scanJsonlFile(path, { maxProblems: maxProblemsPerFile, onChunk: (chunk) => hash.update(chunk) });
-    const size = (await stat(path).catch(() => null))?.size ?? 0;
     partitions.push({
       file,
       partition: partitionOfFile(file),
+      format: 1,
       bytes: size,
       records: scan.records,
       parsed: scan.parsed,
@@ -332,7 +398,42 @@ export async function inspectSpool(workDir: string, options: InspectSpoolOptions
   else if (!manifestReport || !manifestReport.complete) verdict = "incomplete";
   else verdict = "clean";
 
-  return { workDir, spoolDir, partitions, totals, checkpoint, manifest: manifestReport, verdict, findings };
+  if (v2 && !progress) {
+    // v2 partitions without the progress ledger cannot be resumed: the ledger is
+    // the only record of which source rows each frame committed. Never guess.
+    verdict = "damaged";
+    findings.push(`${SPOOL_PROGRESS_FILE} is missing, so a v2 spool cannot be resumed or merged. Nothing was changed.`);
+  }
+  if (progress) {
+    const committedBytes = Object.values(progress.partitions).reduce((total, entry) => total + entry.bytes, 0);
+    const committedRows = Object.values(progress.partitions).reduce((total, entry) => total + entry.rows, 0);
+    if (committedRows !== totals.records) findings.push(`progress.json records ${committedRows.toLocaleString()} rows but the frame ledgers describe ${totals.records.toLocaleString()}.`);
+    if (committedBytes !== totals.bytes) findings.push(`progress.json records ${committedBytes.toLocaleString()} committed bytes but the partition files hold ${totals.bytes.toLocaleString()}.`);
+  }
+
+  return {
+    workDir,
+    spoolDir,
+    format: v2 ? 2 : 1,
+    progress: progress
+      ? {
+          status: progress.status,
+          rows: Object.values(progress.partitions).reduce((total, entry) => total + entry.rows, 0),
+          bytes: Object.values(progress.partitions).reduce((total, entry) => total + entry.bytes, 0),
+          sources: progress.schema.sources.map((source) => ({
+            id: source.id,
+            rowsRead: progress.sources[source.id]?.rowsRead ?? 0,
+            complete: progress.sources[source.id]?.complete ?? false,
+          })),
+        }
+      : undefined,
+    partitions,
+    totals,
+    checkpoint,
+    manifest: manifestReport,
+    verdict,
+    findings,
+  };
 }
 
 /**

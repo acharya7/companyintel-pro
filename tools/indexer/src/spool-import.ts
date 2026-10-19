@@ -88,7 +88,7 @@ import { checkpointPathFor, hashFile, spoolDirFor, spoolManifestPathFor, writeJs
 /** Bookkeeping file that makes an experimental work directory restartable. */
 export const EXPERIMENTAL_IMPORT_FILE = "experimental-import.json";
 
-const PARTITION_FILE = /^part-(\d{4})\.jsonl$/;
+const PARTITION_FILE = /^part-(\d{4})\.jsonl(\.gz)?$/;
 
 /**
  * What `runIndex` needs to know about an import.
@@ -138,6 +138,10 @@ interface SpoolImportBase extends SpoolImportSource {
   sampleLimit: number | null;
   partitions: number;
   spoolPartitions: number;
+  /** Encoding of the imported spool (1 = self-describing JSON rows, 2 = compact). */
+  format: 1 | 2;
+  /** Present for format 2; required to decode its rows. */
+  schema?: unknown;
   totals: { files: number; lines: number; bytes: number };
   sourceCheckpointSha256: string;
   sourceManifestSha256: string;
@@ -529,6 +533,10 @@ async function prepareWorkspace(planBase: SpoolImportBase, counters: Record<stri
    * is re-read and re-hashed on every attempt.
    */
   const derivedManifest: SpoolManifest = {
+    // The encoding travels with the entries: a v2 spool needs its schema to
+    // decode a row, and a derived manifest that dropped it would make the import
+    // unreadable while looking complete.
+    ...(planBase.format === 2 ? { format: 2 as const, schema: planBase.schema } : { format: 1 as const }),
     identity: outputIdentity,
     complete: true,
     createdAt: new Date().toISOString(),
@@ -690,6 +698,8 @@ export async function prepareSpoolImport(request: SpoolImportRequest): Promise<S
     sampleLimit,
     partitions: sourceIdentity.partitions,
     spoolPartitions,
+    format: manifest.format === 2 ? 2 : 1,
+    ...(manifest.format === 2 ? { schema: manifest.schema } : {}),
     entries: [...manifest.partitions].sort((a, b) => a.partition - b.partition),
     totals: { files: manifest.totals.files, lines: manifest.totals.lines, bytes: manifest.totals.bytes },
     rows: manifest.totals.lines,

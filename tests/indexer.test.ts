@@ -426,10 +426,14 @@ describe("end-to-end indexing pipeline", () => {
       runIndex({ ...config, datasetVersion: "test-v2", workDir, outputDir: join(dir, "out-prov-2") }, {}),
     ).rejects.toThrow(/different run/);
 
-    // `--no-resume` is the documented answer: it rebuilds from the sources.
+    // Rebuilding needs BOTH "ignore the checkpoint" and the explicit permission to
+    // delete the spool: --no-resume alone must never remove 217 GB of parsed rows.
+    await expect(
+      runIndex({ ...config, datasetVersion: "test-v2", workDir, outputDir: join(dir, "out-prov-3") }, { resume: false }),
+    ).rejects.toThrow(/already holds .* spool partition/);
     const rebuilt = await runIndex(
       { ...config, datasetVersion: "test-v2", workDir, outputDir: join(dir, "out-prov-3") },
-      { resume: false },
+      { resume: false, discardSpool: true },
     );
     expect(rebuilt.manifest.validationPassed).toBe(true);
     expect(rebuilt.counters.rowsRead).toBe(5);
@@ -437,25 +441,24 @@ describe("end-to-end indexing pipeline", () => {
     expect(rebuilt.counters.uniqueContacts).toBe(5);
   });
 
-  test("a fresh run clears the stale spool so rows cannot be counted twice", async () => {
+  test("a fresh run refuses a stale spool, and clears it only when told to", async () => {
     const workDir = join(dir, "work-stale-spool");
-    const spoolLines = async () => {
-      const files = (await readdir(join(workDir, "spool"))).filter((name) => name.endsWith(".jsonl"));
-      let lines = 0;
-      for (const name of files) {
-        lines += (await readFile(join(workDir, "spool", name), "utf8")).split("\n").filter(Boolean).length;
-      }
-      return lines;
-    };
+    const spoolRows = async () => (await readSpoolManifest(workDir))!.totals.lines;
 
     await runIndex({ ...config, workDir, outputDir: join(dir, "out-stale-1") }, {});
     // Five data rows are spooled (three from csv1, two from csv2).
-    expect(await spoolLines()).toBe(5);
+    expect(await spoolRows()).toBe(5);
 
-    // Pass 1 appends to `part-*.jsonl`. Without clearing, this second fresh run
-    // would leave ten rows in the spool and double every count downstream.
-    await runIndex({ ...config, workDir, outputDir: join(dir, "out-stale-2") }, { resume: false });
-    expect(await spoolLines()).toBe(5);
+    // Pass 1 APPENDS. Without clearing, a second fresh run would leave ten rows in
+    // the spool and double every count downstream — but clearing without an
+    // explicit instruction is how unrecovered work is lost, so it is refused.
+    await expect(
+      runIndex({ ...config, workDir, outputDir: join(dir, "out-stale-2") }, { resume: false }),
+    ).rejects.toThrow(/already holds .* spool partition/);
+    expect(await spoolRows()).toBe(5);
+
+    await runIndex({ ...config, workDir, outputDir: join(dir, "out-stale-2") }, { resume: false, discardSpool: true });
+    expect(await spoolRows()).toBe(5);
   });
 
   test("a run stops cleanly when free space drops below its floor", async () => {
@@ -512,6 +515,10 @@ describe("the pass-2 merge survives the separators real data contains", () => {
       outputDir: join(dir, "out"),
       partitions: 4,
       shards: { exact: 4, prefix: 4, token: 4, trigram: 4, ids: 4 },
+      // This suite asserts the LEGACY line encoding (separators escaped in plain
+      // JSONL). Format v2 stores the same values inside gzip frames, and its own
+      // round-trip is covered by tests/indexer-spool-v2.test.ts.
+      spoolFormat: "jsonl",
     };
   });
 
@@ -567,6 +574,9 @@ describe("spool completeness is recorded, verified and recoverable", () => {
       outputDir: join(dir, "out"),
       partitions: 4,
       shards: { exact: 4, prefix: 4, token: 4, trigram: 4, ids: 4 },
+      // These cases exercise the legacy manifest/adoption path on plain JSONL
+      // partitions; the v2 ledger has its own suite.
+      spoolFormat: "jsonl",
     };
   });
 
@@ -632,8 +642,8 @@ describe("spool completeness is recorded, verified and recoverable", () => {
     // would be exactly the silent data loss the manifest exists to prevent.
     await expect(adoptSpool(config.workDir, manifest!.identity, inspection)).rejects.toThrow(/not provably complete/);
 
-    // --no-resume is the documented answer, and it rebuilds a clean spool.
-    const rebuilt = await runIndex({ ...config, outputDir: join(dir, "out-rebuilt") }, { resume: false });
+    // Rebuilding a damaged legacy spool needs the explicit discard flag.
+    const rebuilt = await runIndex({ ...config, outputDir: join(dir, "out-rebuilt") }, { resume: false, discardSpool: true });
     expect(rebuilt.manifest.validationPassed).toBe(true);
     expect(rebuilt.counters.rowsRead).toBe(3);
     expect((await inspectSpool(config.workDir)).verdict).toBe("clean");
@@ -654,7 +664,7 @@ describe("spool completeness is recorded, verified and recoverable", () => {
     // into the new pass 1, or a crash mid-way would leave a claim that pass 1
     // finished over a spool that was just emptied.
     await rm(spoolManifestPathFor(config.workDir), { force: true });
-    const rebuilt = await runIndex({ ...config, outputDir: join(dir, "out-fresh") }, { resume: false });
+    const rebuilt = await runIndex({ ...config, outputDir: join(dir, "out-fresh") }, { resume: false, discardSpool: true });
     expect(rebuilt.manifest.validationPassed).toBe(true);
     const manifest = await readSpoolManifest(config.workDir);
     expect(manifest!.totals.lines).toBe(3);
@@ -688,21 +698,23 @@ describe("preflight resource estimates match what a real run consumes", () => {
     expect(estimate.totalBytes).toBeGreaterThan(2_490_000_000);
     // The total is the sum of the named terms (times the margin), not a rounded
     // fraction of the input size.
-    const terms = estimate.spoolBytes + estimate.rawCachePeakBytes + estimate.outputBytes + estimate.overheadBytes;
+    const terms = estimate.spoolBytesUpper + estimate.rawCachePeakBytes + estimate.outputBytes + estimate.overheadBytes;
     expect(estimate.totalBytes).toBe(Math.ceil(terms * estimate.safetyMargin));
+    expect(estimate.spoolBytesUpper).toBeGreaterThan(estimate.spoolBytes);
     expect(estimate.spoolBytes).toBe(2_000_000 * STORAGE.spoolBytesPerRow);
     expect(estimate.perSource.every((source) => source.mode === "r2" && source.rows === 1_000_000)).toBe(true);
   });
 
   test("the full-corpus requirement covers spool, raw cache and output", () => {
     const estimate = estimateWorkingSet(modeB, MEASURED, {});
-    // Previously the preflight reported 70.96 GB, which is the SPOOL alone: the
-    // 54 GB csv2 cache and the generated index were never in the total, even
-    // though the repository's own docs budgeted ~145-155 GB for exactly this run.
-    expect(estimate.spoolBytes).toBeGreaterThan(60e9);
+    // The compact v2 spool is a fraction of the source (measured ratio), not
+    // 1.1x it: 64.26 GB of source becomes ~27 GB of framed gzip. The conservative
+    // upper bound is what the decision uses.
+    expect(estimate.spoolBytes).toBeLessThan(35e9);
+    expect(estimate.spoolBytes).toBeGreaterThan(20e9);
+    expect(estimate.spoolBytesUpper).toBeGreaterThan(estimate.spoolBytes);
     expect(estimate.rawCachePeakBytes).toBeGreaterThan(50e9);
-    expect(estimate.totalBytes).toBeGreaterThan(140e9);
-    expect(estimate.totalBytes).toBeGreaterThan(70_960_000_000);
+    expect(estimate.totalBytes).toBeGreaterThan(120e9);
   });
 
   test("the bookkeeping term scales with the run instead of being a flat 256 MB", () => {
@@ -750,7 +762,7 @@ describe("preflight resource estimates match what a real run consumes", () => {
         STORAGE.fixedOverheadBytes,
         Math.max(STORAGE.minimumOverheadBytes, 1_000_000 * STORAGE.overheadBytesPerRow),
       );
-      const terms = STORAGE.spoolBytesPerRow * 1_000_000 + STORAGE.outputBytesPerRow * 1_000_000 + overhead;
+      const terms = STORAGE.spoolBytesPerRowUpper * 1_000_000 + STORAGE.outputBytesPerRow * 1_000_000 + overhead;
       expect(report.estimatedWorkBytes).toBe(Math.ceil(terms * STORAGE.safetyMargin));
     } finally {
       await rm(dir, { recursive: true, force: true });

@@ -87,6 +87,30 @@ import {
   type SpoolManifestEntry,
 } from "./spool";
 import {
+  DEFAULT_CHECKPOINT_MS,
+  DEFAULT_CHECKPOINT_ROWS,
+  DEFAULT_FRAME_BYTES,
+  SPOOL_FORMAT_VERSION,
+  SPOOL_PROGRESS_FILE,
+  SPOOL_V1_FILE_RE,
+  SPOOL_V2_FILE_RE,
+  assertSchema,
+  encodeSpoolV2Row,
+  normalizeValues,
+  prepareResume,
+  progressPathFor,
+  readProgress,
+  readSpoolV2Partition,
+  SpoolV2Writer,
+  spoolV2SidecarName,
+  writeProgress,
+  writeSchema,
+  type ResumePlan,
+  type SpoolProgress,
+  type SpoolSchema,
+  type SpoolSourceSchema,
+} from "./spool-v2";
+import {
   DEFAULT_CHUNK_BYTES,
   createSourceContext,
   parseR2Source,
@@ -125,6 +149,31 @@ export interface IndexerConfig {
    * without caching (nothing is written to disk; a re-run re-downloads).
    */
   rawCacheDir?: string | null;
+  /**
+   * Pass 1 intermediate encoding.
+   *
+   * `v2` (default) writes one compact source-value array per row into framed
+   * gzip partitions with a durable progress ledger — see `spool-v2.ts` for why
+   * the old `jsonl` shape produced 217 GB for 66 M rows. `jsonl` is kept only
+   * so the legacy format can still be built and tested.
+   */
+  spoolFormat?: "v2" | "jsonl";
+  /**
+   * Hard ceiling for the local spool, in bytes. Pass 1 stops cleanly (with a
+   * resumable ledger) rather than filling the volume. Defaults to no explicit
+   * cap: the preflight's estimate is enforced instead.
+   */
+  spoolMaxBytes?: number;
+  spool?: {
+    /** Uncompressed bytes buffered per partition before a gzip frame is sealed. */
+    frameBytes?: number;
+    /** Rows between durable checkpoints (default 100,000). */
+    checkpointRows?: number;
+    /** Milliseconds between durable checkpoints (default 60,000). */
+    checkpointMs?: number;
+    /** TEST-ONLY: simulate ENOSPC once committed bytes pass this value. */
+    faultAfterCommittedBytes?: number;
+  };
   /**
    * Companies per company/contact object is NOT configurable on purpose: the
    * readers derive the object for a given document ref from the shared
@@ -180,8 +229,12 @@ export interface WorkEstimate {
   /** Checkpoint, spool manifest, rejected.jsonl, objects.jsonl, shard `.lines`. */
   overheadBytes: number;
   safetyMargin: number;
-  /** The number compared against free disk: the sum above × `safetyMargin`. */
+  /** Conservative upper bound for the spool term (measurement × headroom). */
+  spoolBytesUpper: number;
+  /** The number compared against free disk: the upper-bound sum × `safetyMargin`. */
   totalBytes: number;
+  /** Largest local spool the design allows while Pass 1 runs (the cap, if any). */
+  spoolCapBytes: number | null;
   /** Per-source ingestion the estimate assumes, for the report. */
   perSource: { id: string; mode: "file" | "r2"; bytes: number; rows: number | null }[];
 }
@@ -191,14 +244,36 @@ export interface WorkEstimate {
  * runs against the real bucket, not a guess — see `docs/indexing.md`.
  */
 export const STORAGE = {
-  /** Real-data sample: 3,778 spool rows occupy 1,981,398 B → 524.5 B/row. */
+  /**
+   * MEASURED v2 spool bytes per source byte, compressed.
+   *
+   * Measured on the real 20,000-records-per-source sample (2026-10-19):
+   *
+   *   csv1  18,605 spooled rows → 13.65 MB compressed / 46.8 MB uncompressed
+   *         (733.6 B/row compressed; source row 1,734 B) → **0.423**;
+   *   csv2  19,524 spooled rows →  3.91 MB compressed / 12.9 MB uncompressed
+   *         (200.4 B/row compressed; source row 580 B)  → **0.346**;
+   *   both  38,129 rows → 17.56 MB compressed (460.6 B/row; 1,565 B/row before
+   *         gzip) — against v1's **3,273 B/row** (217 GB for 66.3 M rows).
+   *
+   * The per-source map is used first; the default covers a corpus whose ids are
+   * not the production ones. Source type matters: contact rows compress far better
+   * because they are narrow and highly repetitive.
+   */
+  spoolBytesPerSourceByte: 0.40,
+  spoolBytesPerSourceByteById: { csv1: 0.423, csv2: 0.346 } as Record<string, number>,
+  /** Conservative upper bound used for the preflight decision (measurement + ~30%). */
+  spoolBytesPerSourceByteUpper: 0.52,
+  /** Legacy v1 sample: 3,778 spool rows occupy 1,981,398 B → 524.5 B/row. */
   measuredSpoolBytesPerRow: 525,
   /**
-   * What the estimate uses: the measurement plus a third. Pass 1 derives extra
-   * fields (aliases, keys, normalized name) for wide organization rows, and the
-   * 1 M benchmark's own peak implies more than the sample average.
+   * v2: measured 460.6 B/row compressed on the real sample. Used only when the
+   * estimate has a row count (a `--sample` run) but no source byte count.
    */
-  spoolBytesPerRow: 700,
+  spoolBytesPerRow: 480,
+  spoolBytesPerRowUpper: 620,
+  /** v1 rows, kept for the legacy scorer so a legacy build can still be estimated. */
+  legacySpoolBytesPerRow: 700,
   /** Measured worst case: `raw/file1.csv` is 10.22 GB for ~4.7 M rows → 2,176 B/row. */
   maxSourceBytesPerRow: 2_176,
   /** Measured corpus average: 64.26 GB for ~101.5 M rows → 633 B/row. */
@@ -468,7 +543,9 @@ export function estimateWorkingSet(
 ): WorkEstimate {
   const chunkBytes = options.chunkBytes ?? DEFAULT_CHUNK_BYTES;
   const perSource: WorkEstimate["perSource"] = [];
+  const format: "v2" | "jsonl" = config.spoolFormat ?? "v2";
   let spoolBytes = 0;
+  let spoolBytesUpper = 0;
   let outputBytes = 0;
   let rawCachePeakBytes = 0;
   /** Rows the estimate is based on; `null` as soon as one source's total is unknown. */
@@ -485,13 +562,29 @@ export function estimateWorkingSet(
     if (rows === null) totalRows = null;
     else if (totalRows !== null) totalRows += rows;
 
+    /*
+     * The spool is estimated from SOURCE BYTES, not from a row count times an
+     * average row size. That is the fix for the 217 GB surprise: the old model
+     * multiplied an assumed row count by a 700 B/row constant measured before
+     * full-column capture existed, so it missed a 4.7x expansion that depended on
+     * how wide the source records are. A ratio per source byte cannot drift from
+     * the data's own width.
+     */
+    if (options.sampleLimit === undefined && source.bytes !== null && format === "v2") {
+      const ratio = STORAGE.spoolBytesPerSourceByteById[source.id] ?? STORAGE.spoolBytesPerSourceByte;
+      spoolBytes += Math.round(bytes * ratio);
+      spoolBytesUpper += Math.round(bytes * Math.max(ratio * 1.3, STORAGE.spoolBytesPerSourceByteUpper));
+    } else {
+      const rowCount = rows ?? Math.round(bytes / STORAGE.averageSourceBytesPerRow);
+      const perRow = format === "v2" ? STORAGE.spoolBytesPerRow : STORAGE.legacySpoolBytesPerRow;
+      const perRowUpper = format === "v2" ? STORAGE.spoolBytesPerRowUpper : STORAGE.legacySpoolBytesPerRow * 1.3;
+      spoolBytes += rowCount * perRow;
+      spoolBytesUpper += rowCount * perRowUpper;
+    }
+
     if (rows === null) {
-      // Unknown size: fall back to the input bytes with the same headroom the
-      // per-row constant carries (measured spool ≈ 0.83 × source bytes here).
-      spoolBytes += Math.round(bytes * 1.1);
       outputBytes += Math.round(bytes * 0.12);
     } else {
-      spoolBytes += rows * STORAGE.spoolBytesPerRow;
       outputBytes += rows * STORAGE.outputBytesPerRow;
     }
 
@@ -517,14 +610,26 @@ export function estimateWorkingSet(
     totalRows === null
       ? STORAGE.fixedOverheadBytes
       : Math.min(STORAGE.fixedOverheadBytes, Math.max(STORAGE.minimumOverheadBytes, totalRows * STORAGE.overheadBytesPerRow));
-  const sum = spoolBytes + rawCachePeakBytes + outputBytes + overheadBytes;
+  /*
+   * The decision uses the UPPER bound, not the expected value. The failed run
+   * passed a preflight computed from a best-case average; a full 6-hour job must
+   * be refused on the number that can actually fill the disk. `totalBytes` also
+   * includes the output written DURING pass 2, because the spool is still on disk
+   * at that moment.
+   */
+  const sum = spoolBytesUpper + rawCachePeakBytes + outputBytes + overheadBytes;
+  const cap = config.spoolMaxBytes ?? null;
   return {
     spoolBytes,
+    spoolBytesUpper,
     rawCachePeakBytes,
     outputBytes,
     overheadBytes,
     safetyMargin: STORAGE.safetyMargin,
     totalBytes: Math.ceil(sum * STORAGE.safetyMargin),
+    // A hard cap lowers the high-water mark only if it is below the upper bound;
+    // the run refuses to exceed it, so the two numbers cannot disagree silently.
+    spoolCapBytes: cap === null ? null : Math.min(cap, spoolBytesUpper),
     perSource,
   };
 }
@@ -567,6 +672,8 @@ export async function preflight(
       ? estimateWorkingSet(config, sources, { sampleLimit: options.sampleLimit, chunkBytes: context.chunkBytes })
       : {
           spoolBytes: 0,
+          spoolBytesUpper: 0,
+          spoolCapBytes: null,
           rawCachePeakBytes: 0,
           outputBytes: Math.round(importedRows * STORAGE.outputBytesPerRow),
           overheadBytes: STORAGE.fixedOverheadBytes,
@@ -583,9 +690,8 @@ export async function preflight(
 
   if (freeDiskBytes !== null && freeDiskBytes < estimatedWorkBytes) {
     warnings.push(
-      `Temporary space looks insufficient: about ${(freeDiskBytes / 1e9).toFixed(1)} GB free vs ${(estimatedWorkBytes / 1e9).toFixed(1)} GB estimated for spool + raw cache + output${
-        sampleRows === null ? "" : ` in a ${options.sampleLimit?.toLocaleString()}-record sample per source`
-      }.`,
+      `Temporary space looks insufficient: about ${(freeDiskBytes / 1e9).toFixed(1)} GB free vs ${(estimatedWorkBytes / 1e9).toFixed(1)} GB for the ` +
+        `UPPER bound of spool + raw cache + output${sampleRows === null ? "" : ` in a ${options.sampleLimit?.toLocaleString()}-record sample per source`}.`,
     );
   }
   if (estimate.rawCachePeakBytes > 0 && estimatedWorkBytes > 0) {
@@ -1015,6 +1121,14 @@ export interface RunOptions {
   /** Free-space floor on the output volume; the run stops cleanly below it. */
   diskFloorBytes?: number;
   /**
+   * Explicit permission to delete an existing spool before rebuilding it.
+   *
+   * `--no-resume` used to imply this, which is how an unclaimed 217 GB spool could
+   * be cleared by a command whose purpose was to finish the index. Deletion now
+   * needs its own flag; without it an existing spool is refused, never removed.
+   */
+  discardSpool?: boolean;
+  /**
    * Merge a VERIFIED Pass 1 spool that lives in another work directory, without
    * profiling or reading any source.
    *
@@ -1200,7 +1314,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
    * to or rewritten. Getting them out of step is what could double every row in a
    * new spool.
    */
-  const reuseSpool = checkpoint?.stage === "pass2-merge";
+  let reuseSpool = checkpoint?.stage === "pass2-merge";
   /*
    * Belt-and-braces for the experimental import: an imported spool is NEVER cleared
    * or rebuilt by this run. Without this guard, a missing derived checkpoint (which
@@ -1245,32 +1359,97 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   await mkdir(config.outputDir, { recursive: true });
 
   /*
-   * Starting fresh means the spool is empty, so any `part-*.jsonl` still on disk
-   * belongs to a previous run and MUST go: pass 1 appends to these files, and
-   * leaving them would add a second copy of every row to the new index (rows are
-   * deduplicated later, but company/contact counts, facets and rejected-row
-   * accounting would all be wrong). Only the spool is cleared — `outputDir`,
-   * generated objects and the raw cache are left alone.
+   * Pass 1 may only start on an EMPTY spool, or on one its own durable ledger
+   * proves it was writing. Anything else is refused.
+   *
+   * This is the guard that fixes the destructive behaviour of the first full
+   * run: a work directory with 217 GB of `part-*.jsonl` and no checkpoint used to
+   * take the "starting fresh" path, which deleted every partition before reading
+   * a row. An unclaimed spool is not stale — it is unrecovered work — so the run
+   * stops and names the read-only inspection and recovery commands instead.
    */
-  if (!reuseSpool) {
-    const stale = (await readdir(spoolDir).catch(() => [] as string[])).filter(
-      (name) => name.startsWith("part-") && name.endsWith(".jsonl"),
-    );
-    for (const name of stale) await rm(join(spoolDir, name), { force: true });
-    if (stale.length) {
-      emit({ stage: "pass1-partition", message: `cleared ${stale.length} stale spool partition file(s) from a previous run` });
+  const spoolFormat: "v2" | "jsonl" = config.spoolFormat ?? "v2";
+  const spoolFilesOnDisk = (await readdir(spoolDir).catch(() => [] as string[])).filter(
+    (name) => SPOOL_V1_FILE_RE.test(name) || SPOOL_V2_FILE_RE.test(name),
+  );
+  let progress: SpoolProgress | null = null;
+  let resumePlan: ResumePlan | null = null;
+  let schema: SpoolSchema | null = null;
+
+  if (!reuseSpool && resume && !options.discardSpool && spoolFormat === "v2") {
+    progress = await readProgress(workDir);
+    if (progress) {
+      const differences = identityDiff(progress.identity, identity);
+      if (differences.length) {
+        throw new Error(
+          `workDir already holds a Pass 1 progress ledger for a different run: ${differences.join("; ")}.\n` +
+            "  The rows in that spool belong to the recorded run, so this run will not resume or overwrite them.\n" +
+            "  Either use the matching configuration/version, point `workDir` at an empty directory, or — only if you\n" +
+            "  really mean to delete the spool — pass --discard-spool. Nothing was read or written.",
+        );
+      }
+      schema = progress.schema;
+      if (progress.status === "pass1-complete" && existsSync(spoolManifestPathFor(workDir))) {
+        // Pass 1 finished but the crash landed between the manifest and the
+        // checkpoint. The manifest is the proof, so merge instead of rebuilding.
+        reuseSpool = true;
+      } else {
+        resumePlan = await prepareResume(workDir, progress);
+        emit({
+          stage: "pass1-partition",
+          message:
+            `pass 1: resuming from ${progressPathFor(workDir)} — ` +
+            progress.schema.sources
+              .map((entry) => `${entry.id}: ${(progress!.sources[entry.id]?.rowsRead ?? 0).toLocaleString()} rows${progress!.sources[entry.id]?.complete ? " (complete)" : ""}`)
+              .join(", ") +
+            `; ${Object.keys(progress.partitions).length} partition(s), ${(Object.values(progress.partitions).reduce((total, entry) => total + entry.bytes, 0) / 1e6).toFixed(1)} MB committed`,
+        });
+      }
+    }
+  }
+
+  if (!reuseSpool && !resumePlan) {
+    if (spoolFilesOnDisk.length && !options.discardSpool) {
+      throw new Error(
+        `Refusing to start: ${spoolDir} already holds ${spoolFilesOnDisk.length} spool partition file(s), and there is no\n` +
+          "  durable progress ledger or checkpoint that proves what they contain.\n" +
+          "\n" +
+          "  This is exactly the state a disk-full Pass 1 leaves behind. Deleting or rebuilding it automatically is how\n" +
+          "  66 million parsed rows were almost lost once, so nothing will be touched.\n" +
+          "\n" +
+          "  Inspect it read-only:        bun run index:spool-doctor\n" +
+          "  Assess recoverability:       bun tools/indexer/src/cli.ts recover-spool --assess --work-dir .indexer-work\n" +
+          "  Convert a proven prefix:     bun tools/indexer/src/cli.ts recover-spool --apply --work-dir .indexer-work\n" +
+          "                               --target-work-dir .indexer-work-v2\n" +
+          "  Delete deliberately:         add --discard-spool (and only then is anything removed)",
+      );
     }
     /*
-     * The manifest and the checkpoint are removed too, before a single row is
-     * spooled. Both of them assert "pass 1 finished": leaving a previous run's
-     * checkpoint in place while the spool is being rewritten would mean that a
-     * crash in the middle of pass 1 left a checkpoint claiming pass 1 was done
-     * over a half-written spool. Removing them first makes that state impossible
-     * — after a crash there is simply no manifest, and no manifest means the
-     * spool may not be merged.
+     * Only an explicit --discard-spool removes rows. The manifest and the
+     * checkpoint go too, before a single row is spooled: both assert "pass 1
+     * finished", and leaving them over a half-written spool would let a crash
+     * produce a checkpoint that claims a rewrite it never completed.
      */
-    await rm(checkpointPath, { force: true });
-    await clearSpoolManifest(workDir);
+    if (options.discardSpool) {
+      const removable = (await readdir(spoolDir).catch(() => [] as string[])).filter(
+        (name) => SPOOL_V1_FILE_RE.test(name) || SPOOL_V2_FILE_RE.test(name) || name.endsWith(".frames"),
+      );
+      for (const name of removable) await rm(join(spoolDir, name), { force: true });
+      for (const name of [SPOOL_PROGRESS_FILE, "schema.json"]) await rm(join(spoolDir, name), { force: true });
+      await rm(checkpointPath, { force: true });
+      await clearSpoolManifest(workDir);
+      progress = null;
+      if (removable.length) {
+        emit({ stage: "pass1-partition", message: `--discard-spool: removed ${removable.length} explicitly discarded spool file(s)` });
+      }
+    } else if (spoolFormat === "jsonl" && spoolFilesOnDisk.length) {
+      // The legacy encoder has no ledger to resume from; an empty spool is the
+      // only safe starting point without an explicit discard.
+      throw new Error(
+        `Refusing to start: ${spoolDir} holds spool files and spoolFormat is "jsonl", which has no resumable ledger.\n` +
+          "  Inspect them (index:spool-doctor), or pass --discard-spool to remove them deliberately.",
+      );
+    }
   }
 
   /* ------------------------------- profiling ------------------------------ */
@@ -1301,7 +1480,18 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       message: `profiling skipped: pass 1 is reused from ${spoolDir}, and the column mapping it used is already recorded in the spool`,
     });
   }
-  for (const source of reuseSpool ? [] : config.sources) {
+  if (schema) {
+    // A resumed v2 run rebuilds the mapping from `spool/schema.json` instead of
+    // profiling: the spool already contains rows written under that exact mapping,
+    // and re-deriving it from a source that may have changed is the one thing that
+    // could decode them differently.
+    for (const recorded of schema.sources) {
+      columnMaps.push(recorded.map);
+      capturedBySource.push(recorded.captured.map((column) => ({ index: column.index, label: column.label })));
+    }
+    emit({ stage: "profiling", message: `profiling skipped: resuming with the column mapping recorded in spool/${"schema.json"}` });
+  }
+  for (const source of schema || reuseSpool ? [] : config.sources) {
     // Mode A profiles the file; Mode B profiles a bounded sample of the object.
     const profile = await sourceProfile(
       source,
@@ -1332,6 +1522,26 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     if (unmappedHeaders.length) {
       emit({ stage: "profiling", message: `  unmapped in ${source.id}: ${unmappedHeaders.slice(0, 12).join(", ")}` });
     }
+  }
+
+  if (!schema) {
+    /*
+     * The schema is what makes a v2 row decodable: the source's column count, the
+     * canonical field → column map, and the captured labels in file order. It is
+     * written once, before the first row, so a resume never has to profile (and
+     * cannot profile differently) — and it is what lets a recovered legacy spool be
+     * read without its original config.
+     */
+    schema = {
+      format: SPOOL_FORMAT_VERSION,
+      sources: config.sources.map((source, index) => ({
+        id: source.id,
+        delimiter: profiles[index]?.delimiter ?? source.delimiter ?? "\t",
+        columns: profiles[index]?.headers.length ?? 0,
+        map: columnMaps[index] ?? {},
+        captured: (capturedBySource[index] ?? []).map((column) => ({ index: column.index, label: column.label })),
+      })),
+    };
   }
 
   const profilingMs = Date.now() - profilingStart;
@@ -1377,16 +1587,42 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     }
   }
 
+  /*
+   * A resumed v2 Pass 1 restores its counters from the progress ledger, which is
+   * written at every checkpoint. The rows it skips were counted before the
+   * interruption, so counting them again would inflate `rows read` and the
+   * per-source contribution validation.
+   */
+  if (resumePlan && progress) {
+    counters.rowsRead = resumePlan.rowsRead;
+    counters.rowsRejected = resumePlan.rowsRejected;
+    for (const source of progress.schema.sources) {
+      const state = progress.sources[source.id];
+      const target = counters.perSource[source.id] ?? { rowsRead: 0, rowsRejected: 0, companies: 0, contacts: 0 };
+      target.rowsRead = state?.rowsRead ?? 0;
+      target.rowsRejected = state?.rowsRejected ?? 0;
+      counters.perSource[source.id] = target;
+    }
+  }
+
   const rejectedPath = join(workDir, "rejected.jsonl");
   // Appended only when this run reuses the spool it belongs to (nothing is written
   // to it in that case); a run that re-reads the sources starts the list over.
-  const rejected = createWriteStream(rejectedPath, { flags: reuseSpool ? "a" : "w" });
+  const rejected = createWriteStream(rejectedPath, { flags: reuseSpool || resumePlan ? "a" : "w" });
 
   /** Milliseconds pass 1 occupied, for the run's stage breakdown. */
   let pass1Ms = reuseSpool ? 0 : -1;
 
   if (!reuseSpool) {
-    emit({ stage: "pass1-partition", message: "pass 1: streaming both files into hash partitions" });
+    const usingV2 = spoolFormat === "v2";
+    if (usingV2 && !schema) throw new Error("internal: pass 1 has no spool schema");
+    if (usingV2) writeSchema(workDir, schema!);
+    emit({
+      stage: "pass1-partition",
+      message: usingV2
+        ? "pass 1: streaming both files into framed-gzip hash partitions (format v2, compact rows + durable checkpoints)"
+        : "pass 1: streaming both files into hash partitions (legacy jsonl encoding)",
+    });
     const pass1Start = Date.now();
 
     // One sink map for the whole pass: a partition that both sources write to
@@ -1394,12 +1630,84 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     // being closed after source 1 and reopened (with a fresh checksum) for
     // source 2.
     const sinks = new Map<number, PartitionSink>();
+    const writer = usingV2
+      ? new SpoolV2Writer(spoolDir, schema!, {
+          frameBytes: config.spool?.frameBytes ?? DEFAULT_FRAME_BYTES,
+          faultAfterCommittedBytes: config.spool?.faultAfterCommittedBytes,
+        })
+      : null;
+    // A resumed run must own the partitions it already committed, or its final
+    // manifest would describe only the rows added after the restart.
+    if (writer && progress) writer.adopt(Object.values(progress.partitions));
+    const checkpointRows = config.spool?.checkpointRows ?? DEFAULT_CHECKPOINT_ROWS;
+    const checkpointMs = config.spool?.checkpointMs ?? DEFAULT_CHECKPOINT_MS;
+    const spoolLimit = config.spoolMaxBytes ?? null;
+
+    /**
+     * The ledger this run writes. A resume adopts the existing one (it is also the
+     * proof the spool belongs to this run) and keeps appending to it.
+     */
+    const ledger: SpoolProgress | null = writer
+      ? (progress ?? {
+          format: SPOOL_FORMAT_VERSION,
+          identity,
+          schema: schema!,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          status: "pass1",
+          sources: Object.fromEntries(
+            config.sources.map((source) => [source.id, { rowsRead: 0, rowsRejected: 0, complete: false }]),
+          ),
+          partitions: {},
+          totals: { files: 0, rows: 0, bytes: 0 },
+        })
+      : null;
+    if (ledger) writeProgress(workDir, ledger);
+
+    /** Flush, fsync and record exactly which rows are now durable. */
+    const checkpointNow = async (): Promise<void> => {
+      if (!writer || !ledger) return;
+      await writer.checkpoint();
+      const partitions = writer.progress();
+      ledger.partitions = Object.fromEntries(partitions.map((entry) => [String(entry.partition), entry]));
+      ledger.totals = {
+        files: partitions.length,
+        rows: partitions.reduce((total, entry) => total + entry.rows, 0),
+        bytes: partitions.reduce((total, entry) => total + entry.bytes, 0),
+      };
+      for (const source of config.sources) {
+        const previous = ledger.sources[source.id];
+        ledger.sources[source.id] = {
+          rowsRead: counters.perSource[source.id]?.rowsRead ?? 0,
+          rowsRejected: counters.perSource[source.id]?.rowsRejected ?? 0,
+          complete: previous?.complete ?? false,
+        };
+      }
+      writeProgress(workDir, ledger);
+    };
+
+    const diskFull = new Error(
+      `Stopping before the volume fills: the local spool has reached ${(spoolLimit! / 1e9).toFixed(2)} GB (spoolMaxBytes).\n` +
+        "  Everything committed is verified and the progress ledger is durable; re-run the same command to resume from\n" +
+        "  that source row (it truncates only the uncommitted tail). Raise spoolMaxBytes, free space, or set\n" +
+        "  `spoolFormat` to \"v2\" (the default) so the spool is compact.",
+    );
 
     for (let sourceIndex = 0; sourceIndex < config.sources.length; sourceIndex += 1) {
       const source = config.sources[sourceIndex];
-      const map = columnMaps[sourceIndex];
+      const sourceSchema: SpoolSourceSchema | undefined = schema!.sources[sourceIndex];
+      const map = columnMaps[sourceIndex] ?? sourceSchema?.map ?? {};
       const captured = capturedBySource[sourceIndex] ?? [];
+      const columns = sourceSchema?.columns ?? 0;
+      if (resumePlan?.completeSources.includes(source.id)) {
+        emit({ stage: "pass1-partition", message: `pass 1: ${source.id} was already complete in the ledger (${(progress?.sources[source.id]?.rowsRead ?? 0).toLocaleString()} rows); not read again` });
+        continue;
+      }
+      const skipRows = resumePlan?.skipRows[source.id] ?? 0;
       let rows = 0;
+      let seen = 0;
+      let rowsSinceCheckpoint = 0;
+      let lastCheckpointAt = Date.now();
       // The first record of each file is its header row, which was already read
       // by the profiler and must never be indexed as data.
       let isHeader = true;
@@ -1414,9 +1722,17 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
           continue;
         }
         if (record.fields.every((field) => field.trim() === "")) continue;
+        seen += 1;
+        /*
+         * Rows below the durable checkpoint were already spooled and counted.
+         * Skipping them (rather than re-writing and de-duplicating later) is what
+         * makes a restart impossible to turn into a double-counted dataset.
+         */
+        if (seen <= skipRows) continue;
         rows += 1;
         counters.rowsRead += 1;
         counters.perSource[source.id].rowsRead += 1;
+        rowsSinceCheckpoint += 1;
 
         const companyInput = extractCompanyInput(record.fields, map, captured);
         if (!companyInput) {
@@ -1432,37 +1748,58 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
           counters.recordsMissingCompanyId += 1;
         }
 
-        const contactInput = extractContactInput(record.fields, map, captured);
         const keys = companyKeysFromInput(companyInput, source.id);
         // Partition by the normalized name, so a company row and the contact rows
         // that name it are resolved in the same partition (see mapping.ts).
         const partition = partitionFor(keys.partitionKey, config.partitions);
-        const row: SpoolRow = {
-          keys: keys.all,
-          bucket: keys.bucket,
-          partitionKey: keys.partitionKey,
-          strong: keys.strong,
-          normalizedName: keys.normalizedName,
-          company: companyInput,
-          contact: contactInput,
-          source: { source: source.id, row: record.line },
-        };
 
-        let sink = sinks.get(partition);
-        if (!sink) {
-          const path = join(spoolDir, `part-${String(partition).padStart(4, "0")}.jsonl`);
-          sink = { stream: createWriteStream(path, { flags: "a" }), bytes: 0, lines: 0, hash: createHash("sha256") };
-          sinks.set(partition, sink);
+        if (writer) {
+          writer.add(partition, encodeSpoolV2Row(sourceIndex, record.line, normalizeValues(record.fields, columns)));
+        } else {
+          const contactInput = extractContactInput(record.fields, map, captured);
+          const row: SpoolRow = {
+            keys: keys.all,
+            bucket: keys.bucket,
+            partitionKey: keys.partitionKey,
+            strong: keys.strong,
+            normalizedName: keys.normalizedName,
+            company: companyInput,
+            contact: contactInput,
+            source: { source: source.id, row: record.line },
+          };
+          let sink = sinks.get(partition);
+          if (!sink) {
+            const path = join(spoolDir, `part-${String(partition).padStart(4, "0")}.jsonl`);
+            sink = { stream: createWriteStream(path, { flags: "a" }), bytes: 0, lines: 0, hash: createHash("sha256") };
+            sinks.set(partition, sink);
+          }
+          // `encodeJsonlLine` escapes U+2028/U+2029, which `JSON.stringify` leaves
+          // literal and a line-oriented reader splits on. That mismatch is what
+          // failed the 1 M benchmark in pass 2 with "Unterminated string".
+          const line = encodeJsonlLine(row);
+          sink.hash.update(line, "utf8");
+          sink.bytes += Buffer.byteLength(line, "utf8");
+          sink.lines += 1;
+          if (!sink.stream.write(line)) {
+            await new Promise<void>((resolve) => sink!.stream.once("drain", () => resolve()));
+          }
         }
-        // `encodeJsonlLine` escapes U+2028/U+2029, which `JSON.stringify` leaves
-        // literal and a line-oriented reader splits on. That mismatch is what
-        // failed the 1 M benchmark in pass 2 with "Unterminated string".
-        const line = encodeJsonlLine(row);
-        sink.hash.update(line, "utf8");
-        sink.bytes += Buffer.byteLength(line, "utf8");
-        sink.lines += 1;
-        if (!sink.stream.write(line)) {
-          await new Promise<void>((resolve) => sink!.stream.once("drain", () => resolve()));
+
+        if (writer && spoolLimit !== null && writer.committedBytes() + writer.bufferedBytes() > spoolLimit) {
+          // Flush what is already buffered so no work is lost, then stop cleanly.
+          await checkpointNow();
+          throw diskFull;
+        }
+
+        if (writer && (rowsSinceCheckpoint >= checkpointRows || Date.now() - lastCheckpointAt >= checkpointMs)) {
+          await checkpointNow();
+          rowsSinceCheckpoint = 0;
+          lastCheckpointAt = Date.now();
+          emit({
+            stage: "pass1-partition",
+            rowsRead: counters.rowsRead,
+            message: `pass 1: checkpoint — ${counters.rowsRead.toLocaleString()} rows durable across ${Object.keys(ledger!.partitions).length} partition(s), ${(ledger!.totals.bytes / 1e6).toFixed(1)} MB`,
+          });
         }
 
         if (rows % 200_000 === 0) {
@@ -1479,7 +1816,15 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
         }
       }
 
-      emit({ stage: "pass1-partition", rowsRead: counters.rowsRead, message: `pass 1: finished ${source.id} (${rows.toLocaleString()} rows)` });
+      if (ledger) {
+        ledger.sources[source.id] = {
+          rowsRead: counters.perSource[source.id]?.rowsRead ?? 0,
+          rowsRejected: counters.perSource[source.id]?.rowsRejected ?? 0,
+          complete: true,
+        };
+        await checkpointNow();
+      }
+      emit({ stage: "pass1-partition", rowsRead: counters.rowsRead, message: `pass 1: finished ${source.id} (${rows.toLocaleString()} rows this attempt)` });
     }
 
     /*
@@ -1491,17 +1836,43 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
      * alone is not proof — it did not say which partitions were finished, which is
      * how a truncated partition could be merged as "these rows never existed".
      */
-    await Promise.all([...sinks.values()].map((sink) => new Promise<void>((resolve) => sink.stream.end(resolve))));
-    const entries: SpoolManifestEntry[] = [...sinks.entries()]
-      .sort((a, b) => a[0] - b[0])
-      .map(([partition, sink]) => ({
-        file: `part-${String(partition).padStart(4, "0")}.jsonl`,
-        partition,
-        bytes: sink.bytes,
-        lines: sink.lines,
-        sha256: sink.hash.digest("hex"),
+    let entries: SpoolManifestEntry[];
+    if (writer) {
+      await writer.checkpoint();
+      await writer.close();
+      entries = writer.finalize().map((entry) => ({
+        file: entry.file,
+        partition: entry.partition,
+        bytes: entry.bytes,
+        lines: entry.rows,
+        sha256: entry.sha256,
+        frames: entry.frames,
       }));
+      if (ledger) {
+        const partitions = writer.progress();
+        ledger.partitions = Object.fromEntries(partitions.map((entry) => [String(entry.partition), entry]));
+        ledger.totals = {
+          files: partitions.length,
+          rows: partitions.reduce((total, entry) => total + entry.rows, 0),
+          bytes: partitions.reduce((total, entry) => total + entry.bytes, 0),
+        };
+        ledger.status = "pass1-complete";
+      }
+    } else {
+      await Promise.all([...sinks.values()].map((sink) => new Promise<void>((resolve) => sink.stream.end(resolve))));
+      entries = [...sinks.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([partition, sink]) => ({
+          file: `part-${String(partition).padStart(4, "0")}.jsonl`,
+          partition,
+          bytes: sink.bytes,
+          lines: sink.lines,
+          sha256: sink.hash.digest("hex"),
+        }));
+    }
     const manifest: SpoolManifest = {
+      format: writer ? SPOOL_FORMAT_VERSION : 1,
+      ...(writer ? { schema: schema! } : {}),
       identity,
       complete: true,
       createdAt: new Date().toISOString(),
@@ -1513,9 +1884,10 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       },
     };
     await writeJsonAtomic(spoolManifestPathFor(workDir), manifest);
+    if (ledger) writeProgress(workDir, ledger);
     emit({
       stage: "pass1-partition",
-      message: `pass 1: spooled ${manifest.totals.lines.toLocaleString()} rows into ${manifest.totals.files} partition file(s) (${(manifest.totals.bytes / 1e9).toFixed(2)} GB); recorded in ${SPOOL_MANIFEST_FILE}`,
+      message: `pass 1: spooled ${manifest.totals.lines.toLocaleString()} rows into ${manifest.totals.files} partition file(s) (${(manifest.totals.bytes / 1e9).toFixed(2)} GB, ${(manifest.totals.bytes / Math.max(1, manifest.totals.lines)).toFixed(0)} B/row); recorded in ${SPOOL_MANIFEST_FILE}`,
     });
 
     pass1Ms = Date.now() - pass1Start;
@@ -1581,7 +1953,15 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   // would cost the operator a working artifact for nothing. (Record counts and
   // checksums still have to be verified while merging — those need a read.)
   for (const entry of spoolEntries) await assertPartitionLength(entry, spoolDir);
-  emit({ stage: "pass2-merge", message: `pass 2: verified the recorded length of all ${totalPartitions} spool partitions` });
+  /*
+   * The manifest says how its rows are encoded. Format 2 rows are compact arrays
+   * decoded through the recorded schema; format 1 rows are self-describing JSON
+   * objects. Both go through the same merge below, so a legacy spool (including a
+   * recovered one) produces the identical index.
+   */
+  const spoolEncoding: 1 | 2 = spoolManifest.format === 2 ? 2 : 1;
+  const spoolSchema = spoolEncoding === 2 ? assertSchema(spoolManifest.schema, spoolManifestPathFor(workDir)) : null;
+  emit({ stage: "pass2-merge", message: `pass 2: verified the recorded length of all ${totalPartitions} spool partitions (format ${spoolEncoding})` });
   const pass2Reset = await resetPass2Output(config, { shardDir }, emit);
 
   const writer = new ObjectWriter(config.outputDir);
@@ -1739,7 +2119,24 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
      * offset instead of being skipped.
      */
     try {
-      for await (const record of readJsonlFile<SpoolRow>(path, { onChunk: (chunk) => partitionHash.update(chunk) })) {
+      /** One iterator shape for both encodings, so the merge is written once. */
+      const rowsForPartition = async function* (): AsyncGenerator<{ value: SpoolRow }> {
+        if (spoolEncoding === 2) {
+          const decoder = readSpoolV2Partition(
+            path,
+            join(spoolDir, spoolV2SidecarName(entry.partition)),
+            spoolSchema!,
+            entry.partition,
+            { onChunk: (chunk) => partitionHash.update(chunk) },
+          );
+          for await (const row of decoder) yield { value: row as unknown as SpoolRow };
+          return;
+        }
+        for await (const record of readJsonlFile<SpoolRow>(path, { onChunk: (chunk) => partitionHash.update(chunk) })) {
+          yield { value: record.value };
+        }
+      };
+      for await (const record of rowsForPartition()) {
         recordsSeen += 1;
         const row = record.value;
         const decision = resolver.resolve({

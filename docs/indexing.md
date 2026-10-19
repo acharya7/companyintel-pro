@@ -68,7 +68,7 @@ as such. Replace the extrapolations with a 1,000,000-row sample run before the f
 | Parse throughput | file1 8,143 rows/s (17.7 MB/s, 2,176 B/row); file2 40,839 rows/s (22.8 MB/s, 558 B/row) | **measured** on this 1-vCPU sandbox |
 | Row counts | file1 ≈ 4.7 M organizations; file2 ≈ 96.8 M people ≈ 101 M rows total | extrapolated from the measured bytes/row |
 | Duration | ≈ 2–3 h single-threaded (download + parse, additive) | extrapolated; a 39,505-row Mode B sample run took 118 s end to end here |
-| Temporary space | 182.09 GB reported by preflight for the full input (spool 71.06 + Mode B staging 54.04 + index 20.30 + bookkeeping 0.27, ×1.25) | **measured** preflight output, against the real bucket |
+| Temporary space | 135.42 GB reported by preflight for the full input, on the upper bound (spool 33.7 + Mode B staging 54.04 + index 20.30 + bookkeeping 0.27, ×1.25); expected spool is 23.02 GB, so the expected sum is 122.0 GB | **measured** preflight output, against the real bucket |
 | Generated index | preflight estimates 7.71 GB. Measured bytes/record from the real-data sample (10.46 MB gzipped for 20,265 companies + 19,414 contacts): **99 B/company**, **96 B/contact**, **324 B/company of index shards**. Applied to the extrapolated corpus (4.7 M organizations + 96.8 M people): 0.5 GB + 9.3 GB + 1.5 GB ≈ **11 GB, contacts dominating** (range 9–20 GB) | bytes/record **measured**; the corpus row count is extrapolated, so the total is too — **confirm with the 1 M run** |
 | `rawCacheDir` | ~64 GB if enabled (skippable with `"rawCacheDir": null`) | the bytes have to land somewhere to resume |
 | RAM | bounded: one hash bucket + one partition at a time; 2 GB was enough for the sample | by design |
@@ -263,26 +263,26 @@ Preflight
   ok   csv2  54.04 GB  r2://company-intel-data/raw/file2.csv
   input total          64.26 GB
   free disk            0.63 GB
-  temporary space need 182.09 GB
-    spool               71.06 GB  (canonical rows written by pass 1)
+  temporary space need 135.42 GB  (upper bound)
+    spool               23.02 GB expected / 33.71 GB upper  (v2 segments written by pass 1)
     raw cache staging   54.04 GB  (largest Mode B .part alive at once)
     index output        20.30 GB  (written during pass 2, same volume by default)
     run bookkeeping     0.27 GB  (checkpoint, spool manifest, rejected/objects lists)
-    safety margin       x1.25 applied to the four terms above
+    safety margin       x1.25 applied to the four terms above, using the spool UPPER bound
+  expected total      122.04 GB  (same terms with the expected spool)
   estimated output     20.30 GB
   memory free / total  1.48 GB / 2.09 GB
   cpu cores            1
-  ! Temporary space looks insufficient: about 0.6 GB free vs 182.1 GB estimated for spool + raw cache + output.
-  ! Budget 54.0 GB for the Mode B raw-cache staging file as well as 71.1 GB for the spool: they are alive at the same time. Setting `rawCacheDir` to null removes that term and costs a re-download on resume.
+  ! Temporary space looks insufficient: about 0.6 GB free vs 135.4 GB estimated for spool + raw cache + output.
+  ! Budget 54.0 GB for the Mode B raw-cache staging file as well as 23.0 GB for the spool: they are alive at the same time. Setting `rawCacheDir` to null removes that term and costs a re-download on resume.
 ```
 
-**This number changed after the first real benchmark, and it is much larger than it used to be
-(70.96 GB → 182.09 GB). The old figure was the spool alone.** The Mode B staging file that a
-cached source is streamed into (`<rawCacheDir>/<bucket>/<key>.part`) was not in the arithmetic at
-all, and neither was the generated index — even though the "Disk budget, added up" table further
-down this document already budgeted ~145–155 GB for exactly this run. The preflight contradicted
-the documentation; the benchmark proved the documentation right. See
-[Why the estimate was wrong](#why-the-estimate-was-wrong) for the measurement.
+**This number has changed twice, and the direction of the second change is the point.** It was
+70.96 GB when it counted only a guessed spool, 182.09 GB once the Mode B staging file and the
+generated index were included, and it is now 135.42 GB because the spool itself shrank 7.1x
+(3,273 → 461 B/row) in the v2 format. The booking of the other terms did not change; only the
+format did. The 182.09 GB figure was still correct for the v1 spool: the real run overflowed it
+by writing 217 GB. See [recovery.md](./recovery.md) for the full post-mortem.
 
 `bun run index:benchmark-1m:preflight` is the same check for the **1 M-record sample**, and it is
 sample-aware: the temporary-space estimate covers the sampled rows, not all 64.26 GB, so the
@@ -374,24 +374,29 @@ but perfectly valid** JSONL file, so `pass2-merge` could have merged it and sile
 | The duration hint uses the **measured** end-to-end rate (5,000 rows/s) instead of a synthetic 120,000 rows/s, and the run prints per-stage timings | `tools/indexer/src/build.ts`, `tools/indexer/src/cli.ts` |
 | `bun run index:spool-doctor` inspects an existing spool read-only and prints positions, never records | `scripts/spool-doctor.mjs` |
 
-### Why the estimate was wrong
+### Why the v1 estimate was wrong about the spool
 
 The benchmark's output gives the numbers directly:
 
-| Term | Old estimate | Now | Evidence |
-| --- | --- | --- | --- |
-| Spool (`part-*.jsonl`) | 1.80 GB (`2 M × 900 B`, a guess) | 1.40 GB (`2 M × 700 B`) | 3,778 real spool rows measure 524.5 B/row; 700 B adds headroom for wide organization rows |
-| Mode B raw-cache staging (`.part`) | **not counted at all** | 2.18 GB | the object bytes read before the sample stops, rounded up to 8 MiB ranged requests |
-| Generated index | 0.54 GB (`spool × 0.3`) | 0.40 GB (`2 M × 200 B/row`) | the measured range for the full corpus is 9–20 GB, so the top of it is used per row |
-| Run bookkeeping | 0.06 GB | 0.27 GB | checkpoint, spool manifest, `rejected.jsonl`, `objects.jsonl` |
-| Safety margin | none | ×1.25 | a run must not be able to fail on a rounding difference |
-| **Reported total** | **1.87 GB** | **5.31 GB** | the benchmark's own peak was already **2.49 GB** before it failed |
+| Term | Old estimate | v1, after the fix | v2 (now) | Evidence |
+| --- | --- | --- | --- | --- |
+| Spool | 1.80 GB (`2 M × 900 B`, a guess) | 1.40 GB (`2 M × 700 B`) | **0.92 GB expected** (`2 M × 461 B`) | the v1 constant was measured on only 3,778 real rows and missed full-column capture; v2 measured 38,129 real rows in both formats |
+| Mode B raw-cache staging (`.part`) | **not counted at all** | 2.18 GB | 2.18 GB | the object bytes read before the sample stops, rounded up to 8 MiB ranged requests |
+| Generated index | 0.54 GB (`spool × 0.3`) | 0.40 GB (`2 M × 200 B/row`) | 0.40 GB | the measured range for the full corpus is 9–20 GB, so the top of it is used per row |
+| Run bookkeeping | 0.06 GB | 0.27 GB | broken down per run size | checkpoint, progress ledger, spool manifest, `rejected.jsonl`, `objects.jsonl` |
+| Safety margin | none | ×1.25 | ×1.25 | a run must not be able to fail on a rounding difference |
+| **Reported total** | **1.87 GB** | **5.31 GB** | **135.42 GB full corpus (upper)** | the v1 benchmark's own peak was already **2.49 GB** before it failed |
 
 `2.49 GB` decomposes as the csv1 `.part` (≈2.2 GB, still being written while the spool grew) plus
 the spool written so far — which is why the largest single missing term, not the spool constant,
-was the main error. The full-corpus requirement is now **182.09 GB** (71.06 spool + 54.04 staging +
-20.30 index + 0.27 bookkeeping, ×1.25), or **93.6 GB** with `"rawCacheDir": null` and no resume
-cache. Both are in line with the "Disk budget, added up" table below, which was already right.
+was the main error.
+
+The full-corpus requirement is now **135.42 GB** on the upper bound (33.71 spool + 54.04 staging +
+20.30 index + 0.27 bookkeeping, ×1.25), **122.04 GB** on the expected spool (23.02 GB), or
+**≈68 GB** with `"rawCacheDir": null`. The preflight refuses on the upper bound. The old
+182.09 GB figure was correct *for the v1 spool* — and the v1 run then wrote 217 GB and filled the
+disk, which is why the format, not the arithmetic, was the actual defect. See
+[recovery.md](./recovery.md) for the post-mortem.
 
 ### Duration
 
@@ -609,7 +614,7 @@ order and stops at the first problem:
 | 1 | dependencies | Bun on PATH, `node_modules` present, the indexer's own files exist |
 | 2 | source version | the git commit (and whether the tree is dirty) is recorded in the report; an archive is reported as such |
 | 3 | cost expectation | R2 storage/Class A/Class B arithmetic at Cloudflare's published prices |
-| 4 | resume state | the checkpoint's stage, version, sample limit and spooled partitions, before anything is read |
+| 4 | resume state | the progress ledger / checkpoint: stage, version, sample limit, committed rows and partitions — before anything is read. If spool files exist with no ledger, the script runs the read-only recovery assessment and **stops** (exit 3) instead of rebuilding over them |
 | 5 | preflight | credentials, source objects, TSV schema mapping, disk and RAM |
 | 6 | index | Pass 1 spool + Pass 2 merge (both resumable) + local validation of every object |
 | 7 | coverage gate | `sample` in the checkpoint ⇒ PARTIAL, and `--activate` is refused |
@@ -690,6 +695,12 @@ Resuming needs **two** facts, and they are separate on purpose:
 - `workDir/spool-manifest.json` records every partition pass 1 finished writing: file name,
   partition number, exact byte length, record count and SHA-256. It is written by rename only after
   every stream has been flushed, so its presence answers "did pass 1 actually finish?".
+- Format v2 (the default) additionally writes `workDir/spool/progress.json` and
+  `workDir/spool/schema.json` **during** Pass 1. The ledger records the identity, the column schema,
+  each source's committed row count and every partition's committed bytes, so an interrupted run
+  resumes at the last durable row instead of waiting for both sources to finish. This is what the
+  failed 66-million-row run lacked: it had no checkpoint at all, because the old build wrote one
+  only after both sources completed.
 
 Without the second one, a checkpoint alone asserts something it cannot know. A truncated partition
 is a shorter but valid JSONL file, so merging it would drop the missing rows with nothing to show
@@ -706,9 +717,9 @@ Resuming is allowed only when the identity matches, because the spool partitions
 - running the 1 M benchmark after a full run (or a sample after the benchmark)
   **stops** with the exact differences listed, instead of merging two different
   inputs into one version;
-- `--no-resume` is the answer: it ignores the checkpoint, clears the stale
-  `part-*.jsonl` spool (pass 1 *appends* to those files, so leaving them would add
-  a second copy of every row) and rebuilds from the sources;
+- rebuilding needs `--no-resume --discard-spool`: the first ignores the checkpoint,
+  the second deletes the spool. Neither flag alone deletes anything. Without the
+  delete, pass 1 would append a second copy of every row, so the run refuses;
 - a checkpoint written by an older build (no identity) is refused the same way —
   unknown provenance is not resumed;
 - pointing `workDir` at an empty directory keeps both runs side by side.
@@ -725,22 +736,30 @@ Do the arithmetic before starting a 60 GB job — the two caches are separate:
 
 | Component | Size | Notes |
 | --- | --- | --- |
-| spool (`workDir`) | 71.06 GB (preflight) | mandatory: pass 2 cannot run without it |
+| spool (`workDir`, format v2) | **23.0 GB expected / 33.4 GB upper** | mandatory: pass 2 cannot run without it. Measured ratio per source byte (csv1 0.423, csv2 0.346); the OLD format wrote 3,273 B/row — 217 GB for 66 M rows |
 | raw cache (`rawCacheDir`) | 54.04 GB for this corpus — the largest single object, not their sum, because sources are read in turn | only needed for resume without re-downloading |
 | generated index (`outputDir`) | 20.30 GB (preflight estimate; measured range 9–20 GB) | written during pass 2 |
-| run bookkeeping | 0.27 GB | checkpoint, spool manifest, rejected/objects lists |
-| **all of the above, as the preflight requires it** | **182.09 GB** (the four rows × 1.25 margin) | one volume by default |
-| **`rawCacheDir: null`** | **~93.6 GB** | streams straight through; a re-run downloads again |
+| run bookkeeping | 0.27 GB | checkpoint, progress ledger, spool manifest, rejected/objects lists |
+| **all of the above, as the preflight requires it** | **≈135 GB** (the four rows, with the spool's UPPER bound, × 1.25 margin) | one volume by default |
+| **`rawCacheDir: null`** | **≈68 GB** | streams straight through; a re-run downloads again |
 
-The preflight now computes exactly this sum, so the number it prints and the table above agree. If
-you are short of space, `"rawCacheDir": null` is the single change that removes the largest term.
+The preflight computes this sum from **source bytes × measured compression ratios**, prints the
+expected and upper bounds separately, and refuses on the upper bound. A row-count × assumed
+row-size model is what produced the 182 GB estimate that a 217 GB spool then exceeded: it cannot
+see how wide the source rows are. `"rawCacheDir": null` remains the single change that removes
+the largest term, and it is what makes the run fit on the failed machine (≈87 GB free).
+
+`--spool-max-gb <n>` (config `spoolMaxBytes`) is a hard ceiling: Pass 1 flushes, records the
+committed rows and stops cleanly when it is reached, so it cannot fill the volume. Re-running
+resumes from the ledger.
 
 So a machine with a single 128 GB volume should either put `rawCacheDir` on a second disk or set
 it to `null` and accept re-downloading on resume. `outputDir` is written *during* pass 2, so its
 size must be free at the same time as the spool. The mid-run floor (512 MB) stops a run before the
 volume fills, but it does not create space: an under-sized machine fails at hour two either way.
 
-- Keep `workDir` on the fastest disk with room for ~1.5× the input size in spool files.
+- Keep `workDir` on the fastest disk; the v2 spool needs ≈0.36× the input size, plus the output
+during pass 2.
 - 16 GB RAM is comfortable; the design is disk-partitioned so less RAM only costs speed.
 - One `run` process saturates roughly one core for CSV parsing plus I/O; do not run two
   full jobs concurrently.
@@ -758,9 +777,11 @@ volume fills, but it does not create space: an under-sized machine fails at hour
 | A Mode B run downloads again after a restart | The cache directory was changed or removed, the object changed on R2 (size differs), or `rawCacheDir` is `null`. Set `"rawCacheDir": ".indexer-raw-cache"` to keep resume behaviour. |
 | Columns mapped to the wrong canonical field | Add a `columns` override for that source (`{"companyname": "Org Name"}`). |
 | High rejected-row count | Check the encoding/delimiter for that file; inspect `workDir/rejected.jsonl` reasons. |
-| `Refusing to start: temporary space is insufficient` | Free space on the `workDir` volume, or lower `partitions`. |
+| `Refusing to start: temporary space is insufficient` | The printed total uses the spool's UPPER bound. Free space on the `workDir` volume, set `"rawCacheDir": null`, or lower `partitions`. |
+| `Refusing to start: … already holds N spool partition file(s)` | There is no durable ledger/checkpoint for them. Nothing is deleted. Run `bun tools/indexer/src/cli.ts recover-spool --assess --work-dir <dir>`; if recoverable, `--apply` into a new work directory. Only `--no-resume --discard-spool` deletes. |
+| `Stopping before the volume fills: the local spool has reached … GB` | The `spoolMaxBytes` / `--spool-max-gb` ceiling. Committed rows are durable; re-run to resume (or raise the cap). |
 | `Stopping before the disk fills: … below the … floor` | The mid-run free-space guard on `outputDir`, checked after every partition. The floor is the smaller of 512 MB and this run's own estimated output × 1.5 (16 MB minimum); pass `--disk-floor <mb>` to set it yourself. Nothing written was lost and the checkpoint is still at `pass2-merge`: free space and re-run the same command to resume — the partial output is reset and replayed, not appended to. |
-| `workDir already holds a checkpoint for a different run: …` | The spool belongs to another run (different version, sample size, partitions or source paths). If that is correct and you want a **new output version from the same spool**, use `pass2-from-spool` (it never clears the spool — see "Rebuilding Pass 2 under a different version"). Otherwise re-run with `--no-resume` (which clears this work directory's spool) or point `workDir` somewhere empty. Nothing was read or written before the stop. |
+| `workDir already holds a … for a different run: …` | The spool belongs to another run (different version, sample size, partitions or source paths). If that is correct and you want a **new output version from the same spool**, use `pass2-from-spool` (it never clears the spool). Otherwise `--no-resume --discard-spool` (both flags: the delete must be explicit), or point `workDir` somewhere empty. Nothing was read or written before the stop. |
 | `was written without a run identity; refusing to resume it` | A checkpoint from a build older than the run-identity change. Re-run with `--no-resume` once. |
 | A resumed run reports `source_missing_rows` (csv1=0, csv2=0) | Fixed: pass-1 counters are restored from the checkpoint, so a resumed run no longer fails validation over its own bookkeeping. If you see it on an older build, re-run with `--no-resume` once. |
 | `JSON Parse error: Unterminated string` during `pass2-merge` | Fixed: U+2028/U+2029 in a spool row were split by the old `readline` reader. See "The 1 M real-data failure" above. Records written by the old build still read correctly with the new reader, and `index:spool-doctor` reports any record it cannot parse with its partition, line and byte offset. |
