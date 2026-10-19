@@ -134,6 +134,19 @@ export default function IndexingControl() {
     }
   };
 
+  const preflight = async () => {
+    setBusy("preflight");
+    setVerifyOutput(null);
+    try {
+      const result = await admin<{ ok: boolean; output: string }>("/api/cloud/preflight", { method: "POST", body: "{}" });
+      setVerifyOutput(result.output || (result.ok ? "READY" : "NOT READY"));
+    } catch (caught) {
+      setVerifyOutput(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const startBenchmark = async () => {
     setBusy("benchmark");
     setNotice(null);
@@ -291,6 +304,9 @@ export default function IndexingControl() {
                 className="mt-6"
               >
                 <div className="flex flex-wrap gap-2">
+                  <Button variant="outline" className="gap-2" disabled={busy !== null} onClick={() => void preflight()}>
+                    <Cloud className="size-4" /> {busy === "preflight" ? "Checking…" : "Run preflight"}
+                  </Button>
                   <Button variant="outline" className="gap-2" disabled={!state || busy !== null} onClick={() => void act("pause")}>
                     <Pause className="size-4" /> Pause
                   </Button>

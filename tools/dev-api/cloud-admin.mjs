@@ -133,6 +133,15 @@ export async function handleCloudAdmin(request, response, root = process.cwd()) 
       return true;
     }
 
+    if (parts[0] === "preflight" && method === "POST") {
+      const output = spawnSync("bun", [CLI, "preflight"], { cwd: root, encoding: "utf8", timeout: 30_000 });
+      json(response, output.status === 0 ? 200 : 422, {
+        ok: output.status === 0,
+        output: `${output.stdout ?? ""}${output.stderr ?? ""}`.trim(),
+      });
+      return true;
+    }
+
     if (parts[0] === "jobs" && parts.length === 2 && method === "GET") {
       return json(response, 200, cliJson(root, ["status", "--version", parts[1], "--json"])), true;
     }

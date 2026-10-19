@@ -34,6 +34,7 @@ import {
   type CloudJobState,
 } from "../../src/shared/cloud/types";
 
+import { assembleRun } from "./assemble";
 import { forecast, type BenchmarkMeasurement } from "./cost";
 import { cloudSourcesFromConfig, runPass1, verifyRun } from "./pass1";
 import { R2BlobStore } from "./store";
@@ -340,6 +341,25 @@ async function control(store: R2BlobStore, action: "pause" | "resume" | "abort" 
   console.log(`control.json for ${id}: pause=${next.pause} abort=${next.abort} approvedFullRun=${next.approvedFullRun}`);
 }
 
+async function assemble(store: R2BlobStore): Promise<void> {
+  const id = version();
+  const { config } = loadConfig();
+  const workDir = typeof flag("work-dir") === "string" ? String(flag("work-dir")) : `.indexer-work-cloud-${id}`;
+  const partitions = num("partitions") ?? config.partitions;
+  const result = await assembleRun({
+    store,
+    version: id,
+    config: { ...config, datasetVersion: id, partitions },
+    workDir,
+    onLog: (line) => console.log(`  ${line}`),
+  });
+  console.log(`\nAssembled ${result.partitions} partition(s), ${result.rows.toLocaleString()} rows, ${gb(result.bytes)} into ${result.workDir}`);
+  console.log("The existing verified Pass 2 can now merge it with:\n");
+  console.log(
+    `  bun tools/indexer/src/cli.ts run --config <cfg with partitions=${result.partitions}> --work-dir ${result.workDir} --version ${id}`,
+  );
+}
+
 async function verify(store: R2BlobStore): Promise<void> {
   const id = version();
   const { config } = loadConfig();
@@ -367,6 +387,7 @@ async function main(): Promise<void> {
         "  jobs      [--json]",
         "  pause | resume | abort | approve --version <id>",
         "  verify    --version <id> --config <cfg>",
+        "  assemble  --version <id> [--work-dir <dir>] [--partitions <n>]",
         "",
         "Sources must be r2://<bucket>/<key>; the bucket comes from the credentials.",
       ].join("\n"),
@@ -380,6 +401,7 @@ async function main(): Promise<void> {
   if (command === "status") return status(store);
   if (command === "jobs") return listJobs(store);
   if (command === "verify") return verify(store);
+  if (command === "assemble") return assemble(store);
   if (command === "pause" || command === "resume" || command === "abort" || command === "approve") return control(store, command);
   throw new Error(`Unknown command: ${command}`);
 }

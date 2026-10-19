@@ -9,13 +9,18 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
 
+import { assembleRun } from "../tools/cloud/assemble";
 import { readChunk } from "../tools/cloud/chunker";
 import { cloudSourcesFromConfig, runPass1, verifyRun } from "../tools/cloud/pass1";
 import { MemoryBlobStore } from "../tools/cloud/store";
 import { cloudKeys, CLOUD_CONTROL_VERSION, type CloudControl, type CloudChunkManifest } from "../src/shared/cloud/types";
 import { decodeSpoolV2Row } from "../tools/indexer/src/spool-v2";
+import { readSpoolManifest } from "../tools/indexer/src/spool";
 
 const COMPANY_HEADER = ["organization_id", "organization_name", "organization_domain", "description"];
 const CONTACT_HEADER = ["person_name", "person_email", "sanitized_organization_name_unanalyzed"];
@@ -275,6 +280,53 @@ describe("cloud Pass 1", () => {
         shards: { exact: 4, prefix: 4, token: 4, trigram: 4, ids: 4 },
       }),
     ).toThrow(/R2 only/);
+  });
+});
+
+describe("cloud → v2 spool assembly", () => {
+  test("assembles segments into a manifest the existing merge validates", async () => {
+    const { store, data } = seed();
+    const version = "assemble-1";
+    await runPass1({ store, version, sources: SOURCES, partitions: 8, chunkBytes: 700, sliceBytes: 64 });
+    const dir = mkdtempSync(join(tmpdir(), "ci-cloud-assemble-"));
+    try {
+      const result = await assembleRun({
+        store,
+        version,
+        workDir: dir,
+        config: {
+          datasetVersion: version,
+          sources: [
+            { id: "csv1", path: "r2://bucket/raw/file1.csv", encoding: "utf8", delimiter: "\t", columns: SOURCES[0]!.columns },
+            { id: "csv2", path: "r2://bucket/raw/file2.csv", encoding: "utf8", delimiter: "\t", columns: SOURCES[1]!.columns },
+          ],
+          workDir: dir,
+          outputDir: join(dir, "out"),
+          partitions: 8,
+          shards: { exact: 4, prefix: 4, token: 4, trigram: 4, ids: 4 },
+        },
+      });
+      expect(result.rows).toBe(data.companyRows + data.contactRows);
+      expect(result.files).toBe(8);
+
+      // The manifest is the SAME format the local merge verifies, and every
+      // partition's bytes are exactly what it recorded.
+      const manifest = await readSpoolManifest(dir);
+      expect(manifest?.complete).toBe(true);
+      expect(manifest?.format).toBe(2);
+      const total = manifest!.partitions.reduce((sum, entry) => sum + entry.lines, 0);
+      expect(total).toBe(data.companyRows + data.contactRows);
+      for (const entry of manifest!.partitions) {
+        const bytes = readFileSync(join(dir, "spool", entry.file));
+        expect(bytes.length).toBe(entry.bytes);
+      }
+      // Concatenated gzip members read back as one stream of rows.
+      const contactPartition = manifest!.partitions.find((entry) => entry.lines > 0)!;
+      const text = gunzipSync(readFileSync(join(dir, "spool", contactPartition.file))).toString("utf8");
+      expect(text.split("\n").filter(Boolean).length).toBe(contactPartition.lines);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

@@ -26,6 +26,7 @@ import DatasetManagement from "../src/pages/DatasetManagement";
 import CompanySearch from "../src/pages/CompanySearch";
 import ContactDetails from "../src/pages/ContactDetails";
 import CompanyDetails from "../src/pages/CompanyDetails";
+import IndexingControl from "../src/pages/IndexingControl";
 import { Pager } from "../src/components/common";
 import { queryKeys } from "../src/hooks/use-api";
 import type { Contact, DatasetStatusResponse, UserSettings } from "../src/shared/models";
@@ -179,6 +180,15 @@ async function renderPage(
 /* ---------------------------------- tests --------------------------------- */
 
 describe("pages render without a missing API method", () => {
+  test("Cloud indexing renders its empty state before any job exists", async () => {
+    // Effects (the 5-second state poll) do not run during server rendering, so this
+    // asserts the page module, its providers and its empty state — the panel then
+    // reads real state in the browser via /api/cloud/jobs.
+    const html = await renderPage(<IndexingControl />);
+    expect(html).toContain("Cloud indexing");
+    expect(html).toContain("No cloud indexing job yet");
+  });
+
   test("Dashboard renders in no-dataset mode and says so", async () => {
     const html = await renderPage(<Dashboard />, { seed: { datasetStatus: noDataset } });
     expect(html).toContain("Dashboard");

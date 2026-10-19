@@ -564,8 +564,13 @@ export async function verifyRun(options: {
       expectedLine = manifest.baseLine + manifest.lines;
       previousChunk = manifest.chunk;
     }
+    const checkpoint = await options.store.getJson<SourceCheckpoint>(cloudKeys.checkpoint(options.version, source.id));
     if (manifests.length === 0) problems.push(`${source.id}: no chunk manifests`);
-    else if (expectedOffset !== head.size) problems.push(`${source.id}: chunks cover ${expectedOffset} of ${head.size} bytes`);
+    else if (checkpoint?.complete && expectedOffset !== head.size) {
+      problems.push(`${source.id}: chunks cover ${expectedOffset} of ${head.size} bytes`);
+    }
+    // A bounded benchmark stops at a prefix; its checkpoint says `complete:false`,
+    // so "the chunks cover the whole object" is not a property it can have.
   }
 
   report.ok = problems.length === 0;
