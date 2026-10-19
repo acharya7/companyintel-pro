@@ -853,3 +853,61 @@ Two real defects were found and fixed while adding these tests:
 
 Remaining unverified: the Cloudflare deploy itself, the container image build, Access against a
 real deployment, every benchmark number (estimates until measured), and the full corpus.
+
+## Phase N — the Cloudflare staging build's one failing test (executed)
+
+Build `#c54f2438`: **611 passed, 1 failed** —
+`cloud Pass 2 > merges R2 segments into the same index bytes as a local merge, one partition on disk`,
+with `Incomplete R2 environment credentials: R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY must be set together`.
+
+### Root cause (reproduced, not inferred)
+
+The comparison test has two legs. The cloud leg is fed by verified R2 segments and passes
+`importedRows` to `runIndex`, so its preflight never sizes a source. The local leg assembled the
+same segments into a local spool and then called `runIndex(localConfig, { resume: true })` **without**
+`importedRows`. With no row count, `preflight` falls back to sizing every `r2://` source, which calls
+`sourceBytes → clientFor → credentialsFor → credentialsFromEnv → resolveCredentials`.
+
+On a developer machine that resolved the private `.r2-credentials.json`; on Workers Builds there is no
+credentials file, and the runner exports `CLOUDFLARE_ACCOUNT_ID` on its own. `resolveCredentials`
+deliberately refuses a half-set environment, so the test failed for a reason unrelated to what it
+asserts. Reproduced directly:
+
+```
+CLOUDFLARE_ACCOUNT_ID=… COMPANYINTEL_R2_CREDENTIALS=/tmp/does-not-exist.json \
+  bun -e 'import {credentialsFromEnv} from "./tools/indexer/src/credentials"; credentialsFromEnv()'
+→ Incomplete R2 environment credentials: …
+```
+
+### Fix
+
+`tests/cloud-pass2.test.ts` now mirrors the cloud leg: it keeps `assembleRun`'s row count and passes it
+as `importedRows`, so the merge is fed by the assembled spool and preflight never probes a source. The
+run is wrapped in `withWorkersBuildCredentials`, which sets `CLOUDFLARE_ACCOUNT_ID`, clears every
+`R2_*` variable and points the credentials file at a path that does not exist for the duration — the
+build runner's exact environment, reproduced deterministically on any machine and restored afterwards.
+If a future change makes that leg probe R2 again, it now fails with the build's message instead of
+silently using local credentials.
+
+Nothing was skipped, weakened or simulated: the byte-for-byte equivalence assertion (every object, with
+only the build timestamp normalised) is unchanged, and a new assertion pins the assembled row count.
+Real R2 integration and the cloud benchmarks stay behind their own credentials and approval gates;
+no credential value was added to the repository, Wrangler configuration, build variables or logs.
+
+### A second defect found while re-running the suite
+
+Repeated runs of `tests/cloud-pass2.test.ts` failed intermittently at the *next* test with
+`ENOENT … open '<scratch>/spool/part-0000.jsonl.gz'`. In the corrupted-segment case the partition
+write stream was destroyed while its `open` was still pending; the destroy completed after the test
+removed the scratch directory, so the resulting `ENOENT` surfaced as an unhandled error. `pass2.ts`
+now awaits `open` before verifying any segment and awaits `close` before removing the partial file.
+Ten consecutive runs of that test and four consecutive full-file runs pass.
+
+### Verification
+
+| Check | Result |
+| --- | --- |
+| `tests/cloud-pass2.test.ts` | **7 pass, 0 fail**, stable over repeated runs (the corrupted-segment path ran 10×) |
+| `bun run verify` (Bun 1.4.2) | **PASS** — typecheck, lint, **612 pass / 0 fail** across 51 files |
+| `bun run verify` (Bun 1.4.3, the Cloudflare build's version) | **PASS** — 612 pass / 0 fail |
+| `bun run build` (Bun 1.4.2 and 1.4.3) | **PASS** — `tsc -b` + Vite |

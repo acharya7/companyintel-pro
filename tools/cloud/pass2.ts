@@ -358,6 +358,14 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
           const sources = segmentsByPartition.get(entry.partition) ?? [];
           const hash = createHash("sha256");
           const stream = createWriteStream(target);
+          // Wait for the handle before any verification can fail. A destroy issued
+          // while `open` is still pending otherwise completes AFTER the caller has
+          // removed the scratch directory, and its ENOENT is reported as an
+          // unhandled error (usually attributed to a later test).
+          const opened = new Promise<void>((resolveOpen, rejectOpen) => {
+            stream.once("open", () => resolveOpen());
+            stream.once("error", rejectOpen);
+          });
           const ledger: SpoolFrameEntry[] = [];
           let bytes = 0;
           let rows = 0;
@@ -373,6 +381,7 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
             });
           };
           try {
+            await opened;
             for (const { segment } of sources) {
               const body = await store.getRange(segment.key, 0, segment.bytes);
               if (body.length !== segment.bytes) {
@@ -396,9 +405,15 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
             await new Promise<void>((resolveEnd, rejectEnd) => stream.end((error?: Error | null) => (error ? rejectEnd(error) : resolveEnd())));
           } catch (error) {
             // A refused segment (checksum mismatch, short read) must not leave an open
-            // handle or a half-written partition behind: the stream is destroyed here so
-            // cleanup cannot race a pending write, and the caller removes the file.
+            // handle or a half-written partition behind: the stream is destroyed and
+            // its close is awaited here, so cleanup cannot race a pending open/write,
+            // and the caller removes the file only once the handle is gone.
             stream.destroy();
+            await new Promise<void>((resolveClose) => {
+              if (stream.closed) return resolveClose();
+              stream.once("close", () => resolveClose());
+              stream.once("error", () => resolveClose());
+            });
             rmSync(target, { force: true });
             throw error;
           }

@@ -24,6 +24,7 @@ import { assembleRun } from "../tools/cloud/assemble";
 import { runPass1, type Pass1SourceSpec } from "../tools/cloud/pass1";
 import { runCloudPass2 } from "../tools/cloud/pass2";
 import { MemoryBlobStore } from "../tools/cloud/store";
+import { resetCredentialCache } from "../tools/indexer/src/credentials";
 import type { IndexerConfig } from "../tools/indexer/src/build";
 import { runIndex } from "../tools/indexer/src/build";
 import { CLOUD_CONTROL_VERSION, cloudKeys, type CloudControl } from "../src/shared/cloud/types";
@@ -141,6 +142,48 @@ async function seedPass1(version = "cloud-p2", partitions = 8, store = new Memor
 
 function hash(bytes: Buffer): string {
   return createHash("sha256").update(bytes).digest("hex");
+}
+
+/**
+ * Reproduce Cloudflare Workers Builds' credential environment for the duration
+ * of `fn`: `CLOUDFLARE_ACCOUNT_ID` is always exported on a build runner, no
+ * `R2_*` key pair is, and there is no private credentials file in the checkout.
+ *
+ * The local equivalence leg must not depend on any of that. It is fed by the
+ * assembled spool and passes `importedRows`, so preflight never sizes or probes
+ * a source. If a future change makes it probe again, `resolveCredentials` will
+ * refuse the half-set environment and this test fails with the build's exact
+ * error — instead of quietly reading whatever credentials the machine happens
+ * to have (which is how the comparison passed locally and failed in CI).
+ */
+async function withWorkersBuildCredentials<T>(dir: string, fn: () => Promise<T>): Promise<T> {
+  const controlled = [
+    "CLOUDFLARE_ACCOUNT_ID",
+    "R2_ACCOUNT_ID",
+    "R2_ACCESS_KEY_ID",
+    "R2_SECRET_ACCESS_KEY",
+    "R2_ENDPOINT_URL",
+    "R2_ENDPOINT",
+    "R2_BUCKET_NAME",
+    "R2_REGION",
+    "COMPANYINTEL_R2_CREDENTIALS",
+    "R2_CREDENTIALS_FILE",
+  ] as const;
+  const saved = new Map(controlled.map((name) => [name, process.env[name]]));
+  for (const name of controlled) delete process.env[name];
+  process.env.CLOUDFLARE_ACCOUNT_ID = "0123456789abcdef0123456789abcdef";
+  // Any credential file is absent, so a resolution attempt cannot fall back to one.
+  process.env.COMPANYINTEL_R2_CREDENTIALS = join(dir, "no-credentials.json");
+  resetCredentialCache();
+  try {
+    return await fn();
+  } finally {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    resetCredentialCache();
+  }
 }
 
 function outputKeys(store: MemoryBlobStore, version: string): string[] {
@@ -301,9 +344,16 @@ describe("cloud Pass 2", () => {
       const localWork = join(dir, "local-work");
       const localOut = join(dir, "local-out");
       const localBase = { ...configFor("cloud-p2", localWork), workDir: localWork };
-      await assembleRun({ store, version: "cloud-p2", config: localBase, workDir: localWork });
+      const assembled = await assembleRun({ store, version: "cloud-p2", config: localBase, workDir: localWork });
+      expect(assembled.rows).toBe(data.companyRows + data.contactRows);
       const localConfig = { ...localBase, outputDir: localOut };
-      await runIndex(localConfig, { resume: true, diskFloorBytes: 0 });
+      // The merge is fed by the assembled spool, exactly as Cloud Pass 2 feeds its
+      // own run: `importedRows` says the rows are already there, so preflight does
+      // not HEAD the 64 GB sources — which is also what makes this leg hermetic
+      // and independent of R2 credentials.
+      await withWorkersBuildCredentials(dir, () =>
+        runIndex(localConfig, { resume: true, diskFloorBytes: 0, importedRows: assembled.rows }),
+      );
 
       const cloudKeysOut = outputKeys(store, "cloud-p2");
       const compared: string[] = [];
