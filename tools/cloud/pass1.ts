@@ -335,6 +335,30 @@ export async function runPass1(options: RunPass1Options): Promise<Pass1Result> {
       await updateAccounting(store, state, now(), startedMs);
       await store.putJson(cloudKeys.state(version), state);
 
+      /*
+       * Conservative budget guard, not a hard billing cap.
+       *
+       * `CLOUD_BUDGET_USD` (30 by default in wrangler.toml) stops a full run at the
+       * next chunk once the RUNNING ESTIMATE reaches it. The estimate excludes R2
+       * storage and any request Cloudflare bills after the snapshot, so this is an
+       * operator protection, not a guarantee — pause/abort remain authoritative.
+       * Benchmarks are never stopped by it.
+       */
+      const budget = Number(process.env.CLOUD_BUDGET_USD ?? "");
+      const spent = state.accounting.estimatedUsd + state.accounting.containerUsd;
+      if (mode === "full" && Number.isFinite(budget) && budget > 0 && spent >= budget) {
+        await pauseState(
+          store,
+          state,
+          "paused",
+          now(),
+          `budget guard: estimated spend $${spent.toFixed(2)} reached CLOUD_BUDGET_USD=$${budget}. Raise the limit or resume deliberately.`,
+        );
+        stopped = "paused";
+        checkpoints.push(checkpoint);
+        return { state, schema, checkpoints, stopped };
+      }
+
       const percent = head.size ? ((checkpoint.nextOffset / head.size) * 100).toFixed(1) : "0.0";
       log(
         `${source.id}: chunk ${chunkIndex + 1} · ${checkpoint.rows.toLocaleString()} rows · ` +

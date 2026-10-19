@@ -42,11 +42,41 @@ not_found_handling = "single-page-application"
 binding = "COMPANY_DATA"
 bucket_name = "company-intel-data"
 
+# ---------------------------------------------------------------------------
+# Indexing container (Cloudflare Containers + its Durable Object).
+#
+# `wrangler deploy` builds ./Dockerfile with Docker and pushes it to Cloudflare's
+# managed registry; Docker (or a compatible CLI) must be running. The container has
+# no public route: the Worker reaches it only through the `INDEXER_CONTAINER`
+# Durable Object binding, and every admin request is checked by Cloudflare Access.
+#
+# `standard-1` = 0.5 vCPU, 4 GiB RAM, 8 GB ephemeral disk. That is enough because
+# Cloud Pass 2 materialises ONE partition (tens of MB with 256 partitions) and
+# streams it back to R2; the ~23 GB spool and ~20 GB index never touch this disk.
+# ---------------------------------------------------------------------------
+[[containers]]
+class_name = "IndexerContainer"
+image = "./Dockerfile"
+instance_type = "standard-1"
+max_instances = 1
+
+[[durable_objects.bindings]]
+name = "INDEXER_CONTAINER"
+class_name = "IndexerContainer"
+
+[[migrations]]
+tag = "v1-indexer-container"
+new_sqlite_classes = ["IndexerContainer"]
+
 [vars]
 ENVIRONMENT = "production"
 APP_VERSION = "0.1.0"
 # Per-identity API rate limit (requests per minute per route group).
 MAX_SEARCHES_PER_MINUTE = "180"
+# Conservative, non-binding guard: Pass 1 pauses at the next chunk when its running
+# estimate reaches this many dollars. It is not a hard billing cap (storage and
+# post-snapshot requests are excluded); pause/abort remain authoritative.
+CLOUD_BUDGET_USD = "30"
 
 # Search hydration dial: company profile partitions read per search. Each read
 # costs ~25 KB, so this is the query's byte ceiling (see docs/architecture.md).

@@ -11,7 +11,8 @@ password storage anywhere in this application.
 | Company/contact data (R2) | public exposure | private bucket, no `r2.dev` domain, no public bucket access, Worker-only access through the `COMPANY_DATA` binding |
 | API | anonymous or cross-origin access | Cloudflare Access JWT verification on every `/api/*` route, same-origin enforcement |
 | Lead notes / saved searches | unauthorized modification | same Access verification; writes are ETag-conditional |
-| S3 credentials | leakage | never present in the Worker or the repository; used only by the local indexer via environment variables |
+| S3 credentials | leakage | never in the repository or the browser; the local indexer reads environment variables, and the deployed Worker holds them as secrets solely to forward to the indexing container |
+| Indexing control plane | unauthorized runs, cost | Cloudflare Access on every `/api/cloud/*` route, a separate `INDEXING_ADMIN_EMAILS` allowlist, same-origin enforcement, and an explicit approval flag for the full corpus |
 | Alternate hostnames | bypassing the policy | every deployed hostname (workers.dev, preview, custom domain) must be covered by an Access policy — see below |
 
 ## Access verification (`worker/src/access.ts`)
@@ -40,6 +41,20 @@ non-allowlisted identity, service token, malformed token, anonymous production r
 unconfigured Access, empty allowlist, the dev bypass refusing to engage in production, and a
 bare `Cf-Access-*` header that is *not* a valid token (a header alone must never impersonate the
 owner). `bun test` runs them.
+
+## Indexing control plane (`worker/src/indexer-admin.ts`)
+
+- Every route verifies Access itself (`verifyAccess`) before reading the job state, and
+  rejects cross-origin requests. The `/api/cloud/*` path being obscure is not a control.
+- `INDEXING_ADMIN_EMAILS` narrows the operators further; if unset, the Access allowlist is
+  used.
+- A full-corpus run requires `approvedFullRun` written to `control.json`. A browser cannot
+  set that flag by starting a run: only the explicit `approve` action writes it.
+- Activation is refused for benchmark jobs and for any stage other than `complete`, then
+  re-verifies the manifest and validation report **in R2** before flipping the pointer.
+- The Worker never returns an R2 key or a container environment variable. The container
+  receives its S3 credentials from Worker secrets at start time; they are never logged.
+- R2 secrets must be scoped to Object Read & Write on `company-intel-data` only.
 
 ## Other controls
 

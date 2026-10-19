@@ -99,8 +99,9 @@ export default function IndexingControl() {
   const state = current?.state ?? null;
   const control = current?.control ?? null;
 
-  const act = async (action: "pause" | "resume" | "abort") => {
+  const act = async (action: "pause" | "resume" | "abort" | "approve") => {
     if (!state) return;
+    if (action === "approve" && !window.confirm(`Record approval for a full-corpus run of ${state.version}? This is the gate that allows Pass 1 to read all 64 GB.`)) return;
     setBusy(action);
     setNotice(null);
     try {
@@ -108,7 +109,11 @@ export default function IndexingControl() {
         method: "POST",
         body: JSON.stringify({ action }),
       });
-      setNotice(`${action} recorded — the engine checks it before the next chunk.`);
+      setNotice(
+        action === "approve"
+          ? "Full-run approval recorded in control.json. Nothing has started; use Start full Pass 1 when you are ready."
+          : `${action} recorded — the engine checks it between chunks/partitions.`,
+      );
       await refresh();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -142,6 +147,25 @@ export default function IndexingControl() {
       setVerifyOutput(result.output || (result.ok ? "READY" : "NOT READY"));
     } catch (caught) {
       setVerifyOutput(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const startFull = async () => {
+    if (!state) return;
+    if (!window.confirm(`Start FULL Pass 1 for ${state.version}? It reads all 64.26 GB from R2 and can run for hours.`)) return;
+    setBusy("start-full");
+    setNotice(null);
+    try {
+      const result = await admin<{ started: boolean }>(`/api/cloud/jobs/${encodeURIComponent(state.version)}/start`, {
+        method: "POST",
+        body: JSON.stringify({ confirm: "START", stage: "pass1" }),
+      });
+      setNotice(result.started ? `Full Pass 1 started for ${state.version}. Progress is durable in R2.` : "The job was not started.");
+      await refresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
       setBusy(null);
     }
@@ -213,11 +237,11 @@ export default function IndexingControl() {
       <PageHeader
         eyebrow="Operations"
         title="Cloud indexing"
-        description="Live Pass 1 state from R2. The engine runs in a Cloudflare Container; this page reads its durable checkpoint and writes its pause/abort flags."
+        description="Durable Pass 1 and Pass 2 state from R2. The engine runs in a Cloudflare Container; this page reads its checkpoint, writes the pause/abort flags, starts the merge and activates only a completed full run."
         actions={
           <>
             <Badge variant="outline" className="gap-1.5 text-xs">
-              <Cloud className="size-3.5" /> Preview control plane
+              <Cloud className="size-3.5" /> Access-protected control plane
             </Badge>
             <Button variant="outline" className="gap-2" onClick={() => void refresh()}>
               <RefreshCw className="size-4" /> Refresh
@@ -356,6 +380,22 @@ export default function IndexingControl() {
                   </Button>
                   <Button variant="outline" className="gap-2" disabled={!state || busy !== null} onClick={() => void verify()}>
                     <ShieldCheck className="size-4" /> {busy === "verify" ? "Verifying…" : "Verify segments"}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    className="gap-2"
+                    disabled={!state || busy !== null || Boolean(control?.approvedFullRun)}
+                    onClick={() => void act("approve")}
+                  >
+                    <ShieldCheck className="size-4" /> {control?.approvedFullRun ? "Full run approved" : "Approve full run"}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    className="gap-2"
+                    disabled={!state || busy !== null || !control?.approvedFullRun || !["pass1", "failed"].includes(state.stage)}
+                    onClick={() => void startFull()}
+                  >
+                    <Play className="size-4" /> {busy === "start-full" ? "Starting…" : "Start full Pass 1"}
                   </Button>
                 </div>
                 {verifyOutput ? (

@@ -147,7 +147,71 @@ Follow `docs/indexing.md` (profile → samples → approval gate → full run �
 Until you publish, the API returns `503 dataset_unavailable` and the UI says the dataset is not
 indexed — that is the intended behaviour, not a bug.
 
-## 10. Rollback
+## 10. Cloud indexing container (optional, needed for the 64 GB run)
+
+The application deploys and serves without a container. The container is what can index
+the full corpus without your computer. `wrangler.toml` already contains the container
+(`[[containers]]`), the `INDEXER_CONTAINER` Durable Object binding and its migration, and
+the root `Dockerfile` is the image.
+
+**Prerequisites:** Docker (or a compatible builder) running on the deploying machine.
+`wrangler deploy` builds the image locally and pushes it to Cloudflare's registry on the
+first deploy; later deploys push only changed layers.
+
+1. Build and validate the image locally first (this is the step that proves the image is
+   self-contained):
+
+   ```powershell
+   docker build --platform linux/amd64 -t companyintel-indexer .
+   docker run --rm -p 8080:8080 companyintel-indexer
+   curl.exe localhost:8080/health
+   ```
+
+   Expected: `{"ok":true,...}`.
+
+2. Set the container's R2 credentials as Worker secrets. The container DO forwards them
+   to the container at start; they are never returned to a browser and are never in this
+   repository:
+
+   ```powershell
+   bunx wrangler secret put R2_ACCOUNT_ID
+   bunx wrangler secret put R2_ACCESS_KEY_ID
+   bunx wrangler secret put R2_SECRET_ACCESS_KEY
+   ```
+
+   Use a token scoped to **Object Read & Write on `company-intel-data` only** (least
+   privilege). Do not reuse your account-wide token.
+
+3. Optionally restrict the control plane to specific operators:
+
+   ```powershell
+   bunx wrangler secret put INDEXING_ADMIN_EMAILS   # comma-separated emails
+   ```
+
+   Every `/api/cloud/*` route already requires a valid Cloudflare Access JWT and rejects
+   cross-origin requests; this variable is a second, narrower allowlist.
+
+4. Deploy:
+
+   ```powershell
+   bun run build
+   bunx wrangler deploy
+   ```
+
+   Expected: Wrangler builds the image, pushes it, deploys the Worker, and prints the
+   container binding. `/indexing` now shows `containerBound: true` from `/api/cloud/jobs`.
+
+5. Run a bounded benchmark from `/indexing` (1–256 MB per source). Then start Cloud
+   Pass 2 from the same panel. Verify the segments first; activate only a completed
+   **full** run.
+
+**Not verified in this workspace:** Docker is unavailable, there is no Cloudflare API
+ token, and no deploy was attempted. The configuration matches Cloudflare's documented
+ schema, and the same code path was exercised against real R2 objects outside the
+ container (see `docs/cloud.md`). Treat the first real deploy as unverified until it
+ appears in the Cloudflare dashboard.
+
+## 11. Rollback
 
 Dataset Management (`/dataset`) lists known versions and lets you re-point the active version
 after a confirmation step. Manually, that pointer is a single object:
@@ -160,6 +224,20 @@ bunx wrangler r2 object get company-intel-data/manifests/active.json --pipe
 Re-point it with the app UI (recommended) or by re-running
 `bun tools/indexer/src/cli.ts publish --config <cfg> --version <previous> --yes`.
 Nothing in the old version is deleted when a new one is published, so rollback is immediate.
+
+## Preserving the code without GitHub
+
+If repository synchronization is unavailable, the workspace is still the authoritative
+copy. A non-destructive archive you can store anywhere:
+
+```powershell
+tar --exclude node_modules --exclude .git --exclude ".indexer*" `
+    --exclude ".r2-credentials.json" -czf companyintel-source.tgz .
+```
+
+Deploy directly from this workspace with `bun run build` and `bunx wrangler deploy`; the
+container image is built from the root `Dockerfile` during that deploy. No indexing job
+has to run on a personal machine for either step.
 
 ## Notes on this preview environment
 

@@ -29,7 +29,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { createWriteStream, existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { gzipSync, gunzipSync } from "node:zlib";
 
@@ -98,20 +98,26 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
 
   // A manifest means this version is complete. Writing into it would replace a
   // verified index in place, so it is refused; use a new version id.
-  const existingManifest = await store.head(`manifests/${version}/manifest.json`);
-  if (existingManifest.exists) {
+  const existingManifest = await store.getJson<{ validationPassed?: boolean }>(`manifests/${version}/manifest.json`);
+  if (existingManifest && existingManifest.validationPassed !== false) {
     throw new Error(
-      `Refusing to build ${version}: manifests/${version}/manifest.json already exists. ` +
+      `Refusing to build ${version}: manifests/${version}/manifest.json already exists and is validated. ` +
         "A completed version is immutable — choose a new version id.",
     );
+  }
+  if (existingManifest) {
+    log(`replacing a previous attempt of ${version} that failed validation; no validated object is overwritten`);
   }
 
   const state = await store.getJson<CloudJobState>(cloudKeys.state(version));
   if (!state) throw new Error(`No cloud job state at ${cloudKeys.state(version)}; run Pass 1 first.`);
   // `pass2` means an earlier attempt was interrupted; `paused` means the operator
   // stopped between partitions. Both replay deterministically from partition 1.
+  // `failed` is recoverable: an operator fixes the cause and re-runs; nothing was
+  // activated and Pass 1 is untouched. The version is still immutable once a
+  // manifest exists (checked above).
   const boundedReady = options.allowBounded === true && state.mode === "benchmark" && state.stage === "pass1";
-  if (state.stage !== "pass1-complete" && state.stage !== "pass2" && state.stage !== "paused" && !boundedReady) {
+  if (state.stage !== "pass1-complete" && state.stage !== "pass2" && state.stage !== "paused" && state.stage !== "failed" && !boundedReady) {
     throw new Error(
       `Refusing Cloud Pass 2: the job is at stage "${state.stage}", not "pass1-complete". Finish or resume Pass 1 first.`,
     );
@@ -187,7 +193,8 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
 
   /* --------------------------- local bookkeeping -------------------------- */
 
-  prepareWorkDir(workDir);
+  assertScratchDir(workDir, version, config);
+  prepareWorkDir(workDir, version);
   const spoolDir = join(workDir, "spool");
   mkdirSync(spoolDir, { recursive: true });
 
@@ -217,7 +224,19 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
   writeJsonSync(join(workDir, "checkpoint.json"), {
     stage: "pass2-merge",
     identity,
-    counters: { rowsRead: totalRows, rowsRejected: checkpoints.reduce((total, entry) => total + entry.rejected, 0) },
+    counters: {
+      rowsRead: totalRows,
+      rowsRejected: checkpoints.reduce((total, entry) => total + entry.rejected, 0),
+      // Per-source row accounting is restored from Pass 1. Without it the merge's
+      // validation reports `source_missing_rows` (csv1=0, csv2=0) and a perfectly
+      // good index is marked failed — measured on the first real-R2 Pass 2 run.
+      perSource: Object.fromEntries(
+        checkpoints.map((entry) => [
+          entry.sourceId,
+          { rowsRead: entry.rows, rowsRejected: entry.rejected, companies: 0, contacts: 0 },
+        ]),
+      ),
+    },
     // Provenance: this checkpoint is derived from R2 segments, not a local spool.
     cloud: { version, segments: manifests.size, segmentBytes: totalSegmentBytes },
   });
@@ -243,7 +262,6 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
     list.sort((a, b) => a.chunk - b.chunk || config.sources.findIndex((s) => s.id === a.sourceId) - config.sources.findIndex((s) => s.id === b.sourceId));
   }
 
-  const shardBatch = 4;
   let shardParts = 0;
   const stateControl = async (): Promise<CloudControl | null> => store.getJson<CloudControl>(cloudKeys.control(version));
 
@@ -349,7 +367,11 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
 
         writeShardPart: async (batch, kind, shard, body) => {
           const key = `${cloudKeys.jobRoot(version)}/pass2/shards/${kind}/${String(shard).padStart(4, "0")}/${String(batch).padStart(6, "0")}.lines.gz`;
-          await store.put(key, gzipSync(body, { level: 6 }), "application/gzip", "gzip");
+          // No `content-encoding` on intermediate parts: it would make every ranged
+          // GET an HTTP-level decompression of a byte range (which is not a gzip
+          // stream) and the read-back fails with a ZlibError. The driver gunzips
+          // these itself; the Worker never reads them.
+          await store.put(key, gzipSync(body, { level: 6 }), "application/gzip");
           shardParts += 1;
           void batch;
         },
@@ -365,7 +387,13 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
         },
 
         writeObject: async (key, body, gzip) => {
-          await store.put(key, body, "application/json", gzip ? "gzip" : undefined);
+          // Deliberately no `content-encoding` even for gzip bytes. R2's S3 endpoint
+          // auto-decodes a response that carries it, which breaks both ranged reads
+          // (the validation read-back) and the byte-for-byte checksum comparison. The
+          // Worker detects gzip by its magic bytes (`worker/src/store.ts`), so the
+          // header is not needed for serving, and the local uploader's files remain
+          // readable the same way.
+          await store.put(key, body, gzip ? "application/gzip" : "application/json");
         },
 
         readObject: async (key) => {
@@ -479,8 +507,46 @@ async function loadChunkManifests(store: BlobStore, version: string, checkpoints
   return out;
 }
 
+const SCRATCH_MARKER = ".cloud-pass2-work.json";
+
+/**
+ * Refuse to treat an arbitrary directory as Cloud Pass 2 scratch.
+ *
+ * This driver deletes its own partition files and bookkeeping between attempts, so
+ * pointing it at a real local spool (or at the configured work/output directory)
+ * must fail BEFORE anything is removed. A directory is accepted only if it is empty,
+ * does not exist, or carries this driver's own marker for the same version.
+ */
+function assertScratchDir(workDir: string, version: string, config: IndexerConfig): void {
+  const samePath = (a: string, b: string) => resolve(a) === resolve(b);
+  if (samePath(workDir, config.workDir) || samePath(workDir, config.outputDir)) {
+    throw new Error(
+      `Refusing to use ${workDir} as Cloud Pass 2 scratch: it is the configured work/output directory. ` +
+        "Choose an empty temporary directory; nothing was deleted.",
+    );
+  }
+  if (!existsSync(workDir)) return;
+  const entries = readdirSync(workDir);
+  if (!entries.length) return;
+  const markerPath = join(workDir, SCRATCH_MARKER);
+  if (!existsSync(markerPath)) {
+    throw new Error(
+      `Refusing to use ${workDir}: it is not empty and has no ${SCRATCH_MARKER} marker, so it is not a ` +
+        "Cloud Pass 2 scratch directory. Nothing was deleted. Use an empty directory (or the one this " +
+        "driver created) — never a Pass 1 spool.",
+    );
+  }
+  const marker = JSON.parse(readFileSync(markerPath, "utf8")) as { version?: string };
+  if (marker.version !== version) {
+    throw new Error(
+      `Refusing to use ${workDir}: its marker belongs to ${marker.version ?? "another job"}, not ${version}. ` +
+        "Nothing was deleted.",
+    );
+  }
+}
+
 /** Clear only this driver's own scratch directories; never touches a source spool. */
-function prepareWorkDir(workDir: string): void {
+function prepareWorkDir(workDir: string, version: string): void {
   if (!existsSync(workDir)) mkdirSync(workDir, { recursive: true });
   for (const name of ["spool", "shards", "out"]) {
     rmSync(join(workDir, name), { recursive: true, force: true });
@@ -488,6 +554,7 @@ function prepareWorkDir(workDir: string): void {
   for (const name of ["checkpoint.json", "spool-manifest.json"]) rmSync(join(workDir, name), { force: true });
   mkdirSync(join(workDir, "spool"), { recursive: true });
   mkdirSync(join(workDir, "out"), { recursive: true });
+  writeJsonSync(join(workDir, SCRATCH_MARKER), { version, createdAt: new Date().toISOString() });
 }
 
 function writeJsonSync(path: string, value: unknown): void {

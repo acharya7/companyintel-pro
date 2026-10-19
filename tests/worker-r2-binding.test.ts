@@ -35,6 +35,18 @@ const wranglerConfig = readFileSync(join(root, "wrangler.toml"), "utf8")
 const envTypes = readFileSync(join(root, "worker/src/env.d.ts"), "utf8");
 const workerFiles = walk(join(root, "worker")).filter((path) => path.endsWith(".ts"));
 const workerSource = workerFiles.map((path) => readFileSync(path, "utf8")).join("\n");
+/**
+ * The container DO is the one deliberate exception: a Cloudflare Container has no R2
+ * binding, so it receives the S3 credentials through `container.start({ env })`.
+ * Everything else in `worker/` must stay free of them — asserted below.
+ */
+const containerBridge = readFileSync(join(root, "worker/src/indexer-container.ts"), "utf8");
+const workerSourceExceptContainer = workerFiles
+  // `env.d.ts` only declares the container-only secret names; runtime source is
+  // what must never read them.
+  .filter((path) => !path.endsWith("indexer-container.ts") && !path.endsWith("env.d.ts"))
+  .map((path) => readFileSync(path, "utf8"))
+  .join("\n");
 
 describe("wrangler.toml declares a private R2 binding", () => {
   test("the COMPANY_DATA binding points at company-intel-data", () => {
@@ -53,10 +65,22 @@ describe("wrangler.toml declares a private R2 binding", () => {
 
 describe("the Worker code never uses S3 credentials", () => {
   test("no worker source file reads an R2 S3 secret", () => {
-    expect(workerSource).not.toContain("R2_ACCESS_KEY_ID");
-    expect(workerSource).not.toContain("R2_SECRET_ACCESS_KEY");
-    expect(workerSource).not.toContain("R2_ACCOUNT_ID");
-    expect(workerSource).not.toContain("cloudflarestorage.com");
+    expect(workerSourceExceptContainer).not.toContain("R2_ACCESS_KEY_ID");
+    expect(workerSourceExceptContainer).not.toContain("R2_SECRET_ACCESS_KEY");
+    expect(workerSourceExceptContainer).not.toContain("R2_ACCOUNT_ID");
+    expect(workerSourceExceptContainer).not.toContain("cloudflarestorage.com");
+  });
+
+  test("the container bridge forwards credentials but never reads or exposes them", () => {
+    // The names may appear only as `env.X = this.env.X` on the start call.
+    expect(containerBridge).not.toContain("cloudflarestorage.com");
+    expect(containerBridge).not.toContain("R2Client");
+    expect(containerBridge).not.toContain("console.log");
+    for (const name of ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]) {
+      const occurrences = containerBridge.split(name).length - 1;
+      expect(occurrences).toBe(3); // `if (this.env.X) env.X = this.env.X;`
+    }
+    expect(containerBridge).toContain("container.start({ enableInternet: true, env");
   });
 
   test("the Worker uses the binding and declares it in its Env type", () => {

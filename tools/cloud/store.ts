@@ -127,6 +127,11 @@ export class MemoryBlobStore implements BlobStore {
   private readonly objects = new Map<string, Buffer>();
   readonly ops = { classA: 0, classB: 0, bytesRead: 0, bytesWritten: 0 };
 
+  /** Same accounting interface as `R2BlobStore`, so cost guards are testable. */
+  countersSnapshot() {
+    return { ...this.ops };
+  }
+
   constructor(seed: Record<string, Buffer> = {}) {
     for (const [key, value] of Object.entries(seed)) this.objects.set(key, value);
   }

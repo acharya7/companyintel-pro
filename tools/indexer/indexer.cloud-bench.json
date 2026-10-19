@@ -1,0 +1,75 @@
+{
+  "$comment": [
+    "CompanyIntel — BOUNDED real-R2 config for the Cloud Pass 1 → Pass 2 smoke run.",
+    "",
+    "Two partitions and two shards keep a bounded benchmark under a minute even on a",
+    "high-latency link: 2 partitions × 2 sources = 4 segment reads for Pass 2, and",
+    "8 index kinds × 2 shards = 16 shard objects. It is a pipeline/integration test,",
+    "NOT a size or cost benchmark — use tools/indexer/indexer.config.json for that.",
+    "",
+    "Run:",
+    "  bun tools/cloud/cli.ts run --config tools/indexer/indexer.cloud-bench.json \\",
+    "    --version cloud-bench-smoke --max-source-mb 1 --partitions 2",
+    "  bun tools/cloud/cli.ts pass2 --config tools/indexer/indexer.cloud-bench.json \\",
+    "    --version cloud-bench-smoke --partitions 2 --allow-bounded",
+    "",
+    "The benchmark is never activatable (state.mode = benchmark)."
+  ],
+  "datasetVersion": "cloud-bench-smoke",
+  "sources": [
+    {
+      "id": "csv1",
+      "path": "r2://company-intel-data/raw/file1.csv",
+      "encoding": "utf-8",
+      "delimiter": "\t",
+      "columns": {
+        "companyid": "organization_id",
+        "companyname": "organization_name",
+        "companydomain": "organization_domain",
+        "companywebsite": "organization_website_url",
+        "industry": "organization_industries",
+        "companysize": "organization_num_current_employees",
+        "companyrevenue": "organization_revenue_in_thousands_int",
+        "companycity": "organization_hq_location_city",
+        "companystate": "organization_hq_location_state",
+        "companycountry": "organization_hq_location_country"
+      }
+    },
+    {
+      "id": "csv2",
+      "path": "r2://company-intel-data/raw/file2.csv",
+      "encoding": "utf-8",
+      "delimiter": "\t",
+      "columns": {
+        "contactname": "person_name",
+        "firstname": "person_first_name_unanalyzed",
+        "lastname": "person_last_name_unanalyzed",
+        "jobtitle": "person_title",
+        "seniority": "person_seniority",
+        "department": "person_functions",
+        "email": "person_email",
+        "phone": "person_phone",
+        "linkedin": "person_linkedin_url",
+        "contactcity": "person_location_city",
+        "contactstate": "person_location_state",
+        "contactcountry": "person_location_country",
+        "companyname": "sanitized_organization_name_unanalyzed"
+      }
+    }
+  ],
+  "workDir": ".indexer-cloud-work-bench",
+  "outputDir": ".indexer-cloud-output-bench",
+  "rawCacheDir": null,
+  "partitions": 2,
+  "shards": {
+    "exact": 2,
+    "prefix": 2,
+    "token": 2,
+    "trigram": 2,
+    "ids": 2
+  },
+  "upload": {
+    "enabled": false,
+    "bucket": "company-intel-data"
+  }
+}

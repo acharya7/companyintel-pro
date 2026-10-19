@@ -15,7 +15,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -35,8 +35,10 @@ function companyRow(index: number): string {
 }
 
 function contactRow(index: number): string {
-  // Every third contact names an employer that is not in the company file: it must
-  // survive as an unassigned contact rather than be dropped.
+  // Every third contact names an employer that is not in the company file. The
+  // indexer creates a company record for it from the contact row itself, so the
+  // interesting property here is that the cloud merge reproduces that local
+  // behaviour exactly (including the contact-only company).
   const employer = index % 3 === 0 ? `Nowhere Holdings ${index}` : `Company ${index % 37} Ltd`;
   return [`Person ${index}`, `person${index}@example.com`, employer].join("\t");
 }
@@ -44,13 +46,20 @@ function contactRow(index: number): string {
 function corpus() {
   const companies = [COMPANY_HEADER.join("\t")];
   for (let index = 0; index < 37; index += 1) companies.push(companyRow(index));
+  // Two unrelated companies share a name and carry different strong evidence. A
+  // contact naming only that employer cannot be attached to either, so it must be
+  // preserved as an unassigned contact by the cloud merge (not dropped).
+  companies.push(["c-acme-a", "Acme Ltd", "acme-a.example", "\"first acme\""].join("\t"));
+  companies.push(["c-acme-b", "Acme Ltd", "acme-b.example", "\"second acme\""].join("\t"));
   const contacts = [CONTACT_HEADER.join("\t")];
   for (let index = 0; index < 60; index += 1) contacts.push(contactRow(index));
+  contacts.push(["Acme Person A", "", "Acme Ltd"].join("\t"));
+  contacts.push(["Acme Person B", "", "Acme Ltd"].join("\t"));
   return {
     company: Buffer.from(`${companies.join("\n")}\n`, "utf8"),
     contact: Buffer.from(`${contacts.join("\n")}\n`, "utf8"),
-    companyRows: 37,
-    contactRows: 60,
+    companyRows: 39,
+    contactRows: 62,
   };
 }
 
@@ -79,8 +88,10 @@ function configFor(version: string, workDir: string): IndexerConfig {
       delimiter: "\t",
       columns: source.columns,
     })),
-    workDir,
-    outputDir: join(workDir, "out"),
+    // Distinct from the scratch directory the cloud driver uses, as in production:
+    // the configured Pass 1 work directory must never be treated as scratch.
+    workDir: join(workDir, "cfg"),
+    outputDir: join(workDir, "cfg-out"),
     partitions: 8,
     shards: { exact: 8, prefix: 8, token: 8, trigram: 8, ids: 8 },
   };
@@ -149,8 +160,9 @@ describe("cloud Pass 2", () => {
       // --- equivalence: merge the same segments locally, then compare bytes ---
       const localWork = join(dir, "local-work");
       const localOut = join(dir, "local-out");
-      await assembleRun({ store, version: "cloud-p2", config: configFor("cloud-p2", localWork), workDir: localWork });
-      const localConfig = { ...configFor("cloud-p2", localWork), outputDir: localOut };
+      const localBase = { ...configFor("cloud-p2", localWork), workDir: localWork };
+      await assembleRun({ store, version: "cloud-p2", config: localBase, workDir: localWork });
+      const localConfig = { ...localBase, outputDir: localOut };
       await runIndex(localConfig, { resume: true, diskFloorBytes: 0 });
 
       const cloudKeysOut = outputKeys(store, "cloud-p2");
@@ -176,6 +188,14 @@ describe("cloud Pass 2", () => {
       expect(mismatched).toEqual([]);
       expect(compared.length).toBeGreaterThan(10);
       expect(sawAllPartitions).toBe(8);
+      // The ambiguous Acme contacts are preserved, not lost by the cloud merge.
+      expect(cloudKeysOut.some((key) => key.startsWith("unassigned/"))).toBe(true);
+      const manifest = await store.getJson<{ validationPassed: boolean; counters: { uniqueCompanies: number; uniqueContacts: number } }>(
+        "manifests/cloud-p2/manifest.json",
+      );
+      expect(manifest?.validationPassed).toBe(true);
+      expect(manifest?.counters.uniqueCompanies).toBe(result.companies);
+      expect(manifest?.counters.uniqueContacts).toBe(result.contacts);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -216,6 +236,22 @@ describe("cloud Pass 2", () => {
       const manifest = await store.getJson<{ counters: { uniqueCompanies: number; uniqueContacts: number } }>("manifests/cloud-p2-pause/manifest.json");
       expect(manifest?.counters.uniqueCompanies).toBe(resumed.companies);
       expect(manifest?.counters.uniqueContacts).toBe(resumed.contacts);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("refuses a non-empty directory that is not its own scratch, without deleting it", async () => {
+    const { store } = await seedPass1("cloud-p2-guard");
+    const dir = mkdtempSync(join(tmpdir(), "cloud-pass2-guard-"));
+    try {
+      const workDir = join(dir, "work");
+      mkdirSync(join(workDir, "spool"), { recursive: true });
+      writeFileSync(join(workDir, "spool", "part-0000.jsonl.gz"), "real spool data");
+      await expect(
+        runCloudPass2({ store, version: "cloud-p2-guard", config: configFor("cloud-p2-guard", workDir), workDir }),
+      ).rejects.toThrow(/not a Cloud Pass 2 scratch directory/);
+      expect(readFileSync(join(workDir, "spool", "part-0000.jsonl.gz"), "utf8")).toBe("real spool data");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

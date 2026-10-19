@@ -34,7 +34,10 @@ export class IndexerContainer implements DurableObject {
    * `start()` is idempotent in the Containers runtime: calling it on a running
    * instance is a no-op, so it is safe on every request.
    */
-  constructor(private readonly state: DurableObjectState) {}
+  constructor(
+    private readonly state: DurableObjectState,
+    private readonly env: EnvWithContainer,
+  ) {}
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -63,7 +66,18 @@ export class IndexerContainer implements DurableObject {
     }
     await this.state.blockConcurrencyWhile(async () => {
       const running = await container.inspect().catch(() => null);
-      if (!running) await container.start({ enableInternet: true });
+      if (!running) {
+        // Credentials are passed from the Worker's secret store into the container
+        // environment at start time. They are never returned to a caller, never
+        // logged, and never stored in this repository. The container uses them only
+        // for the S3 API to the private bucket.
+        const env: Record<string, string> = {};
+        if (this.env.R2_ACCOUNT_ID) env.R2_ACCOUNT_ID = this.env.R2_ACCOUNT_ID;
+        if (this.env.R2_ACCESS_KEY_ID) env.R2_ACCESS_KEY_ID = this.env.R2_ACCESS_KEY_ID;
+        if (this.env.R2_SECRET_ACCESS_KEY) env.R2_SECRET_ACCESS_KEY = this.env.R2_SECRET_ACCESS_KEY;
+        if (this.env.CLOUD_BUDGET_USD) env.CLOUD_BUDGET_USD = this.env.CLOUD_BUDGET_USD;
+        await container.start({ enableInternet: true, env: Object.keys(env).length ? env : undefined });
+      }
     });
     // `getTcpPort` is the typed way to reach the port the container listens on.
     return container.getTcpPort(CONTAINER_PORT).fetch(request);

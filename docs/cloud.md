@@ -19,6 +19,11 @@ browser ── /indexing (control panel)
              │  bun tools/cloud/cli.ts run --version <id>
              │
       raw/file1.csv · raw/file2.csv  (R2, ranged reads only)
+
+   Cloud Pass 2 (tools/cloud/pass2.ts, same container)
+             │  one partition at a time from verified segments
+             ▼
+      indexes/ · companies/ · contacts/ · details/ · unassigned/ · manifests/
 ```
 
 **Pass 1 is implemented and verified** end to end against real R2 objects:
@@ -37,11 +42,32 @@ browser ── /indexing (control panel)
    so nothing is duplicated.
 5. `pause` and `abort` are objects in R2, checked before every chunk.
 
-**Pass 1 output is byte-compatible with the local v2 spool.** `tools/cloud/assemble.ts`
-concatenates a partition's segment objects (concatenated gzip members are one valid
-gzip stream) and writes `progress.json`, `spool-manifest.json` and a `pass2-merge`
-checkpoint. The existing merge then verifies it like any other spool. A test asserts the
-assembled manifest is accepted and its row counts match the source.
+**Pass 2 is now cloud-native.** `tools/cloud/pass2.ts` runs the production merge from
+`tools/indexer/src/build.ts` with three hooks:
+
+1. `preparePartition` concatenates one partition's segment objects from R2 (gzip members
+   concatenate into one valid stream), verifies every segment's SHA-256 and byte length,
+   writes the `.frames` ledger the merge verifies, and hands the file to the unchanged
+   merge loop;
+2. `releasePartition` deletes it immediately, so local disk holds **one partition**
+   (tens of MB at 256 partitions), never the ~23 GB spool;
+3. postings are flushed to R2 every four partitions as gzip batch objects, and the
+   final index objects are PUT straight to their versioned keys — the ~20 GB index is
+   never written locally either.
+
+Company identity, contact association, unassigned contacts, duplicate prevention,
+projections, detail records, all indexes and manifests come from the same code as the
+local build. `tests/cloud-pass2.test.ts` proves this by merging the same segments both
+ways and comparing every generated object byte-for-byte (the only excluded field is the
+`createdAt` timestamp in `indexes/<v>/directory.json`).
+
+The earlier `tools/cloud/assemble.ts` remains as a compatibility bridge for bounded
+runs and as the reference used by that equivalence test; the full corpus never calls it.
+
+Scratch safety: the driver clears only a directory it created (marked with
+`.cloud-pass2-work.json`) or an empty one, and refuses the configured work/output
+directory outright. Pointing `--work-dir` at a real local spool stops before anything is
+deleted.
 
 ## Cloudflare limits that shaped this
 
@@ -58,10 +84,11 @@ Checked against the official docs (October 2026):
 | R2 prices | $0.015/GB-month, $4.50/M Class A, $0.36/M Class B | see forecast |
 | Containers prices | $5/mo includes 375 vCPU-min, 25 GiB-h, 200 GB-h disk; then $0.00002/vCPU-s, $0.0000025/GiB-s | measured forecast is a few dollars |
 
-**The one limit that blocks a full-corpus Pass 2 as a single container process:** the
-complete v2 spool is ~23 GB, and a container has at most 20 GB of ephemeral disk. The
-existing merge also writes the index (~20 GB) while it reads the spool, so it cannot run
-inside one container even if the spool fit. Pass 2 must stream both sides.
+**The disk limit no longer blocks Pass 2.** A container has at most 20 GB of ephemeral
+disk (8 GB at `standard-1`), while the spool is ~23 GB and the index ~20 GB. Cloud Pass 2
+never has either: it materialises one partition, merges it, deletes it, and streams the
+posting/index objects to R2. Peak local use is one partition plus a four-partition shard
+buffer (bounded by `SHARD_FLUSH_BYTES`).
 
 ## What is verified, and what is not
 
@@ -72,28 +99,28 @@ inside one container even if the spool fit. Pass 2 must stream both sides.
 | Resume after pause/kill; refuses a changed source identity | **IMPLEMENTED AND VERIFIED** |
 | Segment verification (SHA-256 + row accounting + coverage) | **IMPLEMENTED AND VERIFIED** |
 | Cloud → v2 spool assembly (format compatibility with existing merge) | **IMPLEMENTED AND VERIFIED** on fixtures |
-| Control panel + backend controls (R2 state and control flags) | **IMPLEMENTED AND VERIFIED** in the preview (a benchmark was started through it) |
+| Control panel + dev backend controls (R2 state and control flags) | **IMPLEMENTED AND VERIFIED** in the preview (a benchmark was started through it) |
+| Deployed admin API + container orchestration | **IMPLEMENTED BUT UNVERIFIED** (static/type checks only) |
 | Container image and runner | **IMPLEMENTED BUT NOT VERIFIED** — no Cloudflare API token in this workspace, nothing deployed |
 | Full-corpus container execution | **NOT RUN** (requires your approval) |
-| Cloud-native Pass 2 (streaming shard merge) | **NOT IMPLEMENTED** — see blocker below |
+| Cloud-native Pass 2 (partition reduce + streaming shard merge) | **IMPLEMENTED AND VERIFIED** on fixtures and a bounded real-R2 job |
+| Pause/resume, corrupted segment, immutable completed version | **IMPLEMENTED AND VERIFIED** (`tests/cloud-pass2.test.ts`) |
+| Deployed admin API (`/api/cloud/*`) + container DO | **IMPLEMENTED BUT UNVERIFIED** — no Docker/token here, nothing deployed |
 | Existing application/search | unchanged; the running index is untouched |
 
-### Pass 2 blocker, precisely
+### How the partition reduce stays correct
 
-The merge is partition-independent for identity and association (a company and its
-contacts hash to the same partition), which is what makes a distributed reduce correct.
-But producing the **global** v4 shards needs one of:
+A company and all its contacts hash to the same partition, so resolution inside one
+partition is complete and independent. The global shard is assembled from posting parts
+in partition order, which is the same order the local merge writes them; the equivalence
+test asserts the resulting payloads are identical. Restart replays partition 1: every
+output key is overwritten with the same bytes, so a replay cannot duplicate a company, a
+contact or a posting. A version whose `manifests/<v>/manifest.json` already exists is
+refused outright.
 
-* a reduce stage that writes per-partition posting parts, then a shard-merge stage that
-  concatenates the parts for each shard (this is the right design, and it has not been
-  written yet); or
-* a machine with >43 GB free disk to materialize the spool and the index, which a
-  personal computer is explicitly not allowed to be.
-
-A container cannot do the second. So the honest status is: Pass 1 can run entirely in
-Cloudflare; Pass 2 needs the streaming shard merger before the full corpus can be
-generated in the cloud. The existing single-process Pass 2 remains available (and is
-what assembled bounded runs use), but it is not the cloud path.
+Known limitation: replay rebuilds every shard, so an interruption late in Pass 2 costs
+the work since the last completed partition batch. A future optimization could checkpoint
+completed shards, but correctness does not depend on it.
 
 ## Real benchmark (bounded, real R2)
 
@@ -121,6 +148,44 @@ Compression: 31.4% at 16 MiB/16 partitions is inflated by gzip headers on tiny f
 The 20,000-row measurement of the same encoding on the real sources was **0.423×
 (company) and 0.346× (contact)** of source bytes, i.e. **~23 GB for 64.26 GB**.
 
+## Real Cloud Pass 2 run (bounded, real R2)
+
+Same CLI, same real objects, new version `cloud-bench-smoke` with
+`tools/indexer/indexer.cloud-bench.json` (2 partitions, 2 shards, 1 MB per source):
+
+```
+Pass 1 verified: 2,324 rows in 2 chunks
+partitions merged: 2/2, one at a time, each deleted before the next
+validation: passed (every generated object read back and re-hashed)
+objects written: 40 · shard batch objects: 16
+R2 Class A / Class B: 78 / 132
+per-source accounting: csv1 436 rows, csv2 1,888 rows
+wall time: 146.6 s
+```
+
+The first attempt failed validation with `source_missing_rows (csv1=0, csv2=0)` because
+Cloud Pass 2 restored only the total row count from Pass 1, not the per-source counters.
+The fix is in the derived checkpoint (`perSource` is rebuilt from the verified
+checkpoints); the re-run above passes, and that failure is now covered by the fixture
+test.
+
+That is **16 rows/s**, but it is a latency measurement, not a throughput one: this
+sandbox takes ~1.5–5 s per R2 request, and the merge issues a fixed handful of
+requests per partition plus one read and one write per shard object. The same code in a
+container sees millisecond R2 round trips. It does prove the real path end to end:
+segments were read from R2, merged with the production engine, the generated index was
+written back without `content-encoding` (so ranged reads stay byte-exact), and every
+object was read back and checksum-verified.
+
+The built index was then downloaded and queried with `scripts/explain-query.mjs`
+(`2GO Group` → exact match from the real company names, 31 ms). Company/contact search
+is therefore compatible with a cloud-produced v4 index, not just with a local one.
+
+In-memory equivalence (`tests/cloud-pass2.test.ts`) is stronger on bytes: the same
+segments merged locally and in cloud mode produce identical objects for every
+projection, detail, index, unassigned and manifest file; only `createdAt` in
+`directory.json` differs.
+
 ## Cost forecast
 
 The CLI writes `index-reports/cloud-benchmark-<version>.json` with low/expected/high
@@ -137,10 +202,12 @@ Those durations inherit the sandbox's 0.7 MB/s and a deliberately conservative P
 multiplier (3× Pass 1, doubled in the high case). With container-local R2 latency and the
 measured 4,000–7,000 rows/s parse rate, Pass 1 for 99 M rows is **~1–2 hours on four
 containers**, and the expected total is closer to **$3–6**; the table above is the
-conservative planning bound. The high scenario exceeds the $30 preference, so the
-operating rule is: a **per-stage budget stop** (pause before the projected total crosses
-$30), not a claim that Cloudflare enforces the alert. Cloudflare's budget alert is a
-notification, not a hard cap.
+conservative planning bound. The high scenario exceeds the $30 preference, so the operating rule is: a
+**per-stage budget stop**, not a claim that Cloudflare enforces the alert. Pass 1 reads
+`CLOUD_BUDGET_USD` (30 in `wrangler.toml`) and pauses at the next durable chunk boundary
+when its running estimate reaches it; benchmarks are exempt. The estimate excludes R2
+storage and requests billed after the snapshot, so this is a guard, not a guaranteed cap
+— pause/abort remain authoritative. Cloudflare's budget alert is a notification only.
 
 What the forecast includes: container CPU/memory/disk beyond the monthly allowances, R2
 Class A/B beyond 1 M/10 M, intermediate spool storage (one month), and the final index.
@@ -149,19 +216,21 @@ free), and retries beyond the measured ones.
 
 ## Using the control panel
 
-`/indexing` in the preview shows the durable state of every job and can:
+`/indexing` shows the durable state of every job and can:
 
 * run a bounded benchmark (1–256 MB per source) through the real chunker/segment writer;
-* pause, resume or abort — the engine checks the flag before the next chunk;
-* verify every uploaded segment independently (re-reads and re-hashes);
-* view the last checkpoint, errors, throughput and running R2 estimate.
+* start or resume **Cloud Pass 2** and watch its partition progress, shard-object count,
+  index bytes, rate, ETA and running cost;
+* pause, resume or abort — the engine checks the flag between chunks/partitions;
+* verify every uploaded Pass 1 segment independently (re-reads sizes and row counts);
+* activate a **completed full run** only; the button is disabled for benchmarks;
+* view the last checkpoint, errors, source-row accounting and the R2 estimate.
 
 It cannot start the full corpus. `run` requires `--approve-full`, and that refuses unless
-`control.json` records `approvedFullRun: true` — a deliberate two-step guard.
-
-The panel talks to the dev server's `/api/cloud/...` routes (dev-only, header-guarded).
-They are not mounted in production; a deployed control plane would use the same R2 keys
-behind Cloudflare Access.
+`control.json` records `approvedFullRun: true`. The dev server's `/api/cloud/...` routes
+are token-guarded (`CLOUD_ADMIN_TOKEN`); the deployed routes live in
+`worker/src/indexer-admin.ts` and are protected by Cloudflare Access plus the
+`INDEXING_ADMIN_EMAILS` allowlist. Activity is never hidden behind an obscure URL.
 
 ## Running the container
 
@@ -173,19 +242,26 @@ docker run --rm -p 8080:8080 \
 curl -X POST localhost:8080/job -d '{"args":["run","--version","v1-cloud-2026-10-19","--max-source-mb","16","--partitions","16"]}'
 ```
 
-Deploying it as a Cloudflare Container needs a Worker with a Container/DO binding and an
-API token that this workspace does not have. That deployment has not been attempted.
+Deploying it as a Cloudflare Container is configured in `wrangler.toml`
+(`[[containers]]`, the `INDEXER_CONTAINER` Durable Object binding and migration) and
+uses the root `Dockerfile`. `wrangler deploy` builds that image with Docker and pushes it
+to Cloudflare's managed registry. The Worker exports `IndexerContainer`, starts it only
+through the admin route, and forwards `/health` and `POST /job`.
+
+**Not verified here:** Docker is not installed in this workspace, there is no Cloudflare
+API token, and nothing was deployed. The config matches Cloudflare's documented schema
+(instance types, DO binding, migration), but a real deploy has not been attempted. See
+`docs/deployment.md` for the exact commands.
 
 ## Approval needed before the full run
 
 1. Review `index-reports/cloud-benchmark-cloud-bench-e.json` (or rerun the benchmark at
    a larger size) and the forecast above.
 2. Approve the full-run budget (the expected case is under $30; the conservative high is
-   not), and the Pass 2 plan.
-3. Deploy the container (requires a Cloudflare API token with Containers + R2 + Workers
-   permissions).
-4. Run Pass 1 in full, verify, and only then implement/execute the streaming shard
-   merger for Pass 2.
+   not) by recording `approvedFullRun` in `control.json`.
+3. Provide a Cloudflare API token with Containers + R2 + Workers permissions so the
+   container can be deployed (Docker must be available on the deploying machine).
+4. Run Pass 1 in full, verify, then run Cloud Pass 2 and activate only after validation.
 
 Full indexing has **not** been started, and no existing index or source object was
 modified.

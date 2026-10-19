@@ -224,6 +224,33 @@ export async function handleCloudAdmin(request, response, root = process.cwd()) 
       return true;
     }
 
+    if (parts[0] === "jobs" && parts.length === 3 && parts[2] === "start" && method === "POST") {
+      const body = await readBody(request);
+      if (body.confirm !== "START" || body.stage !== "pass1") {
+        json(response, 400, {
+          error: { code: "invalid_request", message: 'Full Pass 1 needs confirm: "START" and stage: "pass1".' },
+        });
+        return true;
+      }
+      const version = parts[1];
+      if (!/^[a-z0-9][a-z0-9._-]{2,60}$/i.test(version)) {
+        json(response, 400, { error: { code: "invalid_version", message: "Invalid version id." } });
+        return true;
+      }
+      // The approval flag is the gate. The CLI re-checks it and refuses without it,
+      // so a stale panel cannot start the corpus by itself.
+      const { control } = cliJson(root, ["status", "--version", version, "--json"]);
+      if (!control?.approvedFullRun) {
+        json(response, 403, {
+          error: { code: "approval_required", message: `control.json for ${version} does not record approvedFullRun.` },
+        });
+        return true;
+      }
+      const pid = startDetached(root, ["run", "--version", version, "--approve-full"]);
+      json(response, 202, { started: true, version, stage: "pass1", pid });
+      return true;
+    }
+
     if (parts[0] === "preflight" && method === "POST") {
       const output = spawnSync("bun", [CLI, "preflight"], { cwd: root, encoding: "utf8", timeout: 30_000 });
       json(response, output.status === 0 ? 200 : 422, {

@@ -63,8 +63,23 @@ const server = createServer(async (request, response) => {
     if (!ALLOWED_COMMANDS.has(args[0])) {
       return json(response, 400, { error: `args[0] must be one of ${[...ALLOWED_COMMANDS].join(", ")}` });
     }
-    response.writeHead(200, { "content-type": "application/x-ndjson", "cache-control": "no-store" });
     const child = spawn("bun", ["tools/cloud/cli.ts", ...args], { cwd: root, env: process.env });
+
+    /*
+     * Detached mode: the Worker's admin route starts a job that may run for hours,
+     * far longer than one HTTP request. It asks for an immediate 202 and follows the
+     * job through `cloud/jobs/<version>/state.json` in R2, which the CLI writes after
+     * every chunk or partition. The child keeps running inside the container; a
+     * container stop is safe because the checkpoint is durable.
+     */
+    if (body.detach === true) {
+      child.stdout.resume();
+      child.stderr.pipe(process.stderr);
+      child.on("error", (error) => console.error(`[job] spawn failed: ${error.message}`));
+      return json(response, 202, { started: true, pid: child.pid, args });
+    }
+
+    response.writeHead(200, { "content-type": "application/x-ndjson", "cache-control": "no-store" });
     const forward = (chunk) => response.write(chunk);
     child.stdout.on("data", forward);
     child.stderr.on("data", forward);

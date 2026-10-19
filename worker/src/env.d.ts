@@ -34,6 +34,20 @@ export interface Env {
   INDEXING_ADMIN_EMAILS?: string;
   /** Durable Object namespace that owns the indexing container (see wrangler.toml). */
   INDEXER_CONTAINER?: DurableObjectNamespace;
+  /**
+   * R2 S3 credentials FOR THE CONTAINER ONLY (set with `wrangler secret put`).
+   *
+   * The Worker itself never uses them: it reads R2 through `COMPANY_DATA`. The
+   * container DO forwards them to `container.start({ env })` because the indexing
+   * CLI talks to R2 over the S3 API, and Containers have no binding mechanism.
+   * A comment in `tests/worker-r2-binding.test.ts` records that exception and
+   * asserts these names appear in no other Worker file.
+   */
+  R2_ACCOUNT_ID?: string;
+  R2_ACCESS_KEY_ID?: string;
+  R2_SECRET_ACCESS_KEY?: string;
+  /** Forwarded to the container; Pass 1 pauses when its running estimate reaches it. */
+  CLOUD_BUDGET_USD?: string;
 }
 
 export interface AccessIdentity {

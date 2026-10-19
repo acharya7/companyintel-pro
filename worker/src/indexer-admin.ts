@@ -32,7 +32,6 @@ import {
   type CloudControl,
   type CloudJobState,
 } from "../../src/shared/cloud/types";
-import { publishVersion, verifyRemoteVersion } from "../indexer/src/build";
 import { verifyAccess, AccessError } from "./access";
 import type { AccessIdentity } from "./env";
 import type { EnvWithContainer } from "./indexer-container";
@@ -44,6 +43,12 @@ export const indexingAdmin = new Hono<{ Bindings: EnvWithContainer; Variables: {
 /* ------------------------------- access ---------------------------------- */
 
 indexingAdmin.use("*", async (c, next) => {
+  // Same cross-origin rule as the rest of the API: an Access cookie is not a
+  // licence for another origin to drive indexing controls.
+  const origin = c.req.header("origin");
+  if (origin && origin !== new URL(c.req.url).origin) {
+    return c.json({ error: { code: "forbidden" as const, message: "Cross-origin requests are not allowed on this API" } }, 403);
+  }
   let identity: AccessIdentity;
   try {
     identity = await verifyAccess(c.req.raw, c.env);
@@ -102,28 +107,54 @@ async function listJobs(env: EnvWithContainer): Promise<{ state: CloudJobState; 
 }
 
 /**
- * R2 binding as the write client `publishVersion` expects.
+ * Activation checks against R2, using the binding only.
  *
- * The bucket binding needs no credentials, so the deployed activation path has no
- * S3 secret anywhere in it — that is the whole point of doing it here rather than on
- * a laptop with `R2_*` variables exported.
+ * This mirrors the local indexer's `publishVersion`, but deliberately does not
+ * import it: `worker/` must never depend on `tools/` (the S3 client and its
+ * credentials live there), and the binding needs no credentials at all. The
+ * version is activatable only when R2 itself holds a manifest that names this
+ * version and a validation report that passed.
  */
-const bindingClient = (bucket: R2Bucket) => ({
-  async get(key: string) {
-    const object = await bucket.get(key);
-    return {
-      ok: Boolean(object),
-      json: async () => (object ? JSON.parse(await object.text()) : null),
-    };
-  },
-  async putJson(key: string, value: unknown) {
-    await bucket.put(key, JSON.stringify(value), { httpMetadata: { contentType: "application/json" } });
-  },
-  async put(key: string, body: Uint8Array | ArrayBuffer | string, contentType: string) {
-    await bucket.put(key, body as ArrayBuffer, { httpMetadata: { contentType } });
-    return { etag: null };
-  },
-});
+async function verifyVersionInR2(bucket: R2Bucket, version: string): Promise<void> {
+  const manifestObject = await bucket.get(`manifests/${version}/manifest.json`);
+  if (!manifestObject) {
+    throw new Error(
+      `Version ${version} is not complete in R2: manifests/${version}/manifest.json is missing. Nothing was activated.`,
+    );
+  }
+  const manifest = (await manifestObject.json()) as { version?: string; validationPassed?: boolean };
+  if (manifest.version && manifest.version !== version) {
+    throw new Error(`manifests/${version}/manifest.json describes version ${manifest.version}. Nothing was activated.`);
+  }
+  if (manifest.validationPassed === false) {
+    throw new Error(`Version ${version} recorded a FAILED validation in R2 and cannot be activated.`);
+  }
+  const validationObject = await bucket.get(`manifests/${version}/validation.json`);
+  if (!validationObject) {
+    throw new Error(`Version ${version} has no uploaded validation report. Nothing was activated.`);
+  }
+  const validation = (await validationObject.json()) as { passed?: boolean };
+  if (validation.passed !== true) {
+    throw new Error(`Version ${version} did not pass the validation report stored in R2. Nothing was activated.`);
+  }
+}
+
+/** Flip `manifests/active.json`, preserving the current version as the rollback target. */
+async function activateVersion(bucket: R2Bucket, version: string, actor: string): Promise<string | null> {
+  let previousVersion: string | null = null;
+  const current = await bucket.get("manifests/active.json");
+  if (current) {
+    const pointer = (await current.json()) as { version?: string; previousVersion?: string | null };
+    if (pointer.version && pointer.version !== version) previousVersion = pointer.version;
+    else if (pointer.previousVersion && pointer.previousVersion !== version) previousVersion = pointer.previousVersion;
+  }
+  await bucket.put(
+    "manifests/active.json",
+    JSON.stringify({ version, previousVersion, activatedAt: new Date().toISOString(), activatedBy: actor }),
+    { httpMetadata: { contentType: "application/json" } },
+  );
+  return previousVersion;
+}
 
 /* ------------------------------- routes ---------------------------------- */
 
@@ -220,20 +251,106 @@ indexingAdmin.post("/jobs/:version/start", async (c) => {
         ]
       : ["pass2", "--version", version, "--partitions", String(partitions), ...(mode === "benchmark" ? ["--allow-bounded"] : [])];
 
-  // The DO starts the container on the first request; the response is the CLI's
-  // NDJSON stream, which the panel renders as the live log. The instance name is
-  // stable per deployment, so a second start call reaches the same container and
-  // the CLI resumes from the durable R2 checkpoint instead of starting over.
+  return startInContainer(c, args, { version, stage, partitions });
+});
+
+/**
+ * Start a stage inside the container and return immediately.
+ *
+ * A full run lasts hours, so the container is asked for `detach: true`: it spawns
+ * the CLI and answers 202. The panel follows the job through `state.json` in R2, not
+ * through a held-open HTTP response (which a Worker or the client would cut off).
+ * The instance name is stable per deployment, so a second start reaches the same
+ * container and the CLI resumes from its durable checkpoint.
+ */
+async function startInContainer(
+  c: AdminContext,
+  args: string[],
+  summary: { version: string; stage: "pass1" | "pass2"; partitions: number },
+): Promise<Response> {
+  const container = c.env.INDEXER_CONTAINER;
+  if (!container) return unavailable(c);
   const stub = container.get(container.idFromName(JOB_INSTANCE));
-  const response = await stub.fetch("http://container/job", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ args }),
-  });
-  return new Response(response.body, {
-    status: response.status,
-    headers: { "content-type": response.headers.get("content-type") ?? "application/x-ndjson", "cache-control": "no-store" },
-  });
+  try {
+    const response = await stub.fetch("http://container/job", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ args, detach: true }),
+    });
+    if (!response.ok) {
+      return c.json(
+        { error: { code: "container_rejected" as const, message: (await response.text()).slice(0, 500) } },
+        502,
+      );
+    }
+    return c.json({ started: true, ...summary }, 202);
+  } catch (error) {
+    return c.json(
+      {
+        error: {
+          code: "container_unreachable" as const,
+          message: `The indexing container did not accept the job: ${error instanceof Error ? error.message : String(error)}`,
+        },
+      },
+      502,
+    );
+  }
+}
+
+/** Panel alias: Cloud Pass 2 (`POST /api/cloud/jobs/<v>/pass2`). */
+indexingAdmin.post("/jobs/:version/pass2", async (c) => {
+  const version = sanitiseVersion(c.req.param("version"));
+  if (!version) return badRequest(c, "invalid_version", "Invalid version id.");
+  const body = (await c.req.json().catch(() => ({}))) as { confirm?: string; partitions?: number };
+  if (body.confirm !== "PASS2") return badRequest(c, "confirmation_required", 'Send confirm: "PASS2".');
+  const state = await readState(c.env, version);
+  if (!state) return notFound(c, version);
+  const control = (await readControl(c.env, version)) ?? defaultControl();
+  if (state.mode === "full" && !control.approvedFullRun) {
+    return c.json({ error: { code: "approval_required" as const, message: "A full-corpus Pass 2 requires approvedFullRun." } }, 403);
+  }
+  if (!["pass1-complete", "pass2", "paused"].includes(state.stage) && !(state.mode === "benchmark" && state.stage === "pass1")) {
+    return c.json({ error: { code: "wrong_stage" as const, message: `Pass 2 needs pass1-complete; the job is ${state.stage}.` } }, 409);
+  }
+  const partitions = Number(body.partitions ?? state.partitions ?? 256);
+  if (!Number.isInteger(partitions) || partitions < 1 || partitions > 256) {
+    return badRequest(c, "invalid_partitions", "partitions must be 1..256.");
+  }
+  const args = ["pass2", "--version", version, "--partitions", String(partitions), ...(state.mode === "benchmark" ? ["--allow-bounded"] : [])];
+  return startInContainer(c, args, { version, stage: "pass2", partitions });
+});
+
+/** Panel alias: bounded benchmark (`POST /api/cloud/jobs/benchmark`). */
+indexingAdmin.post("/jobs/benchmark", async (c) => {
+  const body = (await c.req.json().catch(() => ({}))) as {
+    confirm?: string;
+    version?: string;
+    maxSourceMb?: number;
+    partitions?: number;
+  };
+  if (body.confirm !== "BENCHMARK") return badRequest(c, "confirmation_required", 'Send confirm: "BENCHMARK".');
+  const version = sanitiseVersion(body.version);
+  if (!version) return badRequest(c, "invalid_version", "A version id is required (letters, digits, . _ -).");
+  const maxSourceMb = Number(body.maxSourceMb ?? 16);
+  const partitions = Number(body.partitions ?? 16);
+  if (!Number.isFinite(maxSourceMb) || maxSourceMb <= 0 || maxSourceMb > 256) {
+    return badRequest(c, "invalid_size", "maxSourceMb must be between 1 and 256 for a bounded benchmark.");
+  }
+  if (!Number.isInteger(partitions) || partitions < 1 || partitions > 256) {
+    return badRequest(c, "invalid_partitions", "partitions must be 1..256.");
+  }
+  // The container's `benchmark` command exists so the forecast is measured through
+  // the same chunker and segment writer a full run uses.
+  const args = [
+    "benchmark",
+    "--version",
+    version,
+    "--max-source-mb",
+    String(maxSourceMb),
+    "--partitions",
+    String(partitions),
+  ];
+  return startInContainer(c, args, { version, stage: "pass1", partitions });
 });
 
 /** Pause / resume / abort / approve — the same flags the engine checks. */
@@ -329,9 +446,8 @@ indexingAdmin.post("/jobs/:version/activate", async (c) => {
     return c.json({ error: { code: "wrong_stage" as const, message: `Version is ${state.stage}, not complete.` } }, 409);
   }
   try {
-    const client = bindingClient(c.env.COMPANY_DATA);
-    await verifyRemoteVersion(client, version);
-    const { previousVersion } = await publishVersion(version, undefined, client);
+    await verifyVersionInR2(c.env.COMPANY_DATA, version);
+    const previousVersion = await activateVersion(c.env.COMPANY_DATA, version, c.get("identity").email);
     return c.json({
       ok: true,
       version,
