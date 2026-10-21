@@ -32,6 +32,23 @@ export const CONTAINER_PORT = 8080;
 const DEFAULT_READY_TIMEOUT_MS = 60_000;
 const READY_POLL_MS = 250;
 
+/**
+ * Keeping a detached job alive.
+ *
+ * A Cloudflare Container is stopped once the Durable Object that owns it has been
+ * inactive for the inactivity timeout; without one, the platform may stop the
+ * instance shortly after the DO's last request. That is exactly what happened to
+ * staging: the Worker answered 202, the DO went idle, and the CLI was killed after
+ * its first checkpoint — no error, no heartbeat, `stage: pass1` forever.
+ *
+ * `setInactivityTimeout` is the documented keep-alive (max 6h per call). An alarm
+ * renews it while `/health` reports a running job, so the DO is active, and the
+ * timeout is extended, for as long as the job actually runs. When the job ends the
+ * renewal stops and the container sleeps normally.
+ */
+const DEFAULT_JOB_INACTIVITY_MS = 60 * 60 * 1000;
+const DEFAULT_KEEPALIVE_MS = 10 * 60 * 1000;
+
 export interface EnvWithContainer extends Env {
   /**
    * Durable Object namespace bound to `IndexerContainer`. Optional on purpose: a
@@ -44,6 +61,13 @@ export interface EnvWithContainer extends Env {
    * readiness path can be tested without waiting a minute.
    */
   CONTAINER_READY_TIMEOUT_MS?: string;
+  /**
+   * Inactivity timeout renewed while a job runs (milliseconds, default 1h, max 6h).
+   * Also not a secret; it exists so the keep-alive can be tested quickly.
+   */
+  CONTAINER_JOB_INACTIVITY_MS?: string;
+  /** How often the keep-alive alarm re-checks `/health` (milliseconds, default 10m). */
+  CONTAINER_KEEPALIVE_MS?: string;
 }
 
 export interface ContainerErrorBody {
@@ -59,13 +83,81 @@ export class IndexerContainer implements DurableObject {
   constructor(
     private readonly state: DurableObjectState,
     private readonly env: EnvWithContainer,
-  ) {}
+  ) {
+    // A redeploy restarts the DO, not necessarily the container. Restoring the
+    // inactivity timeout here keeps an already-running job from being stopped just
+    // because this instance forgot the setting.
+    const container = this.container();
+    if (container?.running) {
+      void this.state.blockConcurrencyWhile(async () => {
+        try {
+          await this.renew(container);
+        } catch {
+          // A timeout that cannot be restored is not fatal; the job keeps running
+          // until the platform's own limit, and `/health` still reports it.
+        }
+      });
+    }
+  }
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/health" && request.method === "GET") return this.forward(request);
     if (url.pathname === "/job" && request.method === "POST") return this.forward(request);
     return failure(404, "not_found", `No container route for ${request.method} ${url.pathname}.`);
+  }
+
+  /**
+   * Keep-alive alarm.
+   *
+   * Each firing is Durable Object activity, which both renews the container's
+   * inactivity window and lets the alarm re-arm itself. A job that has ended (or a
+   * container that is gone) is not renewed, so a finished benchmark stops costing
+   * container time.
+   */
+  async alarm(): Promise<void> {
+    const container = this.container();
+    if (!container?.running) return;
+    let running = false;
+    try {
+      const response = await container.getTcpPort(CONTAINER_PORT).fetch("http://container/health");
+      const body = (await response.json().catch(() => null)) as { job?: { running?: boolean } } | null;
+      running = Boolean(body?.job?.running);
+    } catch {
+      // A failed probe is not proof the job ended; keep the container's window open
+      // and try again on the next alarm.
+      running = true;
+    }
+    if (!running) return;
+    try {
+      await this.renew(container);
+    } catch {
+      return;
+    }
+    await this.state.storage.setAlarm(Date.now() + this.keepAliveMs());
+  }
+
+  /** Extend the inactivity timeout, then arm the next check if one is not pending. */
+  private async keepAlive(container: Container): Promise<void> {
+    try {
+      await this.renew(container);
+      await this.state.storage.setAlarm(Date.now() + this.keepAliveMs());
+    } catch {
+      // Keep-alive is a best effort: if the platform rejects it, the start itself
+      // must still be reported honestly (and the job resumes from its checkpoint).
+    }
+  }
+
+  private keepAliveMs(): number {
+    const configured = Number(this.env.CONTAINER_KEEPALIVE_MS ?? DEFAULT_KEEPALIVE_MS);
+    return Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_KEEPALIVE_MS;
+  }
+
+  private async renew(container: Container): Promise<void> {
+    if (typeof container.setInactivityTimeout !== "function") return;
+    const configured = Number(this.env.CONTAINER_JOB_INACTIVITY_MS ?? DEFAULT_JOB_INACTIVITY_MS);
+    const timeout = Number.isFinite(configured) && configured > 0 ? Math.min(configured, 6 * 60 * 60 * 1000) : DEFAULT_JOB_INACTIVITY_MS;
+    await container.setInactivityTimeout(timeout);
   }
 
   /**
@@ -76,6 +168,7 @@ export class IndexerContainer implements DurableObject {
    * or returns as soon as the container accepted the job, depending on the route.
    */
   private async forward(request: Request): Promise<Response> {
+    const url = new URL(request.url);
     const container = this.container();
     if (!container) {
       return failure(
@@ -109,7 +202,14 @@ export class IndexerContainer implements DurableObject {
 
     try {
       // `getTcpPort` is the typed way to reach the port the container listens on.
-      return await container.getTcpPort(CONTAINER_PORT).fetch(request);
+      const response = await container.getTcpPort(CONTAINER_PORT).fetch(request);
+      // A `/job` request that was accepted detached a long-running child. The DO
+      // may now go idle, so the container needs an inactivity window and a reason to
+      // wake up again — otherwise the platform stops it mid-run.
+      if (url.pathname === "/job" && (response.status === 202 || response.status === 200)) {
+        await this.keepAlive(container);
+      }
+      return response;
     } catch (error) {
       return failure(
         503,

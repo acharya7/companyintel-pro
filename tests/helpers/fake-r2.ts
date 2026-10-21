@@ -214,23 +214,54 @@ export class FakeR2Bucket {
     this.objects.delete(key);
   }
 
-  async list(options: { prefix: string; limit?: number; cursor?: string }): Promise<unknown> {
+  /**
+   * `list`, including R2's `/` delimiter.
+   *
+   * A delimited listing returns each directory once (`delimitedPrefixes`) instead of
+   * every key below it. That is what lets the admin job listing stay complete for a
+   * job with thousands of segment objects: the directory is one entry, and the
+   * objects below it are never returned. Both objects and prefixes count toward
+   * `limit` and the cursor, as they do in R2.
+   */
+  async list(options: { prefix: string; limit?: number; cursor?: string; delimiter?: string }): Promise<unknown> {
     this.counters.lists += 1;
     const limit = options.limit ?? 1000;
+    const delimiter = options.delimiter;
+    const entries: ({ kind: "object"; key: string; value: StoredObject } | { kind: "prefix"; key: string })[] = [];
+    const seenPrefixes = new Set<string>();
     const all = [...this.objects.entries()]
       .filter(([key]) => key.startsWith(options.prefix))
       .sort((a, b) => a[0].localeCompare(b[0]));
+    for (const [key, value] of all) {
+      if (delimiter) {
+        const relative = key.slice(options.prefix.length);
+        const at = relative.indexOf(delimiter);
+        if (at !== -1) {
+          const prefix = `${options.prefix}${relative.slice(0, at + delimiter.length)}`;
+          if (!seenPrefixes.has(prefix)) {
+            seenPrefixes.add(prefix);
+            entries.push({ kind: "prefix", key: prefix });
+          }
+          continue;
+        }
+      }
+      entries.push({ kind: "object", key, value });
+    }
+    entries.sort((a, b) => a.key.localeCompare(b.key));
     const start = options.cursor ? Number(options.cursor) : 0;
-    const page = all.slice(start, start + limit);
-    const truncated = start + page.length < all.length;
+    const page = entries.slice(start, start + limit);
+    const truncated = start + page.length < entries.length;
     return {
-      objects: page.map(([key, value]) => ({
-        key,
-        etag: value.etag,
-        size: value.bytes.length,
-        uploaded: value.uploaded,
-        httpMetadata: {},
-      })),
+      objects: page
+        .filter((entry): entry is { kind: "object"; key: string; value: StoredObject } => entry.kind === "object")
+        .map((entry) => ({
+          key: entry.key,
+          etag: entry.value.etag,
+          size: entry.value.bytes.length,
+          uploaded: entry.value.uploaded,
+          httpMetadata: {},
+        })),
+      delimitedPrefixes: page.filter((entry) => entry.kind === "prefix").map((entry) => entry.key),
       truncated,
       cursor: truncated ? String(start + page.length) : undefined,
     };

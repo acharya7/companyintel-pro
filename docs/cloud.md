@@ -11,7 +11,7 @@ browser ── /indexing (control panel)
              │  state / pause / abort
              ▼
       R2  cloud/jobs/<version>/
-             ▲   state.json · control.json · schema.json
+             ▲   state.json · control.json · schema.json · run.json (heartbeat)
              │   checkpoints/<source>.json · chunks/<source>/<n>.json
              │   segments/<source>/<chunk>/part-<partition>.jsonl.gz
              │
@@ -39,7 +39,9 @@ browser ── /indexing (control panel)
    checkpoint. Segments are re-read and SHA-256-checked after upload.
 4. A restart reads the checkpoint and continues at the exact byte/line offset. A chunk
    that was interrupted before its checkpoint is simply re-read; keys are deterministic,
-   so nothing is duplicated.
+   so nothing is duplicated. A separate `bun tools/cloud/cli.ts interrupt` command lets the
+   container record a stop it observed but the CLI could not. See "Keep-alive,
+   interruption and resume" below.
 5. `pause` and `abort` are objects in R2, checked before every chunk.
 
 **Pass 2 is now cloud-native.** `tools/cloud/pass2.ts` runs the production merge from
@@ -290,6 +292,35 @@ the same code — never a false success.
 The Durable Object waits for `/health` to answer 200 before proxying (`CONTAINER_READY_TIMEOUT_MS`,
 default 60 s) and answers `503 container_not_ready` with the last probe error instead of a
 bare 502 during a cold start.
+
+### Keep-alive, interruption and resume
+
+A detached job is a grandchild of the container's main process, and Cloudflare stops a
+container once its Durable Object has been inactive for the inactivity timeout — sending
+SIGTERM to the **main process only**. That combination is why the first live staging run
+stopped after csv2's first chunk: the Worker had answered `202`, the DO went idle, the
+instance was stopped, and nothing in R2 recorded it.
+
+| Piece | What it does |
+| --- | --- |
+| `ctx.container.setInactivityTimeout()` | Set when `/job` is accepted (default 1 h, max 6 h, `CONTAINER_JOB_INACTIVITY_MS`) and restored in the DO constructor if the container is already running. |
+| DO alarm (`CONTAINER_KEEPALIVE_MS`, default 10 min) | Each firing is DO activity: it renews the timeout **only** while the runner's `/health` reports `job.running`, then re-arms. A finished job stops renewing, so it stops costing container time. |
+| Runner signal handling | SIGTERM/SIGINT is forwarded to the detached child, which stops at the next chunk boundary (`JOB_STOP_GRACE_MS`, 90 s). If it does not exit, it is ended forcibly and the stop is recorded as `terminated`. |
+| `cloud/jobs/<version>/run.json` | One object per attempt: `running` with a heartbeat after every committed chunk/partition, then `completed`, `failed`, `interrupted` or `terminated` with a reason, pid, exit code and signal. Written by the CLI; the runner fills it in when the CLI could not. |
+| `bun tools/cloud/cli.ts interrupt --version <v> --reason <text>` | Idempotent writer used by the runner on a stop or a non-zero child exit. It publishes the durable checkpoints' progress into `state.json`, appends the reason to `errors[]`, sets `interruption` and leaves the job `paused` so it can be resumed — it never relabels a finished job. |
+
+`state.json` is written after each checkpoint, so a process stopped in that window could leave
+the state one chunk behind. The engine now publishes each checkpoint's progress into the
+state before reading on, and `interrupt` reconciles from checkpoints — progress only ever
+moves forward, and a resume never re-reads a committed chunk (segment keys are
+deterministic).
+
+`GET /api/cloud/jobs` lists job directories with R2's `/` delimiter, so a job with thousands
+of segments is found in one delimited listing (bounded to 5 pages / 25 rendered jobs, with
+`truncated: true`). Each entry carries `state`, `control`, `run` and a `warning`:
+`stale` when an in-flight stage has had no heartbeat for 3 minutes, or the explicit
+`failed` / `interrupted` / `terminated` reason. The panel renders that warning — a stopped
+Pass 1 can no longer look like a slow one.
 
 Deploying it as a Cloudflare Container is configured in `wrangler.toml`
 (`[[containers]]`, the `INDEXER_CONTAINER` Durable Object binding and migration) and

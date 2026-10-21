@@ -2,8 +2,8 @@
 /**
  * CompanyIntel deploy wrapper: verify runtime settings, then deploy.
  *
- *   bun scripts/deploy.mjs staging            # wrangler deploy -c wrangler.staging.toml
- *   bun scripts/deploy.mjs production         # wrangler deploy
+ *   bun scripts/deploy.mjs staging            # wrangler deploy -c wrangler.staging.toml --keep-vars
+ *   bun scripts/deploy.mjs production         # wrangler deploy -c wrangler.toml --keep-vars
  *   bun scripts/deploy.mjs staging --check    # settings only, no deploy
  *
  * Why this exists
@@ -111,7 +111,15 @@ if (checkOnly) {
   process.exit(0);
 }
 
-const deploy = spawnSync(bunBin, ["x", "wrangler", "deploy", "-c", configPath], { cwd: root, stdio: "inherit", env: process.env });
+// `--keep-vars` keeps the dashboard-managed `[vars]` on the deployed Worker. Without
+// it, a deploy built from a commit that lags the dashboard can clear them, and the
+// deployed Worker comes up missing STAGING_MODE / ACTIVE_MANIFEST_KEY / the budget —
+// silently losing staging isolation. It is part of the configured deploy command.
+const deploy = spawnSync(bunBin, ["x", "wrangler", "deploy", "-c", configPath, "--keep-vars"], {
+  cwd: root,
+  stdio: "inherit",
+  env: process.env,
+});
 if (deploy.error) {
   console.error(`[deploy] could not run wrangler: ${deploy.error.message}`);
   process.exit(1);

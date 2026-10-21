@@ -139,6 +139,22 @@ describe("admin start routes report container failures honestly", () => {
     expect(response.body.stage).toBe("pass1");
   });
 
+  test("a second start while a job runs stays a 409, not a 502", async () => {
+    const response = await benchmark(
+      envWithContainer(
+        () =>
+          jsonResponse(409, {
+            error: { code: "job_already_running", message: "A job is already running (pid 42, benchmark --version other)." },
+          }),
+        [],
+      ),
+    );
+    expect(response.status).toBe(409);
+    expect((response.body.error as { code: string }).code).toBe("job_already_running");
+    expect((response.body.error as { message: string }).message).toContain("already running");
+    expect(response.body.started).toBeUndefined();
+  });
+
   test("an unreachable container is a JSON 502, not an unhandled error", async () => {
     const response = await benchmark(
       envWithContainer(() => {

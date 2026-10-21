@@ -38,12 +38,16 @@ const repo = resolve(import.meta.dir, "..");
 interface FakeR2 {
   endpoint: string;
   objects: Map<string, Buffer>;
+  /** Artificial latency per request, so a test can stop a run while it is mid-chunk. */
+  delayMs: number;
   close(): Promise<void>;
 }
 
 async function startFakeR2(seed: Record<string, string>): Promise<FakeR2> {
   const objects = new Map<string, Buffer>(Object.entries(seed).map(([key, value]) => [key, Buffer.from(value, "utf8")]));
-  const server: Server = createServer((request, response) => {
+  let delayMs = 0;
+  const server: Server = createServer(async (request, response) => {
+    if (delayMs) await new Promise((sleep) => setTimeout(sleep, delayMs));
     const url = new URL(request.url ?? "/", "http://stub");
     // /<bucket>/<key...>
     const parts = url.pathname.split("/").filter(Boolean);
@@ -105,6 +109,12 @@ async function startFakeR2(seed: Record<string, string>): Promise<FakeR2> {
   return {
     endpoint: `http://127.0.0.1:${port}`,
     objects,
+    get delayMs() {
+      return delayMs;
+    },
+    set delayMs(value: number) {
+      delayMs = value;
+    },
     close: () => new Promise<void>((done) => server.close(() => done())),
   };
 }
@@ -155,10 +165,10 @@ function makeImageRoot(options: { withTools?: boolean } = {}): string {
   return root;
 }
 
-function seedSources(): Record<string, string> {
+function seedSources(count = 40): Record<string, string> {
   const companies = ["organization_id\torganization_name\torganization_domain"];
   const people = ["person_name\torganization_name\tperson_title"];
-  for (let index = 0; index < 40; index += 1) {
+  for (let index = 0; index < count; index += 1) {
     companies.push(`c${index}\tAcme ${index}\tacme${index}.example`);
     people.push(`Person ${index}\tAcme ${index}\tEngineer`);
   }
@@ -370,6 +380,86 @@ describe("cloud/runner.mjs (image layout, real CLI, stub R2)", () => {
       await runner.stop();
     }
   }, 30_000);
+
+  test("SIGTERM stops the job at a chunk boundary, records the reason, and the same version resumes", async () => {
+    // The staging failure: the container was stopped mid-run, nothing observed it, and
+    // state.json stayed on `stage: pass1` with no reason. The runner now forwards
+    // SIGTERM to the detached CLI, waits for its boundary exit, and records the stop.
+    const fake = await startFakeR2(seedSources(1_200));
+    // Latency makes the run long enough to be interrupted deterministically, and
+    // proves the stop waits for a chunk instead of corrupting one.
+    fake.delayMs = 250;
+    const root = makeImageRoot();
+    const runtimeEnv = cleanEnv({
+      R2_ACCOUNT_ID: "test-account",
+      R2_ACCESS_KEY_ID: "AKIDTEST",
+      R2_SECRET_ACCESS_KEY: "secret-test",
+      R2_ENDPOINT_URL: fake.endpoint,
+      R2_BUCKET_NAME: "company-intel-data",
+      JOB_STOP_GRACE_MS: "30000",
+    });
+    const version = "stg-sigterm-test";
+    const args = [
+      "benchmark",
+      "--version",
+      version,
+      "--config",
+      "tools/indexer/indexer.runner-test.json",
+      "--max-source-mb",
+      "8",
+      "--partitions",
+      "2",
+      "--chunk-mb",
+      "1",
+    ];
+
+    let runner = await startRunner(root, runtimeEnv);
+    try {
+      const started = await postJob(runner, args);
+      expect([200, 202]).toContain(started.status);
+      await waitFor(() => fake.objects.get(`cloud/jobs/${version}/state.json`) ?? null);
+
+      runner.child.kill("SIGTERM");
+      const exited = await waitFor(() => (runner.child.exitCode !== null || runner.child.signalCode !== null ? true : null), 60_000);
+      expect(exited).toBe(true);
+
+      const runStatus = JSON.parse(
+        await waitFor(() => fake.objects.get(`cloud/jobs/${version}/run.json`) ?? null),
+      ) as { outcome: string; reason?: string; recordedBy: string };
+      expect(["interrupted", "terminated"]).toContain(runStatus.outcome);
+      expect(runStatus.reason ?? "").toMatch(/SIGTERM/);
+
+      const stoppedState = JSON.parse(
+        (await waitFor(() => fake.objects.get(`cloud/jobs/${version}/state.json`) ?? null)).toString("utf8"),
+      ) as { stage: string; interruption?: { outcome: string; reason: string }; errors: { message: string }[] };
+      expect(stoppedState.stage).toBe("paused");
+      expect(stoppedState.interruption?.reason ?? stoppedState.errors.at(-1)?.message ?? "").toMatch(/SIGTERM/);
+
+      // Resume the same version with a new container process: it continues from the
+      // durable checkpoint and reaches the same totals, with no duplicated work.
+      fake.delayMs = 0;
+      runner = await startRunner(root, runtimeEnv);
+      const resumed = await postJob(runner, args);
+      expect([200, 202]).toContain(resumed.status);
+      const finished = await waitFor(() => {
+        const body = fake.objects.get(`cloud/jobs/${version}/state.json`);
+        if (!body) return null;
+        const parsed = JSON.parse(body.toString("utf8")) as { stage: string; totals: { rowsRead: number } };
+        return parsed.stage === "pass1-complete" ? parsed : null;
+      });
+      expect(finished.totals.rowsRead).toBe(2_400);
+      const finalRun = await waitFor(() => {
+        const body = fake.objects.get(`cloud/jobs/${version}/run.json`);
+        if (!body) return null;
+        const parsed = JSON.parse(body.toString("utf8")) as { outcome: string };
+        return parsed.outcome !== "running" ? parsed : null;
+      });
+      expect(finalRun.outcome).toBe("completed");
+    } finally {
+      await runner.stop();
+      await fake.close();
+    }
+  }, 180_000);
 
   test("a container whose image lost tools/ reports 503 instead of accepting jobs", async () => {
     const root = makeImageRoot({ withTools: false });

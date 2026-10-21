@@ -33,15 +33,78 @@ import {
   cloudKeys,
   type CloudControl,
   type CloudJobState,
+  type CloudRunStatus,
 } from "../../src/shared/cloud/types";
 
 import { assembleRun } from "./assemble";
 import { forecast, type BenchmarkMeasurement } from "./cost";
-import { cloudSourcesFromConfig, runPass1, verifyRun } from "./pass1";
+import { cloudSourcesFromConfig, runPass1, syncStateFromCheckpoints, verifyRun } from "./pass1";
 import { runCloudPass2 } from "./pass2";
 import { R2BlobStore } from "./store";
 
 const root = resolve(dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "../..");
+
+/**
+ * A stop request from the platform (or an operator's Ctrl-C).
+ *
+ * The handler only records the reason; the engine asks `shouldStop()` at the next
+ * chunk/partition boundary and exits cleanly. That matters because Cloudflare stops
+ * a container with SIGTERM to its main process and then SIGKILLs the process tree —
+ * without this the CLI dies between `putJson(checkpoint)` and `putJson(state)` and
+ * R2 keeps a job that looks like it is still working.
+ */
+const stopRequest = { reason: null as string | null };
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.on(signal, () => {
+    stopRequest.reason ??= `the container received ${signal}; the job stopped at the last committed chunk`;
+  });
+}
+
+/** Start a run attempt in `run.json` (the panel's proof of life). */
+async function beginRun(store: R2BlobStore, id: string, stage: "pass1" | "pass2"): Promise<CloudRunStatus> {
+  const previous = await store.getJson<CloudRunStatus>(cloudKeys.runStatus(id));
+  const at = new Date().toISOString();
+  const status: CloudRunStatus = {
+    version: id,
+    stage,
+    outcome: "running",
+    attempt: (previous?.attempt ?? 0) + 1,
+    recordedBy: "cli",
+    startedAt: at,
+    heartbeatAt: at,
+    pid: process.pid,
+  };
+  await store.putJson(cloudKeys.runStatus(id), status);
+  return status;
+}
+
+async function touchRun(store: R2BlobStore, status: CloudRunStatus): Promise<void> {
+  status.heartbeatAt = new Date().toISOString();
+  await store.putJson(cloudKeys.runStatus(status.version), status);
+}
+
+async function finishRun(
+  store: R2BlobStore,
+  status: CloudRunStatus,
+  outcome: CloudRunStatus["outcome"],
+  reason?: string,
+  detail?: string,
+): Promise<void> {
+  const at = new Date().toISOString();
+  await store.putJson(cloudKeys.runStatus(status.version), {
+    ...status,
+    outcome,
+    heartbeatAt: at,
+    reason,
+    detail,
+    exitCode: outcome === "completed" ? 0 : typeof process.exitCode === "number" ? process.exitCode : null,
+  } satisfies CloudRunStatus);
+}
+
+/** Map a Pass 1 stop reason onto the run outcome the panel shows. */
+function outcomeFor(stopped: "complete" | "paused" | "aborted" | "bounded" | "interrupted"): CloudRunStatus["outcome"] {
+  return stopped === "complete" || stopped === "bounded" ? "completed" : "interrupted";
+}
 
 function flag(name: string): string | true | null {
   const argv = process.argv.slice(2);
@@ -141,16 +204,31 @@ async function runCommand(store: R2BlobStore): Promise<void> {
   if (maxMb === null && partitions !== config.partitions) {
     throw new Error(`--partitions must equal the configured ${config.partitions} for a full run; it exists for bounded benchmarks only.`);
   }
-  const result = await runPass1({
+  const run = await beginRun(store, id, "pass1");
+  let result;
+  try {
+    result = await runPass1({
+      store,
+      version: id,
+      sources,
+      partitions,
+      chunkBytes: (num("chunk-mb") ?? 128) * 1024 * 1024,
+      maxSourceBytes: maxMb === null ? undefined : maxMb * 1024 * 1024,
+      mode: maxMb === null ? "full" : "benchmark",
+      onLog: (line) => console.log(`  ${line}`),
+      shouldStop: () => stopRequest.reason,
+      heartbeat: () => touchRun(store, run),
+    });
+  } catch (error) {
+    await finishRun(store, run, "failed", error instanceof Error ? error.message : String(error)).catch(() => {});
+    throw error;
+  }
+  await finishRun(
     store,
-    version: id,
-    sources,
-    partitions,
-    chunkBytes: (num("chunk-mb") ?? 128) * 1024 * 1024,
-    maxSourceBytes: maxMb === null ? undefined : maxMb * 1024 * 1024,
-    mode: maxMb === null ? "full" : "benchmark",
-    onLog: (line) => console.log(`  ${line}`),
-  });
+    run,
+    outcomeFor(result.stopped),
+    result.stopped === "complete" || result.stopped === "bounded" ? undefined : (result.state.interruption?.reason ?? result.state.note),
+  );
   console.log(`\nStage: ${result.state.stage} · ${result.stopped}`);
   printState(result.state);
   if (maxMb === null && result.stopped === "complete") {
@@ -171,16 +249,31 @@ async function benchmark(store: R2BlobStore): Promise<void> {
   const benchPartitions = num("partitions") ?? config.partitions;
   const partitionScale = config.partitions / benchPartitions;
 
-  const result = await runPass1({
+  const run = await beginRun(store, id, "pass1");
+  let result;
+  try {
+    result = await runPass1({
+      store,
+      version: id,
+      sources,
+      partitions: benchPartitions,
+      chunkBytes: (num("chunk-mb") ?? 32) * 1024 * 1024,
+      maxSourceBytes: maxMb * 1024 * 1024,
+      mode: "benchmark",
+      onLog: (line) => console.log(`  ${line}`),
+      shouldStop: () => stopRequest.reason,
+      heartbeat: () => touchRun(store, run),
+    });
+  } catch (error) {
+    await finishRun(store, run, "failed", error instanceof Error ? error.message : String(error)).catch(() => {});
+    throw error;
+  }
+  await finishRun(
     store,
-    version: id,
-    sources,
-    partitions: benchPartitions,
-    chunkBytes: (num("chunk-mb") ?? 32) * 1024 * 1024,
-    maxSourceBytes: maxMb * 1024 * 1024,
-    mode: "benchmark",
-    onLog: (line) => console.log(`  ${line}`),
-  });
+    run,
+    outcomeFor(result.stopped),
+    result.stopped === "complete" || result.stopped === "bounded" ? undefined : (result.state.interruption?.reason ?? result.state.note),
+  );
   const seconds = Math.max(0.001, (Date.now() - started) / 1000);
   const after = store.countersSnapshot();
 
@@ -343,6 +436,75 @@ async function control(store: R2BlobStore, action: "pause" | "resume" | "abort" 
   console.log(`control.json for ${id}: pause=${next.pause} abort=${next.abort} approvedFullRun=${next.approvedFullRun}`);
 }
 
+/**
+ * Record that a run stopped, from outside the process that stopped.
+ *
+ * Used by `cloud/runner.mjs` when the container is being stopped (SIGTERM) or when
+ * the child exits non-zero without the CLI having recorded anything. It writes both
+ * `run.json` and, for the first observation, the job state, so an interrupted Pass 1
+ * can never be displayed as a job that is still working.
+ *
+ * Idempotent: once a terminal outcome is recorded (`failed`, `interrupted`,
+ * `terminated`), a second call only fills in the process exit details and never
+ * appends a second error or relabels a finished job.
+ */
+async function interrupt(store: R2BlobStore): Promise<void> {
+  const id = version();
+  const reasonValue = flag("reason");
+  const reason = typeof reasonValue === "string" && reasonValue.trim() ? reasonValue.trim() : "the run stopped without reporting a reason";
+  const outcomeValue = flag("outcome");
+  const outcome: "failed" | "interrupted" | "terminated" =
+    outcomeValue === "failed" || outcomeValue === "terminated" ? outcomeValue : "interrupted";
+  const exitCode = num("exit-code");
+  const signalValue = flag("signal");
+  const signal = typeof signalValue === "string" ? signalValue : null;
+  const detailValue = flag("detail");
+  const detail = typeof detailValue === "string" ? detailValue.slice(-800) : undefined;
+
+  const at = new Date().toISOString();
+  const existing = await store.getJson<CloudRunStatus>(cloudKeys.runStatus(id));
+  const alreadyTerminal = Boolean(existing && existing.outcome !== "running");
+  const next: CloudRunStatus = {
+    version: id,
+    stage: existing?.stage ?? (flag("stage") === "pass2" ? "pass2" : "pass1"),
+    outcome: alreadyTerminal ? existing!.outcome : outcome,
+    attempt: existing?.attempt ?? 1,
+    recordedBy: "runner",
+    startedAt: existing?.startedAt ?? at,
+    heartbeatAt: existing?.heartbeatAt ?? at,
+    pid: existing?.pid ?? null,
+    exitCode: exitCode ?? existing?.exitCode ?? null,
+    signal: signal ?? existing?.signal ?? null,
+    reason: alreadyTerminal ? existing!.reason : reason,
+    detail: alreadyTerminal ? (existing!.detail ?? detail) : detail,
+  };
+  await store.putJson(cloudKeys.runStatus(id), next);
+  console.log(`run.json for ${id}: ${next.outcome} (${next.reason})`);
+
+  const state = await store.getJson<CloudJobState>(cloudKeys.state(id));
+  if (!state) return;
+  // The checkpoint is the last committed truth; state.json can lag it by the one
+  // chunk that was in flight. Publish it even when the outcome was already recorded
+  // (a second call must not append a second error, but the progress is still real).
+  const repaired = await syncStateFromCheckpoints(store, state);
+  if (alreadyTerminal) {
+    if (repaired) await store.putJson(cloudKeys.state(id), state);
+    return;
+  }
+  // Never rewrite a job that already finished or was deliberately stopped: this
+  // command only describes an attempt that vanished while a stage was in flight.
+  if (!["preflight", "pass1", "pass2", "assembling", "verify", "paused"].includes(state.stage)) {
+    if (repaired) await store.putJson(cloudKeys.state(id), state);
+    return;
+  }
+  state.updatedAt = at;
+  state.errors = [...state.errors, { at, stage: state.stage, message: reason }].slice(-10);
+  state.interruption = { at, outcome, reason, detail };
+  state.note = `${reason}. Every committed chunk is checkpointed in R2; start the same version again to resume.`;
+  state.stage = "paused";
+  await store.putJson(cloudKeys.state(id), state);
+}
+
 async function assemble(store: R2BlobStore): Promise<void> {
   const id = version();
   const { config } = loadConfig();
@@ -382,17 +544,33 @@ async function pass2(store: R2BlobStore): Promise<void> {
   console.log(`  scratch                ${workDir} (one partition at a time)`);
   const before = store.countersSnapshot();
   const started = Date.now();
-  const result = await runCloudPass2({
+  const run = await beginRun(store, id, "pass2");
+  let result;
+  try {
+    result = await runCloudPass2({
+      store,
+      version: id,
+      config: { ...config, partitions, datasetVersion: id },
+      workDir,
+      allowBounded: Boolean(flag("allow-bounded")),
+      onLog: (line) => console.log(`  ${line}`),
+      onProgress: (event) => {
+        if (event.stage === "pass2-merge" || event.stage === "validating") console.log(`  [${event.stage}] ${event.message}`);
+        // One heartbeat per partition boundary: a Pass 2 that is killed is visible
+        // as a stale run instead of an indefinitely "merging" job.
+        if (event.stage === "pass2-merge") void touchRun(store, run);
+      },
+    });
+  } catch (error) {
+    await finishRun(store, run, "failed", error instanceof Error ? error.message : String(error)).catch(() => {});
+    throw error;
+  }
+  await finishRun(
     store,
-    version: id,
-    config: { ...config, partitions, datasetVersion: id },
-    workDir,
-    allowBounded: Boolean(flag("allow-bounded")),
-    onLog: (line) => console.log(`  ${line}`),
-    onProgress: (event) => {
-      if (event.stage === "pass2-merge" || event.stage === "validating") console.log(`  [${event.stage}] ${event.message}`);
-    },
-  });
+    run,
+    result.stopped === "complete" ? "completed" : "interrupted",
+    result.stopped === "complete" ? undefined : result.state.interruption?.reason ?? result.state.note,
+  );
   const after = store.countersSnapshot();
   const seconds = (Date.now() - started) / 1000;
   console.log("\nCloud Pass 2 result");
@@ -434,6 +612,7 @@ async function main(): Promise<void> {
         "  status    --version <id> [--json]",
         "  jobs      [--json]",
         "  pause | resume | abort | approve --version <id>",
+        "  interrupt --version <id> --reason <text> [--outcome failed|interrupted|terminated] [--exit-code <n>] [--signal <s>]",
         "  verify    --version <id> --config <cfg>",
         "  pass2     --version <id> --config <cfg> [--partitions <n>] [--work-dir <dir>] [--allow-bounded]",
         "  assemble  --version <id> [--work-dir <dir>] [--partitions <n>]",
@@ -452,6 +631,7 @@ async function main(): Promise<void> {
   if (command === "verify") return verify(store);
   if (command === "assemble") return assemble(store);
   if (command === "pass2") return pass2(store);
+  if (command === "interrupt") return interrupt(store);
   if (command === "pause" || command === "resume" || command === "abort" || command === "approve") return control(store, command);
   throw new Error(`Unknown command: ${command}`);
 }

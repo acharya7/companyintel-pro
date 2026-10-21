@@ -36,6 +36,7 @@ import {
   cloudKeys,
   type CloudControl,
   type CloudJobState,
+  type CloudRunStatus,
 } from "../../src/shared/cloud/types";
 import { verifyAccess, AccessError } from "./access";
 import type { AccessIdentity } from "./env";
@@ -160,25 +161,120 @@ async function writeControl(env: EnvWithContainer, version: string, control: Clo
 }
 
 const STATE_PREFIX = `${cloudKeys.jobRoot("")}`.replace(/\/$/, "");
+/** A job directory listing page is one Class A op; 5 pages is 5,000 version dirs. */
+const MAX_JOB_PAGES = 5;
+/** Most recent jobs the panel renders (each is 2 small GETs: state + control). */
+const MAX_JOBS = 25;
+/** A live job writes `state.json` (or a heartbeat) at every chunk; 3 min is well past that. */
+const STALE_AFTER_MS = 180_000;
+const IN_FLIGHT_STAGES = new Set<CloudJobState["stage"]>(["preflight", "pass1", "pass2", "assembling", "verify"]);
 
-/** Every job's durable state, newest first. Listing `cloud/jobs/` is one Class A op. */
-async function listJobs(env: EnvWithContainer): Promise<{ state: CloudJobState; control: CloudControl | null }[]> {
-  const listed = await env.COMPANY_DATA.list({ prefix: `${STATE_PREFIX}/`, limit: 200 });
-  const keys = listed.objects
-    .map((object) => object.key)
-    .filter((key) => key.endsWith("/state.json"))
-    // Staging shows its own jobs only: a production job id has no `stg-` prefix.
-    .filter((key) => !isStaging(env) || key.startsWith(`${STATE_PREFIX}/stg-`));
+export interface JobWarning {
+  kind: "failed" | "interrupted" | "terminated" | "stale";
+  since: string;
+  reason: string;
+}
+
+export interface JobListing {
+  state: CloudJobState;
+  control: CloudControl | null;
+  /** Last attempt (run.json). Null for a job written before heartbeats existed. */
+  run: CloudRunStatus | null;
+  /** Non-null when this job is not running and the reason is known (or overdue). */
+  warning: JobWarning | null;
+}
+
+/**
+ * List job version directories, never their contents.
+ *
+ * The previous version listed `cloud/jobs/` with a single 200-key page and kept only
+ * `…/state.json`. A real job writes hundreds of chunk manifests and thousands of
+ * segments under the same prefix, and those keys sort BEFORE `state.json`, so the one
+ * page was full of segments and the job never appeared: staging reported
+ * `{"jobs":[]}` while `state.json` existed. Using the `/` delimiter returns only the
+ * version directories (one entry per job), so the listing is complete regardless of
+ * how many objects a job has, and it never reads a segment.
+ */
+async function listJobVersions(env: EnvWithContainer): Promise<{ versions: string[]; truncated: boolean }> {
+  const versions: string[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < MAX_JOB_PAGES; page += 1) {
+    const options: R2ListOptions = { prefix: `${STATE_PREFIX}/`, delimiter: "/", limit: 1000 };
+    if (cursor) options.cursor = cursor;
+    const listed = await env.COMPANY_DATA.list(options);
+    for (const prefix of listed.delimitedPrefixes ?? []) {
+      const version = prefix.slice(STATE_PREFIX.length + 1).replace(/\/$/, "");
+      if (!version) continue;
+      // Staging shows its own jobs only: a production job id has no `stg-` prefix.
+      if (isStaging(env) && !version.startsWith("stg-")) continue;
+      versions.push(version);
+    }
+    cursor = listed.truncated ? listed.cursor : undefined;
+    if (!cursor) break;
+  }
+  // Version ids are date-stamped by convention, so the newest directory first; the
+  // final order is by `updatedAt` once each state object has been read.
+  versions.sort((a, b) => b.localeCompare(a));
+  return { versions: versions.slice(0, MAX_JOBS), truncated: Boolean(cursor) || versions.length > MAX_JOBS };
+}
+
+/**
+ * Why a job is not advancing.
+ *
+ * A detached job's only proof of life is its heartbeat, so a job whose stage is in
+ * flight and whose last heartbeat is old is reported as stopped — never as "still
+ * running". An explicit interruption (written by the CLI on failure or by the
+ * container runner when a stop killed it) takes precedence.
+ */
+export function warningFor(state: CloudJobState, run: CloudRunStatus | null, nowMs: number): JobWarning | null {
+  if (!IN_FLIGHT_STAGES.has(state.stage)) return null;
+  const terminalRun = run && run.outcome !== "running" ? run : null;
+  if (terminalRun) {
+    return {
+      kind: terminalRun.outcome as JobWarning["kind"],
+      since: terminalRun.heartbeatAt,
+      reason: terminalRun.reason ?? `The run ended (${terminalRun.outcome}) without a recorded reason.`,
+    };
+  }
+  if (state.interruption) {
+    return { kind: state.interruption.outcome, since: state.interruption.at, reason: state.interruption.reason };
+  }
+  const heartbeat = run?.heartbeatAt ?? state.updatedAt;
+  const age = nowMs - Date.parse(heartbeat);
+  if (!Number.isFinite(age) || age <= STALE_AFTER_MS) return null;
+  return {
+    kind: "stale",
+    since: heartbeat,
+    reason:
+      `No progress for ${Math.round(age / 60_000)} min. The run stopped without recording a reason ` +
+      `(the container was probably stopped). Every committed chunk is in R2; start the same version to resume.`,
+  };
+}
+
+/** Every job's durable state, newest first. One delimited listing, then small GETs. */
+async function listJobs(env: EnvWithContainer): Promise<{ jobs: JobListing[]; truncated: boolean }> {
+  const { versions, truncated } = await listJobVersions(env);
+  const nowMs = Date.now();
   const jobs = await Promise.all(
-    keys.map(async (key) => {
-      const object = await env.COMPANY_DATA.get(key);
+    versions.map(async (version): Promise<JobListing | null> => {
+      const object = await env.COMPANY_DATA.get(cloudKeys.state(version));
       if (!object) return null;
       const state = (await object.json()) as CloudJobState;
-      return { state, control: await readControl(env, state.version) };
+      const [control, run] = await Promise.all([readControl(env, version), readRunStatus(env, version)]);
+      return { state, control, run, warning: warningFor(state, run, nowMs) };
     }),
   );
-  return jobs.filter((job): job is { state: CloudJobState; control: CloudControl | null } => job !== null)
-    .sort((a, b) => (b.state.updatedAt ?? "").localeCompare(a.state.updatedAt ?? ""));
+  return {
+    jobs: jobs
+      .filter((job): job is JobListing => job !== null)
+      .sort((a, b) => (b.state.updatedAt ?? "").localeCompare(a.state.updatedAt ?? "")),
+    truncated,
+  };
+}
+
+async function readRunStatus(env: EnvWithContainer, version: string): Promise<CloudRunStatus | null> {
+  const object = await env.COMPANY_DATA.get(cloudKeys.runStatus(version));
+  return object ? ((await object.json()) as CloudRunStatus) : null;
 }
 
 /**
@@ -235,9 +331,12 @@ async function activateVersion(bucket: R2Bucket, activeKey: string, version: str
 
 /** All jobs, plus the bucket the panel is reading. */
 indexingAdmin.get("/jobs", async (c) => {
-  const jobs = await listJobs(c.env);
+  const { jobs, truncated } = await listJobs(c.env);
   return c.json({
     jobs,
+    // True when the deployment holds more job directories than one panel page shows;
+    // the panel says so instead of silently looking complete.
+    truncated,
     containerBound: Boolean(c.env.INDEXER_CONTAINER),
     // The panel shows the isolation rules when this is a staging deployment, so an
     // operator is never unsure whether they are looking at production state.
@@ -384,9 +483,13 @@ async function startInContainer(
     if (!response.ok) {
       const code = payload?.error?.code ?? "container_rejected";
       const message = payload?.error?.message ?? `The indexing container rejected the job (HTTP ${response.status}).`;
+      // 409 is the runner refusing because another job is already running. Passing
+      // that through (rather than a generic 502) makes a duplicate start visible as
+      // a duplicate instead of looking like a broken container.
+      const status = response.status === 503 ? 503 : response.status === 409 ? 409 : 502;
       return c.json(
         { error: { code, message, ...(payload?.error?.detail ? { detail: payload.error.detail } : {}) } },
-        response.status === 503 ? 503 : 502,
+        status,
       );
     }
     if (payload?.started === false) {

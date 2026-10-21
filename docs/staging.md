@@ -124,14 +124,14 @@ connecting the repository first, then choosing the Worker name):
 | --- | --- |
 | Root directory | `/` (the repository root) |
 | Build command | `bun install --frozen-lockfile && bun run verify && bun run build` |
-| Deploy command | `bun scripts/deploy.mjs staging` (verifies the seven runtime settings first, then runs `wrangler deploy -c wrangler.staging.toml`) |
+| Deploy command | `bun scripts/deploy.mjs staging` (verifies the seven runtime settings first, then runs `wrangler deploy -c wrangler.staging.toml --keep-vars`) |
 | Non-production deploy command | leave empty / `bunx wrangler versions upload` (it will not deploy containers — that is expected) |
 | Production branch | `main` (or the branch the PR merged into) |
 | API token | created by Cloudflare for Workers Builds (§5) |
 
 Verification that runs in the build itself: `bun run verify` = four typechecks + ESLint +
-the full suite (651 tests, including the staging-isolation, API-routing, container-entrypoint
-and secret-placement guards).
+the full suite (673 tests, including the staging-isolation, API-routing, container-entrypoint,
+keep-alive and secret-placement guards).
 It fails the build rather than deploying a broken Worker, and it never touches production
 resources. `wrangler deploy` only runs after it passes, so a failed build cannot alter the
 production Worker.
@@ -398,6 +398,29 @@ shard sizes to re-check.
   notification only. Pause and abort remain authoritative, and both are one click in
   `/indexing`.
 
+## 8a. The first live run stopped after one checkpoint (fixed)
+
+`stg-bench-2026-10-21` did read real R2 data, then stopped. The bucket showed why the
+dashboard could not tell:
+
+* `checkpoints/csv2.json` had **1 chunk / 28,298 rows** (`nextOffset 16,777,313`,
+  `07:00:19.518Z`) and `chunks/csv2/000000.json` plus 16 csv2 segments existed —
+* while `state.json` still said `stage: pass1`, csv2 `0` rows, `errors: []`
+  (`06:59:52.825Z`), and `run.json` did not exist, and
+* `GET /api/cloud/jobs` returned `{"jobs":[]}` because the listing was one 200-key page of
+  `cloud/jobs/` and the job's own `segments/…` keys filled it.
+
+Two defects, both fixed and regression-tested (`docs/verification.md` Phase R): the listing
+now uses R2's `/` delimiter (one entry per job directory, cursor-followed, no segment scan),
+and the container's lifetime is owned: the DO sets `setInactivityTimeout()` and renews it from
+a keep-alive alarm while `/health` reports a running job, the runner forwards SIGTERM to the
+detached CLI and records the stop through `cli.ts interrupt`, and the CLI stops at a chunk
+boundary and writes `run.json` heartbeats plus an explicit `interruption` reason.
+
+Resuming is safe and uses only the durable checkpoint: the committed csv2 chunk is not read
+again, and its 28,298 rows are counted. **Do not start a second benchmark for this version** —
+start the same version to resume it.
+
 ## 9. What is not verified (what stays unknown until it runs)
 
 * nobody has deployed to Cloudflare from this workspace; there is no API token here, and
@@ -422,7 +445,9 @@ shard sizes to re-check.
 2. **Cloudflare dashboard → Workers & Pages → Create → Workers → connect the repository**:
    name it `companyintel-staging`; set root directory `/`, build command
    `bun install --frozen-lockfile && bun run verify && bun run build`, deploy command
-   `bunx wrangler deploy -c wrangler.staging.toml`, production branch = your merge branch.
+   `bunx wrangler deploy -c wrangler.staging.toml --keep-vars`, production branch = your merge
+   branch. The `--keep-vars` flag is required: it keeps the dashboard-managed `[vars]` from
+   being cleared by a deploy that was built from an older commit.
 3. **Cloudflare dashboard → Zero Trust → Access → Applications → Add self-hosted
    application**: cover `companyintel-staging.<your-subdomain>.workers.dev`, one `Allow`
    policy for your email, no bypass; then run the two `CF_ACCESS_*` secret commands in §5.

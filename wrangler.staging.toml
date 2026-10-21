@@ -4,7 +4,12 @@
 # namespace, its own Container application and its own migration tag. It is not the
 # application and it must never be promoted by renaming it.
 #
-# Deploy:   bunx wrangler deploy -c wrangler.staging.toml
+# Deploy:   bunx wrangler deploy -c wrangler.staging.toml --keep-vars
+#
+#           `--keep-vars` is deliberate: it keeps the dashboard-managed [vars] below
+#           when a deploy is built from a commit that lags the dashboard. Dropping it
+#           can clear STAGING_MODE / ACTIVE_MANIFEST_KEY / CLOUD_JOB_BUDGET_USD, which
+#           silently removes this Worker's isolation.
 # Logs:     bunx wrangler tail companyintel-staging
 #
 # Isolation, in order of importance:

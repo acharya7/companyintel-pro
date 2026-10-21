@@ -31,6 +31,7 @@ import {
   cloudKeys,
   type CloudChunkManifest,
   type CloudControl,
+  type CloudInterruption,
   type CloudJobState,
   type CloudSegmentRef,
   type CloudSourceState,
@@ -115,6 +116,15 @@ export interface RunPass1Options {
   maxSourceBytes?: number;
   mode?: CloudJobState["mode"];
   onLog?: (line: string) => void;
+  /**
+   * Asked at every chunk boundary (before reading the next chunk). Returning a
+   * reason stops cleanly — the chunk already written stays checkpointed — and
+   * records that reason in `state.json`. The container CLI wires SIGTERM here, so a
+   * platform stop does not need to kill the process mid-chunk.
+   */
+  shouldStop?: () => string | null;
+  /** Called after every committed chunk; the CLI uses it to refresh run.json. */
+  heartbeat?: (checkpoint: SourceCheckpoint) => Promise<void> | void;
   /** Injected for tests; defaults to real time. */
   now?: () => number;
 }
@@ -123,10 +133,29 @@ export interface Pass1Result {
   state: CloudJobState;
   schema: SpoolSchema;
   checkpoints: SourceCheckpoint[];
-  stopped: "complete" | "paused" | "aborted" | "bounded";
+  stopped: "complete" | "paused" | "aborted" | "bounded" | "interrupted";
 }
 
+/**
+ * Run Pass 1, recording any failure in `state.json` before re-throwing it.
+ *
+ * The wrapper exists so the engine body below keeps its ordinary structure and the
+ * failure path is one place: a thrown error would otherwise leave the job parked on
+ * `stage: pass1` with an empty `errors[]` — the exact shape the staging dashboard
+ * showed for a run that had actually stopped.
+ */
 export async function runPass1(options: RunPass1Options): Promise<Pass1Result> {
+  try {
+    return await runPass1Internal(options);
+  } catch (error) {
+    // Every chunk already written is committed and resumable. The CLI still exits
+    // non-zero and the container runner still reports the stderr tail.
+    await recordFailure(options.store, options.version, options.now ?? (() => Date.now()), error);
+    throw error;
+  }
+}
+
+async function runPass1Internal(options: RunPass1Options): Promise<Pass1Result> {
   const store = options.store;
   const version = options.version;
   const now = options.now ?? (() => Date.now());
@@ -160,6 +189,11 @@ export async function runPass1(options: RunPass1Options): Promise<Pass1Result> {
   state.mode = mode;
   state.partitions = options.partitions;
   state.stage = "pass1";
+  // A new attempt supersedes the previous attempt's interruption record. The
+  // message itself stays in `errors` (history), but a live job must not keep
+  // advertising a stop that no longer describes it.
+  state.interruption = undefined;
+  state.note = existing ? "Resumed from the durable checkpoints in R2." : "Pass 1 started; progress is checkpointed after every chunk.";
   state.updatedAt = new Date(now()).toISOString();
   await store.putJson(cloudKeys.state(version), state);
 
@@ -173,6 +207,21 @@ export async function runPass1(options: RunPass1Options): Promise<Pass1Result> {
       throw new Error(`Source ${source.id} is missing at ${source.key}; refusing to plan a run over an absent source.`);
     }
     let checkpoint = await loadCheckpoint(store, version, source, head.size, chunkBytes, options.partitions);
+    /*
+     * A resumed run trusts the checkpoint, not state.json.
+     *
+     * The engine uploads a chunk, then its checkpoint, then state.json. A process
+     * killed in that last window leaves state.json one chunk behind — observed on
+     * staging: csv2's chunk, manifest and checkpoint all existed while state.json
+     * still said 0 rows. Publishing the checkpoint here means the panel can never
+     * display less progress than R2 durably holds, and a resume never re-reads a
+     * chunk it already committed.
+     */
+    if (checkpoint) {
+      state.sources[sourceIndex] = { ...state.sources[sourceIndex]!, ...progressOf(checkpoint), key: source.key, size: head.size, etag: head.etag };
+      updateTotals(state, options.sources, now(), startedMs);
+      await store.putJson(cloudKeys.state(version), state);
+    }
     if (checkpoint?.complete) {
       log(`${source.id}: already complete (${checkpoint.rows.toLocaleString()} rows); not read again`);
       checkpoints.push(checkpoint);
@@ -201,6 +250,13 @@ export async function runPass1(options: RunPass1Options): Promise<Pass1Result> {
     }
 
     const bound = options.maxSourceBytes === undefined ? head.size : Math.min(head.size, options.maxSourceBytes);
+    // A resumed bounded benchmark whose checkpoint is already at the limit has no
+    // chunk left to read; without this it would report no stop reason at all and
+    // look like a job that started and did nothing.
+    if (options.maxSourceBytes !== undefined && checkpoint.nextOffset >= bound) {
+      stopped = "bounded";
+      log(`${source.id}: already at the bounded limit (${checkpoint.nextOffset.toLocaleString()} B); nothing to read`);
+    }
     const sourceSchema = schema.sources[sourceIndex]!;
     const map = sourceSchema.map;
     const columns = sourceSchema.columns;
@@ -209,14 +265,24 @@ export async function runPass1(options: RunPass1Options): Promise<Pass1Result> {
     while (checkpoint.nextOffset < bound) {
       const currentControl = (await store.getJson<CloudControl>(cloudKeys.control(version))) ?? control;
       if (currentControl.abort) {
-        await pauseState(store, state, "aborted", now(), "abort requested");
+        await pauseState(store, state, "aborted", now(), "abort requested", "interrupted");
         stopped = "aborted";
         checkpoints.push(checkpoint);
         return { state, schema, checkpoints, stopped };
       }
       if (currentControl.pause) {
-        await pauseState(store, state, "paused", now(), "pause requested");
+        await pauseState(store, state, "paused", now(), "pause requested", "interrupted");
         stopped = "paused";
+        checkpoints.push(checkpoint);
+        return { state, schema, checkpoints, stopped };
+      }
+      // The container runner forwards SIGTERM here (via `shouldStop`): stop at a
+      // record boundary with everything committed, instead of being killed while a
+      // segment or state object is half written.
+      const stopReason = options.shouldStop?.() ?? null;
+      if (stopReason) {
+        await pauseState(store, state, "paused", now(), stopReason, "interrupted");
+        stopped = "interrupted";
         checkpoints.push(checkpoint);
         return { state, schema, checkpoints, stopped };
       }
@@ -347,6 +413,9 @@ export async function runPass1(options: RunPass1Options): Promise<Pass1Result> {
       };
       await updateAccounting(store, state, now(), startedMs);
       await store.putJson(cloudKeys.state(version), state);
+      // Proof of life for the panel and for a watchdog: a job whose heartbeat stops
+      // is reported as stopped instead of "still running" forever.
+      await options.heartbeat?.(checkpoint);
 
       /*
        * Conservative budget guard, not a hard billing cap.
@@ -368,6 +437,7 @@ export async function runPass1(options: RunPass1Options): Promise<Pass1Result> {
           now(),
           `budget guard: combined estimate $${spent.toFixed(2)} (R2 + container, Pass 1 and Pass 2) ` +
             `reached CLOUD_JOB_BUDGET_USD=$${budget}. Raise the limit or resume deliberately.`,
+          "interrupted",
         );
         stopped = "paused";
         checkpoints.push(checkpoint);
@@ -389,22 +459,118 @@ export async function runPass1(options: RunPass1Options): Promise<Pass1Result> {
 
     if (checkpoint.nextOffset >= head.size) checkpoint.complete = true;
     await store.putJson(cloudKeys.checkpoint(version, source.id), checkpoint);
-    state.sources[sourceIndex] = { ...state.sources[sourceIndex]!, complete: checkpoint.complete, nextOffset: checkpoint.nextOffset };
+    state.sources[sourceIndex] = { ...state.sources[sourceIndex]!, ...progressOf(checkpoint) };
     checkpoints.push(checkpoint);
+    // One durable state write per source boundary: a job that processes csv1 and is
+    // then stopped still shows csv1's real progress, not the run's first snapshot.
+    updateTotals(state, options.sources, now(), startedMs);
+    await updateAccounting(store, state, now(), startedMs);
+    await store.putJson(cloudKeys.state(version), state);
     // A bounded benchmark stops each source at its own limit; it must still visit
     // the next source instead of ending the job after the first one.
   }
 
   const complete = checkpoints.length === options.sources.length && checkpoints.every((entry) => entry.complete);
-  state.stage = complete ? "pass1-complete" : stopped === "bounded" ? "pass1" : "pass1";
+  const bounded = !complete && options.maxSourceBytes !== undefined;
+  state.stage = complete ? "pass1-complete" : "pass1";
   state.note = complete
     ? "Pass 1 complete: every source read to EOF and every segment verified."
-    : "Partially processed. Re-running the same version resumes at the recorded offsets.";
+    : bounded
+      ? `Bounded benchmark reached its per-source limit (${(options.maxSourceBytes! / 1024 / 1024).toFixed(0)} MB); the prefix is durable and Pass 2 can merge it.`
+      : "Partially processed. Re-running the same version resumes at the recorded offsets.";
+  state.interruption = undefined;
   if (complete) state.finishedAt = new Date(now()).toISOString();
   updateTotals(state, options.sources, now(), startedMs);
   await updateAccounting(store, state, now(), startedMs);
   await store.putJson(cloudKeys.state(version), state);
   return { state, schema, checkpoints, stopped };
+}
+
+/**
+ * Persist a failed attempt in the job state (best effort).
+ *
+ * The throw is re-raised by the caller, so the CLI still exits non-zero and the
+ * runner still reports the stderr tail; this only makes the failure visible in R2.
+ * A job that is already complete is never relabelled.
+ */
+async function recordFailure(store: BlobStore, version: string, now: () => number, error: unknown): Promise<void> {
+  const message = error instanceof Error ? error.message : String(error);
+  try {
+    const state = await store.getJson<CloudJobState>(cloudKeys.state(version));
+    if (!state || state.stage === "complete" || state.stage === "pass1-complete") return;
+    const at = new Date(now()).toISOString();
+    state.stage = "failed";
+    state.updatedAt = at;
+    state.errors = [...state.errors, { at, stage: state.stage, message }].slice(-10);
+    state.interruption = { at, outcome: "failed", reason: message };
+    state.note = "Pass 1 failed. Every completed chunk is checkpointed; fix the cause and re-run the same version to resume.";
+    await store.putJson(cloudKeys.state(version), state);
+  } catch (secondary) {
+    // Recording the failure must not mask the failure itself.
+    if (secondary instanceof Error) {
+      // eslint-disable-next-line no-console
+      console.error(`could not record the failure in ${cloudKeys.state(version)}: ${secondary.message}`);
+    }
+  }
+}
+
+/**
+ * Publish the durable checkpoints' progress in a job state.
+ *
+ * Used when a run is found stopped: the checkpoint is the last committed truth, and
+ * state.json can legitimately lag it by one chunk (the process was killed between the
+ * two writes). This only ever moves progress forward, and never invents a row count.
+ * Returns true when something changed and the caller should write the state back.
+ */
+export async function syncStateFromCheckpoints(store: BlobStore, state: CloudJobState): Promise<boolean> {
+  let changed = false;
+  for (const [index, source] of state.sources.entries()) {
+    const checkpoint = await store.getJson<SourceCheckpoint>(cloudKeys.checkpoint(state.version, source.id));
+    if (!checkpoint || checkpoint.sourceId !== source.id) continue;
+    if (checkpoint.chunks <= source.chunks && checkpoint.nextOffset <= source.sourceBytes) {
+      // Progress is not behind. The one thing that can still be missing is the source
+      // metadata: a state created before the source was HEADed carries `size: 0`.
+      if (source.size === checkpoint.sourceSize && source.etag === checkpoint.sourceEtag) continue;
+      state.sources[index] = { ...source, size: checkpoint.sourceSize, etag: checkpoint.sourceEtag };
+      changed = true;
+      continue;
+    }
+    state.sources[index] = { ...source, ...progressOf(checkpoint) };
+    changed = true;
+  }
+  if (!changed) return false;
+  const sum = (pick: (source: CloudSourceState) => number) => state.sources.reduce((total, source) => total + pick(source), 0);
+  state.totals = {
+    rowsRead: sum((source) => source.rows + source.rejected),
+    rowsRejected: sum((source) => source.rejected),
+    rowsIndexed: sum((source) => source.rows),
+    segments: sum((source) => source.segments),
+    segmentBytes: sum((source) => source.segmentBytes),
+    sourceBytesRead: sum((source) => source.sourceBytes),
+  };
+  return true;
+}
+
+/** Per-source progress fields copied from a checkpoint into the job state. */
+function progressOf(checkpoint: SourceCheckpoint): Pick<
+  CloudSourceState,
+  "size" | "etag" | "nextOffset" | "nextLine" | "chunks" | "rows" | "rejected" | "sourceBytes" | "segments" | "segmentBytes" | "complete"
+> {
+  return {
+    // A checkpoint records the object it was read from; a state created before the
+    // source was HEADed (the staging job) otherwise keeps `size: 0, etag: null`.
+    size: checkpoint.sourceSize,
+    etag: checkpoint.sourceEtag,
+    nextOffset: checkpoint.nextOffset,
+    nextLine: checkpoint.nextLine,
+    chunks: checkpoint.chunks,
+    rows: checkpoint.rows,
+    rejected: checkpoint.rejected,
+    sourceBytes: checkpoint.nextOffset,
+    segments: checkpoint.segments,
+    segmentBytes: checkpoint.segmentBytes,
+    complete: checkpoint.complete,
+  };
 }
 
 async function ensureSchema(store: BlobStore, version: string, sources: Pass1SourceSpec[]): Promise<SpoolSchema> {
@@ -527,10 +693,19 @@ async function updateAccounting(store: BlobStore, state: CloudJobState, nowMs: n
     seconds * (CONTAINER_PRICE.vcpu * CONTAINER_PRICE.vcpuPerSecond + CONTAINER_PRICE.gib * CONTAINER_PRICE.gibPerSecond);
 }
 
-async function pauseState(store: BlobStore, state: CloudJobState, stage: CloudJobState["stage"], nowMs: number, note: string): Promise<void> {
+async function pauseState(
+  store: BlobStore,
+  state: CloudJobState,
+  stage: CloudJobState["stage"],
+  nowMs: number,
+  note: string,
+  outcome: CloudInterruption["outcome"],
+): Promise<void> {
   state.stage = stage;
   state.note = note;
-  state.updatedAt = new Date(nowMs).toISOString();
+  const at = new Date(nowMs).toISOString();
+  state.updatedAt = at;
+  state.interruption = { at, outcome, reason: note };
   await store.putJson(cloudKeys.state(state.version), state);
 }
 

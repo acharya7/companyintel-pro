@@ -1104,3 +1104,103 @@ deploy: `/indexing` must show the benchmark controls on an empty list, a start m
 `202`, and `/api/cloud/jobs` must list `stg-…` with a checkpoint within one chunk. `raw/` was
 only read (ranged GETs); no index was activated, no production pointer moved, and the full
 corpus was not started.
+
+## Phase R — the live staging job stopped after one checkpoint, and was invisible
+
+The first real Cloudflare Container run *did* process real R2 data and then stopped:
+
+| Evidence (read directly from the bucket) | Value |
+| --- | --- |
+| `cloud/jobs/stg-bench-2026-10-21/state.json` | `stage: pass1`, `errors: []`, `updatedAt 2026-10-21T06:59:52.825Z`, csv1 7,180 rows / 16 segments, **csv2 0 rows**, `sourceBytesRead 16,778,741` |
+| `checkpoints/csv1.json` | 1 chunk, `nextOffset 16,778,741`, `updatedAt 06:58:51.875Z` |
+| `checkpoints/csv2.json` | **1 chunk, 28,298 rows, `nextOffset 16,777,313`, `updatedAt 07:00:19.518Z`** |
+| `chunks/csv2/000000.json` + 16 csv2 segments | present, `completedAt 07:00:18.254Z` |
+| `run.json` | absent (nothing ever recorded how the attempt ended) |
+| `raw/file1.csv`, `raw/file2.csv` | 10.2 GB / 54.0 GB, unchanged; only ranged GETs |
+| `GET /api/cloud/jobs` | `{"jobs":[]}` |
+
+### Root cause 1 — the listing never reached `state.json`
+
+`listJobs` read **one** 200-key page of `cloud/jobs/`, then filtered it to keys ending in
+`/state.json`. A real job writes `chunks/…` and thousands of `segments/…` objects under the
+same prefix, and `segments/…` sorts before `state.json`, so the page was entirely segments.
+The job existed and was invisible. The run above had 40 objects under its own version
+directory, 32 of them below `segments/`.
+
+Fix: the listing now uses R2's `/` delimiter on `cloud/jobs/` (one `delimitedPrefixes` entry
+per job directory), follows the cursor for up to 5 pages, and then GETs only each job's
+`state.json`, `control.json` and `run.json`. It never lists or reads the contents of a
+segment directory, and it reports `truncated: true` when there are more job directories than
+the 25 it renders.
+
+### Root cause 2 — nothing owned the container's lifetime
+
+A detached job is a grandchild of the container's main process. Cloudflare stops a container
+once the Durable Object owning it has been inactive for the inactivity timeout, and it sends
+SIGTERM to the **main process** only. The DO never called
+`ctx.container.setInactivityTimeout()`, so the instance was eligible to be stopped as soon as
+the start request returned 202 and the DO went idle; the runner only forwarded SIGTERM in the
+*streaming* branch, and never recorded anything about a detached child that died.
+
+The timeline matches a stop, not a code path: csv2's chunk, segments, rejected file and
+checkpoint were all written (07:00:18–07:00:19) and the next write — `state.json` — never
+happened. A crash *inside* Pass 1 would have been awaited and recorded; a process stopped
+between those two PUTs leaves exactly this shape. Nothing in R2 said so, which is the second
+half of the defect.
+
+Fix:
+
+* `worker/src/indexer-container.ts` calls `setInactivityTimeout()` (default 1 h, max 6 h,
+  `CONTAINER_JOB_INACTIVITY_MS`) when a `/job` request is accepted, arms a DO alarm
+  (`CONTAINER_KEEPALIVE_MS`, default 10 min) and renews the timeout from that alarm **only
+  while the runner's `/health` reports `job.running`**. A finished job stops renewing, so it
+  stops costing container time. A redeployed DO restores the timeout in its constructor when
+  the container is already running.
+* `cloud/runner.mjs` now owns detached children: `/health` reports `job.running`, a
+  SIGTERM/SIGINT handler forwards SIGTERM to the child, waits up to `JOB_STOP_GRACE_MS`
+  (90 s) for a boundary exit, ends it forcibly otherwise, and then records the stop through
+  `bun tools/cloud/cli.ts interrupt` (15 s cap) before exiting. A child that exits non-zero
+  or by signal on its own is recorded the same way.
+* `tools/cloud/pass1.ts` asks a new `shouldStop()` at every chunk boundary. That is where the
+  forwarded SIGTERM lands, so the stop is a committed checkpoint, not a half-written segment.
+* `tools/cloud/cli.ts` writes `cloud/jobs/<version>/run.json` for every attempt
+  (`running` + a heartbeat after each committed chunk/partition, then `completed` / `failed`
+  / `interrupted`), records failures in `state.json` (`stage: failed`, an `errors[]` entry and
+  `interruption`), and gained an idempotent `interrupt` command for the runner.
+
+### Root cause 3 — state.json could lag the checkpoint, and a bounded re-run never stopped
+
+`state.json` was written after the checkpoint, so a stop in between (what happened here) left
+it a chunk behind. A resume now publishes each checkpoint into the state before it reads on,
+and `syncStateFromCheckpoints()` (used by `interrupt`) only ever moves progress forward. A
+bounded benchmark whose checkpoint is already at its byte limit now returns
+`stopped: "bounded"` with a note instead of looping with no reason — the shape that made this
+job look "stuck in Pass 1".
+
+### Verification
+
+| Check | Result |
+| --- | --- |
+| `bun test tests/cloud-job-listing.test.ts` | **PASS** — 6 tests: a job with 1,200 segment objects is listed (nothing under `segments/` is listed or fetched), staging still filters, stale/interrupted/failed reasons, truncation at 25 jobs |
+| `bun test tests/cloud-pass1-recovery.test.ts` | **PASS** — 5 tests: SIGTERM-equivalent stop at a chunk boundary resumes to the exact totals, a thrown error is persisted then resumes, a bounded re-run reports `bounded`, a lagging state is repaired from the checkpoint, resume never re-reads a committed chunk |
+| `bun test tests/cloud-runner.test.ts` | **PASS** — 4 tests, including a real SIGTERM to the runner: the child stops at a boundary, `run.json` and `state.json` record the interruption, and a new container process resumes the same version to 2,400 rows / `completed` |
+| `bun test tests/indexer-container-keepalive.test.ts` | **PASS** — 5 tests: timeout + alarm on an accepted job, alarm renewal only while the job runs, probe failure keeps the window open, a rejected keep-alive never breaks the 202, constructor restore after a DO restart |
+| `bun test` | **PASS** — 673 tests, 0 fail across 58 files |
+| Typechecks | **PASS** — frontend/shared, `worker/tsconfig.json`, `tools/indexer/tsconfig.json` |
+
+### Not verified here
+
+The deployment is not performed from this workspace: `wrangler` has no authenticated account
+and there is no Cloudflare API token, so neither the Worker nor the image was pushed. The
+fixes above are exercised locally (real runner + real CLI + stub S3, real R2 state read) but
+the keep-alive and the SIGTERM-forwarding path have **not** been observed inside Cloudflare's
+container runtime. After deploying with
+`bunx wrangler deploy -c wrangler.staging.toml --keep-vars`, the live confirmation is:
+`/api/cloud/jobs` lists `stg-bench-2026-10-21`, its warning reads "No progress for …", a
+resume returns 202 and the heartbeat in `run.json` advances past one chunk, and a deliberate
+rollout shows `run.json` `interrupted` with a SIGTERM reason rather than a silent
+`stage: pass1`.
+
+No full-corpus run was started, nothing was activated, `raw/` was read only, and the stuck
+job's state was repaired in place — `run.json` + `state.json` only, with its real csv2
+checkpoint progress (28,298 rows) published and an explicit interruption reason recorded.

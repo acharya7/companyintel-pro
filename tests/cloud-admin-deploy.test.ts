@@ -97,6 +97,36 @@ describe("Cloudflare Containers deployment config", () => {
     expect(container).toContain("http://container/health");
     expect(container).not.toContain(".inspect()");
   });
+
+  test("a detached job keeps the container alive while it runs", () => {
+    // Without an inactivity timeout the platform may stop the instance as soon as the
+    // DO that owns it goes idle after the 202. The alarm renews it only while the
+    // runner reports a running job.
+    expect(container).toContain("setInactivityTimeout");
+    expect(container).toContain("async alarm()");
+    expect(container).toContain("CONTAINER_KEEPALIVE_MS");
+    expect(container).toContain("job?.running");
+  });
+
+  test("the runner forwards a stop to the child and records it in R2", () => {
+    expect(runner).toContain("recordInterruption");
+    expect(runner).toContain('child.kill("SIGTERM")');
+    expect(runner).toContain('"interrupt"');
+    expect(runner).toContain("JOB_STOP_GRACE_MS");
+    // /health must expose whether a detached child is alive, or the keep-alive alarm
+    // has nothing to read.
+    expect(runner).toContain("running: true");
+  });
+
+  test("the job listing uses a delimited, paginated directory scan", () => {
+    // The staging bug: one 200-key page of `cloud/jobs/` was filled by `segments/…`, so
+    // `state.json` was never in it and the job never appeared.
+    expect(admin).toContain('delimiter: "/"');
+    expect(admin).toContain("delimitedPrefixes");
+    expect(admin).toContain("listed.truncated");
+    expect(admin).toContain("runStatus");
+    expect(admin).toContain("warningFor");
+  });
 });
 
 /**
@@ -140,6 +170,17 @@ describe("the seven runtime settings survive a deployment", () => {
     const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { scripts: Record<string, string> };
     expect(pkg.scripts["deploy:staging"]).toBe("bun scripts/deploy.mjs staging");
     expect(pkg.scripts["deploy:production"]).toBe("bun scripts/deploy.mjs production");
+  });
+
+  test("every deploy keeps the dashboard-managed vars", () => {
+    // The configured staging command is `wrangler deploy -c wrangler.staging.toml
+    // --keep-vars`. Dropping the flag lets a deploy built from an older commit clear
+    // STAGING_MODE / ACTIVE_MANIFEST_KEY / the budget, which silently removes staging
+    // isolation. The wrapper must pass it, and the docs must show it.
+    expect(deployScript).toContain('"deploy", "-c", configPath, "--keep-vars"');
+    expect(readFileSync(join(root, "wrangler.staging.toml"), "utf8")).toContain(
+      "bunx wrangler deploy -c wrangler.staging.toml --keep-vars",
+    );
   });
 
   test("health reports presence only, by count, and never a value", () => {

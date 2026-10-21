@@ -76,6 +76,46 @@ export interface CloudAccounting {
   combinedUsd?: number;
 }
 
+/**
+ * Why a run stopped without finishing its stage.
+ *
+ * Written by the CLI when it can (a thrown error) and by the container runner when a
+ * process disappears without the chance to write anything (SIGTERM, SIGKILL, OOM).
+ * It is part of the job state on purpose: R2 would otherwise hold a job whose latest
+ * checkpoint looks like progress while nothing is running.
+ */
+export interface CloudInterruption {
+  at: string;
+  outcome: "failed" | "interrupted" | "terminated";
+  reason: string;
+  detail?: string;
+}
+
+/**
+ * The last run attempt, written to `cloud/jobs/<version>/run.json`.
+ *
+ * A heartbeat is the only evidence that a detached process is still alive: the
+ * Worker answers 202 and the browser polls R2, so without it an interrupted job and
+ * a slow chunk look identical. `outcome: "running"` plus an old `heartbeatAt` is
+ * what the panel reports as "stopped without recording why".
+ */
+export interface CloudRunStatus {
+  version: string;
+  stage: "pass1" | "pass2";
+  outcome: "running" | "completed" | "failed" | "interrupted" | "terminated";
+  /** 1-based attempt counter; a resumed job increments it. */
+  attempt: number;
+  recordedBy: "cli" | "runner";
+  startedAt: string;
+  heartbeatAt: string;
+  pid: number | null;
+  exitCode?: number | null;
+  signal?: string | null;
+  /** Always present for failed/interrupted/terminated. */
+  reason?: string;
+  detail?: string;
+}
+
 export interface CloudJobState {
   engine: typeof CLOUD_ENGINE_VERSION;
   jobId: string;
@@ -117,6 +157,8 @@ export interface CloudJobState {
     updatedAt: string;
   };
   errors: { at: string; stage: CloudStage; message: string }[];
+  /** Set whenever the last attempt failed, was interrupted by a stop, or was found dead. */
+  interruption?: CloudInterruption;
   note?: string;
 }
 
@@ -185,6 +227,7 @@ export const cloudKeys = {
   control: (version: string) => `${CLOUD_PREFIX}/jobs/${version}/control.json`,
   schema: (version: string) => `${CLOUD_PREFIX}/jobs/${version}/schema.json`,
   checkpoint: (version: string, sourceId: string) => `${CLOUD_PREFIX}/jobs/${version}/checkpoints/${sourceId}.json`,
+  runStatus: (version: string) => `${CLOUD_PREFIX}/jobs/${version}/run.json`,
   chunkManifest: (version: string, sourceId: string, chunk: number) =>
     `${CLOUD_PREFIX}/jobs/${version}/chunks/${sourceId}/${String(chunk).padStart(6, "0")}.json`,
   segment: (version: string, sourceId: string, chunk: number, partition: number) =>

@@ -17,9 +17,19 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { EmptyState, PageHeader, Section, StatCard, StatusPill } from "@/components/common";
-import type { CloudControl, CloudJobState } from "@/shared/cloud/types";
+import type { CloudControl, CloudJobState, CloudRunStatus } from "@/shared/cloud/types";
 
-type JobsResponse = { jobs: { state: CloudJobState; control: CloudControl | null }[]; containerBound?: boolean; staging?: boolean };
+/** Mirrors `JobListing` in `worker/src/indexer-admin.ts`. */
+type JobWarning = { kind: "failed" | "interrupted" | "terminated" | "stale"; since: string; reason: string };
+type JobListing = { state: CloudJobState; control: CloudControl | null; run: CloudRunStatus | null; warning: JobWarning | null };
+type JobsResponse = { jobs: JobListing[]; containerBound?: boolean; staging?: boolean; truncated?: boolean };
+
+const WARNING_LABEL: Record<JobWarning["kind"], string> = {
+  failed: "Pass stopped with an error",
+  interrupted: "Run interrupted",
+  terminated: "Run terminated by the platform",
+  stale: "Run is not advancing",
+};
 
 async function admin<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -59,7 +69,8 @@ const STAGE_TONE: Record<string, string> = {
 };
 
 export default function IndexingControl() {
-  const [jobs, setJobs] = useState<{ state: CloudJobState; control: CloudControl | null }[]>([]);
+  const [jobs, setJobs] = useState<JobListing[]>([]);
+  const [truncated, setTruncated] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -78,6 +89,7 @@ export default function IndexingControl() {
     try {
       const data = await admin<JobsResponse>("/api/cloud/jobs");
       setJobs(data.jobs);
+      setTruncated(Boolean(data.truncated));
       setSelected((current) => current ?? data.jobs[0]?.state.version ?? null);
       setStaging(Boolean(data.staging));
       setContainerBound(Boolean(data.containerBound));
@@ -111,6 +123,8 @@ export default function IndexingControl() {
 
   const state = current?.state ?? null;
   const control = current?.control ?? null;
+  const warning = current?.warning ?? null;
+  const run = current?.run ?? null;
 
   const act = async (action: "pause" | "resume" | "abort" | "approve") => {
     if (!state) return;
@@ -319,7 +333,31 @@ export default function IndexingControl() {
                 pause {String(control.pause)} · abort {String(control.abort)} · full-run approval {String(control.approvedFullRun)}
               </span>
             ) : null}
+            {truncated ? <span className="text-xs text-chart-3">showing the newest jobs only</span> : null}
           </div>
+
+          {/*
+           * A detached run leaves no open request behind, so "the job is not moving"
+           * has to be stated from the durable heartbeat. Without this banner a stopped
+           * Pass 1 looks exactly like a slow one.
+           */}
+          {warning ? (
+            <div className="mb-4 flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-xs text-destructive">
+              <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+              <span>
+                <strong>{WARNING_LABEL[warning.kind]}</strong> — {warning.reason}
+                <span className="text-muted-foreground"> · {new Date(warning.since).toLocaleString()}</span>
+              </span>
+            </div>
+          ) : run && run.outcome === "running" ? (
+            <div className="mb-4 flex items-start gap-2 rounded-lg border border-chart-2/30 bg-chart-2/5 p-3 text-xs text-chart-2">
+              <Activity className="mt-0.5 size-4 shrink-0" />
+              <span>
+                Run {run.attempt} is alive · stage {run.stage} · last heartbeat {new Date(run.heartbeatAt).toLocaleTimeString()}
+                {run.pid ? ` · pid ${run.pid}` : ""}
+              </span>
+            </div>
+          ) : null}
 
           {state ? (
             <>
