@@ -10,7 +10,7 @@
 
 import { useMemo, useState } from "react";
 import { Link } from "react-router";
-import { Building2, Copy, FileDown, Linkedin, Mail, Phone, Search, Star, Users, X } from "lucide-react";
+import { Building2, Copy, FileDown, Linkedin, Mail, Search, Star, Users, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ASSOCIATION_CATEGORY_HINTS, ASSOCIATION_CATEGORY_LABELS } from "@/shared/association";
@@ -20,6 +20,7 @@ import { Switch } from "@/components/ui/switch";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { EmptyState, ErrorBlock, LoadingBlock, PageHeader, Pager, Section } from "@/components/common";
+import { ContactNumbers } from "@/components/contact-numbers";
 import {
   api,
   downloadExportFile,
@@ -107,7 +108,21 @@ export default function Contacts() {
                       {
                         kind: "contacts",
                         contactIds: [...selected],
-                        columns: ["fullName", "title", "designation", "seniority", "department", "email", "phone", "linkedinUrl", "companyName", "country", "city"],
+                        columns: [
+                          "fullName",
+                          "title",
+                          "designation",
+                          "seniority",
+                          "department",
+                          "email",
+                          "phone",
+                          "mobile",
+                          "additionalPhones",
+                          "linkedinUrl",
+                          "companyName",
+                          "country",
+                          "city",
+                        ],
                       },
                       { onSuccess: (job) => void downloadExportFile(job.id) },
                     )
@@ -293,6 +308,7 @@ export default function Contacts() {
                           <TableCell>
                             <p className="font-medium">{contact.fullName}</p>
                             <p className="text-[11px] text-muted-foreground">{contact.title ?? "—"}</p>
+                            <ContactNumbers contact={contact} className="mt-1" showLabels={false} />
                             {contact.association && contact.association.category !== "high_confidence" ? (
                               <Badge
                                 variant="outline"
@@ -327,11 +343,6 @@ export default function Contacts() {
                           </TableCell>
                           <TableCell>
                             <div className="flex items-center justify-end gap-1">
-                              {contact.phone ? (
-                                <Button variant="ghost" size="icon-sm" title={contact.phone} onClick={() => void navigator.clipboard?.writeText(contact.phone!)}>
-                                  <Phone className="size-3.5" />
-                                </Button>
-                              ) : null}
                               {contact.linkedinUrl ? (
                                 <Button variant="ghost" size="icon-sm" asChild title="Open LinkedIn profile">
                                   <a href={contact.linkedinUrl} target="_blank" rel="noreferrer noopener">
@@ -423,6 +434,19 @@ export default function Contacts() {
                 checked={Boolean(filters.hasEmail)}
                 onCheckedChange={(checked) => {
                   setFilters((current) => ({ ...current, hasEmail: checked || undefined }));
+                  setPage(1);
+                }}
+              />
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <Label htmlFor="contacts-phone" className="text-xs font-normal">
+                Phone / mobile available
+              </Label>
+              <Switch
+                id="contacts-phone"
+                checked={Boolean(filters.hasPhone)}
+                onCheckedChange={(checked) => {
+                  setFilters((current) => ({ ...current, hasPhone: checked || undefined }));
                   setPage(1);
                 }}
               />

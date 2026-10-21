@@ -28,6 +28,7 @@ import ContactDetails from "../src/pages/ContactDetails";
 import CompanyDetails from "../src/pages/CompanyDetails";
 import IndexingControl from "../src/pages/IndexingControl";
 import { Pager } from "../src/components/common";
+import { ContactNumbers } from "../src/components/contact-numbers";
 import { queryKeys } from "../src/hooks/use-api";
 import type { Contact, DatasetStatusResponse, UserSettings } from "../src/shared/models";
 
@@ -214,7 +215,10 @@ describe("pages render without a missing API method", () => {
   test("Dashboard renders in real-data mode with the published version", async () => {
     const html = await renderPage(<Dashboard />, { seed: { datasetStatus: realDataset } });
     expect(html).toContain("v1");
-    expect(html).toContain("R2 index");
+    // A published version is REAL DATA. The sample label appears only when the
+    // synthetic adapter really served the page.
+    expect(html).toContain("REAL DATA");
+    expect(html).not.toContain("Demo mode");
     expect(html).not.toContain("is not a function");
   });
 
@@ -238,7 +242,8 @@ describe("pages render without a missing API method", () => {
 
     const real = await renderPage(<DatasetManagement />, { seed: { datasetStatus: realDataset } });
     expect(real).toContain("v1");
-    expect(real).toContain("Live data");
+    expect(real).toContain("REAL DATA");
+    expect(real).not.toContain("Demo mode");
   });
 
   test("Company search explains the no-dataset state instead of failing", async () => {
@@ -278,14 +283,34 @@ describe("pages render without a missing API method", () => {
         </MemoryRouter>
       </QueryClientProvider>,
     );
-    // The value is delivered whole and declared as a column of the record…
-    expect(html).toContain("organization_short_description");
-    expect(html).toContain("organization_public_symbol");
+    // The curated company card shows the description collapsed, with the real
+    // character count and a way to expand it…
     expect(html).toContain("EXM");
-    // …but rendered collapsed, with the real character count and a way to expand it.
     expect(html).toContain("Show all");
     expect(html).toContain(`${description.length} characters`);
     expect(html).not.toContain("END-OF-VALUE");
+    // …and the complete original row is still offered, behind its own control.
+    expect(html).toContain("All original attributes");
+    expect(html).toContain("2");
+    expect(html).toContain("fields");
+
+    // The requested layout: summary cards, a horizontal filter bar above the
+    // contacts, and company information beside them (2/3 · 1/3 on desktop).
+    expect(html).toContain("Total contacts");
+    expect(html).toContain("Search this company&#x27;s contacts…");
+    expect(html).toContain("Has phone / mobile");
+    expect(html).toContain("Company information");
+    expect(html).toContain("lg:grid-cols-[minmax(0,13fr)_minmax(0,7fr)]");
+  });
+
+  test("phone and mobile render as labelled tel: links, with extensions preserved", () => {
+    const html = renderToString(
+      <ContactNumbers contact={{ phone: "+1 (503) 443-7070 ext. 42", mobile: "+1 (503) 555 0199" }} />,
+    );
+    expect(html).toContain('href="tel:+15034437070;ext=42"');
+    expect(html).toContain('href="tel:+15035550199"');
+    expect(html).toContain("Mobile");
+    expect(html).toContain("Phone");
   });
 
   test("Contact profile renders every captured field and the employer evidence", async () => {

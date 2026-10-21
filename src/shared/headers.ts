@@ -76,6 +76,8 @@ export const HEADER_ALIASES: Record<string, string[]> = {
   department: ["department", "function", "jobfunction", "team"],
   email: ["email", "emailaddress", "workemail", "businessemail", "emailid", "contactemail"],
   phone: ["phone", "phonenumber", "telephone", "mobile", "contactnumber", "directphone", "contactphone"],
+  /** A mobile column stays separate from a work/landline phone column. */
+  mobile: ["mobile", "mobilephone", "mobilenumber", "cell", "cellphone", "cellular", "personmobile"],
   linkedin: ["linkedin", "linkedinurl", "linkedinprofile", "personlinkedin", "contactlinkedin"],
   contactcountry: ["contactcountry", "personcountry", "contactlocationcountry"],
   contactstate: ["contactstate", "personstate", "contactlocationstate"],

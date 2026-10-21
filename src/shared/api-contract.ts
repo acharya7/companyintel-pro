@@ -79,12 +79,15 @@ export const companyFiltersSchema = z
 
 export const contactFiltersSchema = z
   .object({
+    /** Free-text match inside the company's contact collection. */
+    query: z.string().max(200).optional(),
     designation: z.string().max(160).optional(),
     department: z.string().max(160).optional(),
     seniority: z.string().max(80).optional(),
     country: z.string().max(120).optional(),
     city: z.string().max(120).optional(),
     hasEmail: booleanish.optional(),
+    hasPhone: booleanish.optional(),
     hasLinkedin: booleanish.optional(),
     /**
      * Comma-separated association categories (`high_confidence,plausible`). A
@@ -345,6 +348,8 @@ export const contactSchema = z.object({
   department: z.string().optional(),
   email: z.string().optional(),
   phone: z.string().optional(),
+  mobile: z.string().optional(),
+  additionalPhones: z.array(z.string()).optional(),
   linkedinUrl: z.string().optional(),
   country: z.string().optional(),
   state: z.string().optional(),
@@ -409,6 +414,8 @@ export const contactSearchHitSchema = z.object({
   department: z.string().nullable(),
   email: z.string().nullable(),
   phone: z.string().nullable(),
+  mobile: z.string().nullable(),
+  additionalPhones: z.array(z.string()),
   linkedinUrl: z.string().nullable(),
   country: z.string().nullable(),
   city: z.string().nullable(),
@@ -542,6 +549,8 @@ export const savedLeadSchema = z.discriminatedUnion("kind", [
     fullName: z.string(),
     title: z.string().optional(),
     email: z.string().optional(),
+    phone: z.string().optional(),
+    mobile: z.string().optional(),
     linkedinUrl: z.string().optional(),
     status: leadStatusSchema,
     tags: z.array(z.string()),

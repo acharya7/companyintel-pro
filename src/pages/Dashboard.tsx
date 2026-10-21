@@ -22,7 +22,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { BarList, EmptyState, ErrorBlock, LoadingBlock, PageHeader, Section, StatCard } from "@/components/common";
-import { useActivity, useDatasetStats, useDatasetStatus, useLeads, useSavedSearches, apiMode } from "@/hooks/use-api";
+import { useActivity, useDatasetMode, useDatasetStats, useDatasetStatus, useLeads, useSavedSearches } from "@/hooks/use-api";
 import { formatBytes, formatCompact, formatNumber, relativeTime } from "@/lib/format";
 import { readRecentCompanies } from "@/lib/recent";
 import { RealDataCoverageNotice } from "@/components/realdata";
@@ -30,6 +30,7 @@ import { LEAD_STATUSES } from "@/shared/models";
 
 export default function Dashboard() {
   const status = useDatasetStatus();
+  const datasetMode = useDatasetMode();
   const stats = useDatasetStats(Boolean(status.data?.indexed || status.data?.dataOrigin === "sample"));
   const leads = useLeads();
   const searches = useSavedSearches();
@@ -150,8 +151,14 @@ export default function Dashboard() {
         <StatCard label="Saved searches" value={formatNumber(searches.data?.length ?? 0)} hint="Reusable queries" icon={<Search className="size-4" />} />
         <StatCard
           label="Data source"
-          value={sample ? "Sample" : indexed ? "R2 index" : "Not indexed"}
-          hint={sample ? "Synthetic preview dataset — never production data" : `API mode: ${apiMode}`}
+          value={sample ? "Sample" : indexed ? "REAL DATA" : "Not indexed"}
+          hint={
+            sample
+              ? "Synthetic preview dataset — never production data"
+              : indexed
+                ? `${datasetMode.partial ? "PARTIAL COVERAGE" : "COMPLETE COVERAGE"} · ${datasetMode.version ?? status.data?.activeVersion ?? "unknown"}`
+                : "No validated version is published"
+          }
           icon={<Database className="size-4" />}
           tone={sample ? "accent" : "default"}
         />

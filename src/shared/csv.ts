@@ -50,6 +50,8 @@ export const EXPORT_COLUMN_HEADERS: Record<string, string> = {
   seniority: "Seniority",
   department: "Department",
   phone: "Phone",
+  mobile: "Mobile",
+  additionalPhones: "Additional Phones",
   sourceFile: "Source File",
 };
 

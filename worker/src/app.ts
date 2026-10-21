@@ -25,7 +25,9 @@ import {
   toContactFilters,
   updateLeadRequestSchema,
 } from "../../src/shared/api-contract";
-import { associationMatchesFilter, type AssociationCategory } from "../../src/shared/association";
+import { type AssociationCategory } from "../../src/shared/association";
+import { contactMatchesFilters } from "../../src/shared/contact-filter";
+import { extractPhoneNumbers } from "../../src/shared/phone";
 import { loadContactById, searchContacts } from "./contact-search";
 import { normalizeQuery } from "../../src/shared/normalize";
 import { spoolPartitionOfNormalizedName, type IndexDirectory } from "../../src/shared/search/index-format";
@@ -247,20 +249,28 @@ function sortContacts(contacts: Contact[], sort: string, order: "asc" | "desc"):
 }
 
 function filterContacts(contacts: Contact[], filters?: ContactFilters): Contact[] {
-  if (!filters) return contacts;
-  return contacts.filter((contact) => {
-    if (filters.designation && contact.designation !== filters.designation) return false;
-    if (filters.department && contact.department !== filters.department) return false;
-    if (filters.seniority && contact.seniority !== filters.seniority) return false;
-    if (filters.country && contact.country !== filters.country) return false;
-    if (filters.city && contact.city !== filters.city) return false;
-    if (filters.hasEmail && !contact.email) return false;
-    if (filters.hasLinkedin && !contact.linkedinUrl) return false;
-    // Association category: the trusted view (high-confidence + plausible) is
-    // expressed as a filter, never as a silent omission of disputed rows.
-    if (!associationMatchesFilter(contact.association?.category, filters.association)) return false;
-    return true;
-  });
+  // The rule (including free text, phone availability and association category)
+  // lives in `src/shared/contact-filter.ts` so the preview applies exactly the
+  // same filter as the deployed Worker.
+  return filters ? contacts.filter((contact) => contactMatchesFilters(contact, filters)) : contacts;
+}
+
+/**
+ * Add displayable phone/mobile values to a contact.
+ *
+ * The active index was built before `mobile` existed as a field: its original
+ * `person_phone` / `person_mobile` columns are still carried verbatim in
+ * `attributes`. Deriving the numbers here (a pure projection) exposes them
+ * without reindexing, and keeps an already-canonical `phone` value intact.
+ */
+function withContactNumbers<T extends Contact>(contact: T): T {
+  const numbers = extractPhoneNumbers(contact);
+  return {
+    ...contact,
+    phone: numbers.phone ?? undefined,
+    mobile: numbers.mobile ?? undefined,
+    additionalPhones: numbers.additional.length ? numbers.additional : undefined,
+  };
 }
 
 /* --------------------------------- routes -------------------------------- */
@@ -552,7 +562,12 @@ app.get("/api/companies/:id/contacts", async (c) => {
   if (ref === null) throw new HttpError(404, "not_found", `Company ${c.req.param("id")} is not in dataset ${dataset.version}.`);
   const contacts = sortContacts(filterContacts(await dataset.store.getContactsByCompanyRef(dataset.version, ref), filters), sort, order);
   const { slice, page: pageInfo } = paginate(contacts, page, pageSize);
-  return c.json({ companyId: c.req.param("id"), contacts: slice, page: pageInfo, datasetVersion: dataset.version });
+  return c.json({
+    companyId: c.req.param("id"),
+    contacts: slice.map(withContactNumbers),
+    page: pageInfo,
+    datasetVersion: dataset.version,
+  });
 });
 
 /**
@@ -597,7 +612,7 @@ app.get("/api/companies/:id/unassigned", async (c) => {
   const response: UnassignedContactsResponse = {
     companyId: company.id,
     companyName: company.name,
-    contacts: slice,
+    contacts: slice.map(withContactNumbers),
     page: pageInfo,
     datasetVersion: dataset.version,
     totals: {
@@ -686,7 +701,7 @@ app.get("/api/contacts", async (c) => {
   const filtered = filterContacts(collected, filters);
   const sorted = sortContacts(filtered, query.sort ?? "name", query.order === "desc" ? "desc" : "asc");
   const { slice, page } = paginate(sorted, Math.max(1, Number(query.page ?? 1)), Math.min(100, Math.max(1, Number(query.pageSize ?? 25))));
-  return c.json({ companyId: null, contacts: slice, page, datasetVersion: dataset.version });
+  return c.json({ companyId: null, contacts: slice.map(withContactNumbers), page, datasetVersion: dataset.version });
 });
 
 app.get("/api/contacts/:id", async (c) => {
@@ -699,7 +714,12 @@ app.get("/api/contacts/:id", async (c) => {
   // person kept without an employer must open like any other record.
   const found = await loadContactById(dataset.store, dataset.directory, contactIdParam);
   if (!found.contact) throw new HttpError(404, "not_found", "Contact is not part of the active dataset.");
-  return c.json({ contact: found.contact, company: found.company, unassigned: found.unassigned, datasetVersion: dataset.version });
+  return c.json({
+    contact: withContactNumbers(found.contact),
+    company: found.company,
+    unassigned: found.unassigned,
+    datasetVersion: dataset.version,
+  });
 });
 
 /* -------------------------------- leads ---------------------------------- */
@@ -765,6 +785,8 @@ app.post("/api/leads", async (c) => {
       fullName: contact.fullName,
       title: contact.title,
       email: contact.email,
+      phone: extractPhoneNumbers(contact).phone ?? undefined,
+      mobile: extractPhoneNumbers(contact).mobile ?? undefined,
       linkedinUrl: contact.linkedinUrl,
       status: body.status,
       tags: body.tags,
@@ -938,7 +960,7 @@ app.post("/api/exports", async (c) => {
             break;
           }
           rows.push({
-            ...contact,
+            ...withContactNumbers(contact),
             companyName: company?.name ?? "",
             companyDomain: company?.domain ?? "",
             industry: company?.industry ?? "",
@@ -962,7 +984,7 @@ app.post("/api/exports", async (c) => {
         if (!contact) continue;
         const company = await store.getCompanyByRef(dataset.version, ref);
         rows.push({
-          ...contact,
+          ...withContactNumbers(contact),
           companyName: company?.name ?? "",
           companyDomain: company?.domain ?? "",
           industry: company?.industry ?? "",
@@ -998,7 +1020,9 @@ app.post("/api/exports", async (c) => {
   const columns: CsvColumn<Record<string, unknown>>[] = body.columns.map((column) => ({
     id: column,
     header: EXPORT_COLUMN_HEADERS[column] ?? column,
-    value: (row) => row[column],
+    // A record can hold several numbers; a list cell is joined with `;` so one
+    // export column stays one spreadsheet cell instead of shifting the row.
+    value: (row) => (Array.isArray(row[column]) ? (row[column] as unknown[]).join("; ") : row[column]),
   }));
   const csv = toCsv(rows, columns);
   const id = `ex_${crypto.randomUUID().slice(0, 10)}`;

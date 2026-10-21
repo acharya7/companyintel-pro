@@ -28,9 +28,9 @@ import {
   normalizeEmail,
   normalizeLinkedin,
   normalizeName,
-  normalizePhone,
   nameVariants,
 } from "../../../src/shared/normalize";
+import { extractPhoneNumbers } from "../../../src/shared/phone";
 // The canonical field list, the header aliases and the header→field mapping are
 // shared with the read-only R2 probe and the browser bundle, so they live in
 // `src/shared/headers.ts` and are re-exported here to keep every existing
@@ -177,6 +177,7 @@ export interface RawContactInput {
   department?: string;
   email?: string;
   phone?: string;
+  mobile?: string;
   linkedinUrl?: string;
   country?: string;
   state?: string;
@@ -239,6 +240,7 @@ export function extractContactInput(
     department: pick("department"),
     email: pick("email"),
     phone: pick("phone"),
+    mobile: pick("mobile"),
     linkedinUrl: pick("linkedin"),
     country: normalizeAttribute(pick("contactcountry")) ?? normalizeAttribute(pick("companycountry")) ?? undefined,
     state: normalizeAttribute(pick("contactstate")) ?? normalizeAttribute(pick("companystate")) ?? undefined,
@@ -660,6 +662,14 @@ export function buildContact(params: {
   const email = normalizeEmail(params.input.email);
   const linkedin = normalizeLinkedin(params.input.linkedinUrl, "in");
   const name = params.input.name ?? [params.input.firstName, params.input.lastName].filter(Boolean).join(" ");
+  // Display values, not digit strings: the source formatting carries the country
+  // code and extension, and every number the record holds is kept (the canonical
+  // columns first, then any phone-like source attribute).
+  const numbers = extractPhoneNumbers({
+    phone: params.input.phone,
+    mobile: params.input.mobile,
+    attributes: params.input.attributes,
+  });
   return {
     id: contactId(`${params.company.id}|${params.rowFingerprint}`),
     companyId: params.company.id,
@@ -671,7 +681,9 @@ export function buildContact(params: {
     seniority: normalizeAttribute(params.input.seniority) ?? undefined,
     department: normalizeAttribute(params.input.department) ?? undefined,
     email: email ?? undefined,
-    phone: normalizePhone(params.input.phone) ?? undefined,
+    phone: numbers.phone ?? undefined,
+    mobile: numbers.mobile ?? undefined,
+    additionalPhones: numbers.additional.length ? numbers.additional : undefined,
     linkedinUrl: linkedin ? `https://${linkedin}` : undefined,
     country: normalizeAttribute(params.input.country) ?? undefined,
     state: normalizeAttribute(params.input.state) ?? undefined,

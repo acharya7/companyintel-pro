@@ -121,7 +121,7 @@ export default function Exports() {
                     setKind(next);
                     setColumns(
                       next === "contacts"
-                        ? ["fullName", "title", "email", "phone", "linkedinUrl", "companyName", "country", "city"]
+                        ? ["fullName", "title", "email", "phone", "mobile", "linkedinUrl", "companyName", "country", "city"]
                         : next === "companies"
                           ? ["name", "domain", "industry", "country", "city", "contactCount"]
                           : ["kind", "name", "companyName", "title", "email", "status", "tags", "savedAt"],

@@ -23,6 +23,7 @@ import type {
   UserSettings,
 } from "@/shared/models";
 import type { ExportRequestBody, SavedSearchRequest, SettingsRequest } from "@/shared/api-contract";
+import type { RealDataCoverageResponse } from "@/shared/realdata/types";
 
 export interface CompanySearchParams {
   query: string;
@@ -232,6 +233,12 @@ export interface DatasetModeInfo {
   description: string;
   /** True when rows on screen come from the bundled synthetic dataset. */
   synthetic: boolean;
+  /** Active version, when one is published. */
+  version: string | null;
+  /** True when real data is active but only part of the source corpus is indexed. */
+  partial?: boolean;
+  /** Coverage metadata from `/api/realdata/coverage`, when the deployment has it. */
+  coverage?: RealDataCoverageResponse | null;
 }
 
 type StatusLike =
@@ -246,9 +253,18 @@ export function datasetModeOf(status: StatusLike): DatasetMode {
   return status.indexed && status.activeVersion ? "real" : "no-dataset";
 }
 
-/** Label + explanation for a status, used by every banner and status pill. */
-export function datasetModeInfo(status: StatusLike): DatasetModeInfo {
+/**
+ * Label + explanation for a status, used by every banner and status pill.
+ *
+ * A published version is REAL DATA, and the coverage response says whether the
+ * whole corpus or only a measured prefix of it is indexed. This is the one label
+ * every screen reads, so the header, sidebar, footer and pages cannot disagree
+ * about which dataset is being served — and "Demo data" can only appear when the
+ * bundled synthetic adapter really is the source (`dataOrigin: "sample"`).
+ */
+export function datasetModeInfo(status: StatusLike, coverage?: RealDataCoverageResponse | null): DatasetModeInfo {
   const mode = datasetModeOf(status);
+  const activeVersion = status?.activeVersion ?? null;
   if (mode === "demo") {
     return {
       mode,
@@ -256,14 +272,33 @@ export function datasetModeInfo(status: StatusLike): DatasetModeInfo {
       description:
         "This preview is serving the bundled synthetic dataset. Nothing here is read from your Cloudflare R2 bucket.",
       synthetic: true,
+      version: null,
     };
   }
   if (mode === "real") {
+    const usableCoverage = coverage && coverage.dataOrigin === "r2" && (!coverage.version || coverage.version === activeVersion);
+    if (usableCoverage) {
+      const percent = coverage.coverage?.totals.coveragePercent ?? 0;
+      return {
+        mode,
+        label: coverage.partial ? "REAL DATA — PARTIAL COVERAGE" : "REAL DATA — COMPLETE COVERAGE",
+        description:
+          `${coverage.companies.toLocaleString("en-US")} companies and ${coverage.contacts.toLocaleString("en-US")} contacts ` +
+          `from ${coverage.version ?? activeVersion}; ${percent < 1 ? percent.toFixed(4) : percent.toFixed(2)}% of the ` +
+          "original source file bytes are indexed.",
+        synthetic: false,
+        version: coverage.version ?? activeVersion,
+        partial: coverage.partial,
+        coverage,
+      };
+    }
     return {
       mode,
-      label: `Live dataset ${status?.activeVersion}`,
-      description: `Search results come from the published index version ${status?.activeVersion} in company-intel-data.`,
+      label: `REAL DATA · ${activeVersion}`,
+      description: `Results come from the published index version ${activeVersion} in company-intel-data. Coverage metadata is unavailable for this request.`,
       synthetic: false,
+      version: activeVersion,
+      coverage: coverage ?? null,
     };
   }
   return {
@@ -273,6 +308,7 @@ export function datasetModeInfo(status: StatusLike): DatasetModeInfo {
       "No validated index version has been published to R2, so there are no real records to search yet. " +
       "Index locally, then publish a version.",
     synthetic: false,
+    version: null,
   };
 }
 
@@ -301,6 +337,8 @@ export const CONTACT_EXPORT_FIELDS = [
   "department",
   "email",
   "phone",
+  "mobile",
+  "additionalPhones",
   "linkedinUrl",
   "companyName",
   "country",

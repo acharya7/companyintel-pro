@@ -33,6 +33,7 @@ import {
 } from "../../src/shared/search/index-format";
 import { shardOf } from "../../src/shared/hash";
 import { normalizeQuery } from "../../src/shared/normalize";
+import { extractPhoneNumbers } from "../../src/shared/phone";
 import {
   commonPrefixLength,
   diceCoefficient,
@@ -70,6 +71,8 @@ export interface ContactSearchHit {
   department: string | null;
   email: string | null;
   phone: string | null;
+  mobile: string | null;
+  additionalPhones: string[];
   linkedinUrl: string | null;
   country: string | null;
   city: string | null;
@@ -245,6 +248,7 @@ function toHit(
   matchedTerms: string[],
 ): ContactSearchHit {
   const association = contact.association?.category ?? (unassigned ? "unresolved" : null);
+  const numbers = extractPhoneNumbers(contact);
   return {
     id: contact.id,
     fullName: displayName(contact),
@@ -255,7 +259,9 @@ function toHit(
     seniority: contact.seniority ?? null,
     department: contact.department ?? null,
     email: contact.email ?? null,
-    phone: contact.phone ?? null,
+    phone: numbers.phone,
+    mobile: numbers.mobile,
+    additionalPhones: numbers.additional,
     linkedinUrl: contact.linkedinUrl ?? null,
     country: contact.country ?? null,
     city: contact.city ?? null,

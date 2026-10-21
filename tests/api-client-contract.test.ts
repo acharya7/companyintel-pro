@@ -31,14 +31,14 @@ import {
 } from "../src/lib/api/types";
 import { LocalApiClient } from "../src/lib/api/local";
 import { ApiRequestError, WorkerApiClient } from "../src/lib/api/worker";
-import { createApiClient, withPersistentCache } from "../src/lib/api/client";
+import { apiMode, withPersistentCache } from "../src/lib/api/client";
 
 type AnyClient = Record<string, unknown>;
 
 const clients: { name: string; client: ApiClient }[] = [
   { name: "LocalApiClient (demo)", client: new LocalApiClient() },
   { name: "WorkerApiClient", client: new WorkerApiClient("https://example.invalid") },
-  { name: "wrapped client (createApiClient)", client: createApiClient() },
+  { name: "wrapped client (LocalApiClient)", client: withPersistentCache(new LocalApiClient()) },
 ];
 
 describe("every client implements the whole ApiClient interface at runtime", () => {
@@ -77,7 +77,14 @@ describe("every client implements the whole ApiClient interface at runtime", () 
 });
 
 describe("the caching wrapper delegates instead of replacing", () => {
-  const wrapped = createApiClient();
+  const wrapped = withPersistentCache(new LocalApiClient());
+
+  test("a build with no VITE_API_MODE talks to the Worker, never to sample data", () => {
+    // Cloudflare Workers Builds sets no VITE_* value. Defaulting that build to the
+    // synthetic adapter is what labelled a live deployment as demo data and showed
+    // the 9-contact synthetic Microsoft instead of the 30-contact real record.
+    expect(apiMode).toBe("worker");
+  });
 
   test("datasetStatus reaches the underlying client and keeps its contract", async () => {
     const status = await wrapped.datasetStatus();
@@ -192,5 +199,41 @@ describe("application modes are derived from a published manifest", () => {
     expect(datasetModeOf(undefined)).toBe("no-dataset");
     expect(datasetModeOf(null)).toBe("no-dataset");
     expect(datasetModeInfo(undefined).label).toBe("No dataset indexed");
+  });
+
+  test("a published partial dataset reads REAL DATA — PARTIAL COVERAGE on every screen", () => {
+    const status = { indexed: true, activeVersion: "stg-real-2026-10-21", dataOrigin: "r2" as const };
+    const label = datasetModeInfo(status).label;
+    expect(label).toContain("REAL DATA");
+    expect(label).not.toContain("Demo");
+
+    const coverage = {
+      version: "stg-real-2026-10-21",
+      dataOrigin: "r2" as const,
+      label: "REAL DATA — PARTIAL COVERAGE",
+      partial: true,
+      companies: 30_300,
+      contacts: 29_291,
+      coverage: {
+        format: 1,
+        version: "stg-real-2026-10-21",
+        label: "REAL DATA — PARTIAL COVERAGE",
+        partial: true,
+        dataOrigin: "index" as const,
+        generatedAt: "2026-10-21T15:48:00.000Z",
+        sources: [],
+        totals: { sourceBytesCovered: 85_318_900, sourceBytesTotal: 64_261_999_620, coveragePercent: 0.1328 },
+      },
+      scanBudgetMb: 48,
+      scanAvailable: true,
+      directScan: true,
+      checkedAt: "2026-10-21T15:55:00.000Z",
+      message: "Serving the activated partial index.",
+    };
+    const info = datasetModeInfo(status, coverage);
+    expect(info.label).toBe("REAL DATA — PARTIAL COVERAGE");
+    expect(info.partial).toBe(true);
+    expect(info.version).toBe("stg-real-2026-10-21");
+    expect(info.synthetic).toBe(false);
   });
 });

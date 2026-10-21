@@ -210,6 +210,28 @@ describe("Worker API routes (real fetch handler)", () => {
     );
     expect(filtered.status).toBe(200);
     expect(filtered.body.contacts.map((contact: { fullName: string }) => contact.fullName)).toEqual(["Amy Hood"]);
+
+    // Free text is part of the server-side filter, applied before pagination.
+    const searched = await api(`/api/companies/${encodeURIComponent(id)}/contacts?pageSize=25&query=amy`);
+    expect(searched.status).toBe(200);
+    expect(searched.body.contacts.map((contact: { fullName: string }) => contact.fullName)).toEqual(["Amy Hood"]);
+    expect(searched.body.page.total).toBe(1);
+
+    // `mobile` is a separate field, not folded into `phone` (csv2 carries a
+    // mobile column). The filter accepts either number and never counts a row
+    // that has neither.
+    const withPhone = await api(`/api/companies/${encodeURIComponent(id)}/contacts?pageSize=25&hasPhone=true`);
+    expect(withPhone.status).toBe(200);
+    expect(withPhone.body.contacts.length).toBeGreaterThan(0);
+    for (const contact of withPhone.body.contacts as Array<{ phone?: string; mobile?: string }>) {
+      expect(Boolean(contact.phone || contact.mobile)).toBe(true);
+    }
+    const all = await api(`/api/companies/${encodeURIComponent(id)}/contacts?pageSize=25`);
+    const judson = (all.body.contacts as Array<{ fullName: string; phone?: string; mobile?: string }>).find(
+      (contact) => contact.fullName === "Judson Althoff",
+    );
+    expect(judson?.mobile).toBe("+1 425 555 0199");
+    expect(judson?.phone).toBeUndefined();
   });
 
   test("a single contact resolves by id", async () => {
@@ -370,7 +392,7 @@ describe("Worker API routes (real fetch handler)", () => {
       "/api/exports",
       json("POST", {
         kind: "contacts",
-        columns: ["fullName", "title", "email", "companyName"],
+        columns: ["fullName", "title", "email", "phone", "mobile", "companyName"],
         contactIds,
         datasetVersion: fixture.version,
       }),
@@ -388,9 +410,13 @@ describe("Worker API routes (real fetch handler)", () => {
     expect(download.headers.get("cache-control")).toContain("no-store");
     const csv = await download.text();
     // Human-readable headers, in the column order the request asked for.
-    expect(csv.split("\r\n")[0]).toBe("Contact Name,Job Title,Email,Company");
+    expect(csv.split("\r\n")[0]).toBe("Contact Name,Job Title,Email,Phone,Mobile,Company");
     expect(csv).toContain("satya.nadella@microsoft.com");
     expect(csv).toContain("Microsoft Corporation");
+    // The exported mobile is the same value the contact endpoint returns.
+    expect(csv).toContain("+1 425 555 0199");
+    // Four contacts + the header line: the export reconciles with the page total.
+    expect(csv.trimEnd().split("\r\n")).toHaveLength(5);
   });
 
   test("unknown API routes return a structured 404, not an HTML crash", async () => {

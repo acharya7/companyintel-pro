@@ -115,7 +115,12 @@ export interface Contact {
   seniority?: string;
   department?: string;
   email?: string;
+  /** Work/landline number, exactly as the source row carried it. */
   phone?: string;
+  /** Mobile number, kept separate when the source identifies one. */
+  mobile?: string;
+  /** Further distinct numbers on the same record (never duplicates of `phone`/`mobile`). */
+  additionalPhones?: string[];
   linkedinUrl?: string;
   country?: string;
   state?: string;
@@ -150,12 +155,16 @@ export interface UnassignedContact extends Contact {
 
 /** Contact fields that can be filtered server-side (must match index metadata). */
 export interface ContactFilters {
+  /** Free-text match within this contact collection (name, title, department, email, number). */
+  query?: string;
   designation?: string;
   department?: string;
   seniority?: string;
   country?: string;
   city?: string;
   hasEmail?: boolean;
+  /** True when either a phone or a mobile number is available. */
+  hasPhone?: boolean;
   hasLinkedin?: boolean;
   /** Association categories to include; empty/absent means every category. */
   association?: AssociationCategory[];
@@ -224,6 +233,8 @@ export interface ContactSearchHit {
   department: string | null;
   email: string | null;
   phone: string | null;
+  mobile: string | null;
+  additionalPhones: string[];
   linkedinUrl: string | null;
   country: string | null;
   city: string | null;
@@ -601,6 +612,8 @@ export interface SavedContactLead {
   fullName: string;
   title?: string;
   email?: string;
+  phone?: string;
+  mobile?: string;
   linkedinUrl?: string;
   status: LeadStatus;
   tags: string[];

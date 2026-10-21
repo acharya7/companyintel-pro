@@ -11,6 +11,7 @@ import { useMutation, useQuery, useQueryClient, keepPreviousData } from "@tansta
 import { toast } from "sonner";
 import { createApiClient, apiMode, apiBaseUrl, configurePersistentCache, persistentCache, invalidateCacheForVersion } from "@/lib/api/client";
 import { datasetModeInfo } from "@/lib/api/types";
+import { useRealDataCoverage } from "@/hooks/use-realdata";
 import type { AssociationCategory } from "@/shared/association";
 import type { CompanyFilters, ContactFilters, CompanySortField, ContactSortField, LeadStatus, SortOrder } from "@/shared/models";
 import type { ExportRequestBody, SavedSearchRequest, SettingsRequest } from "@/shared/api-contract";
@@ -62,10 +63,16 @@ export function useDatasetStatus() {
  */
 export function useDatasetMode() {
   const status = useDatasetStatus();
-  const info = datasetModeInfo(status.data);
+  // Coverage and the active dataset version come from the API, not from a UI
+  // constant: a published version is REAL DATA, and its partial/complete state is
+  // whatever the deployment reports. A deployment without the real-data route
+  // (or a transient failure) yields null and the label falls back to the version.
+  const coverage = useRealDataCoverage();
+  const info = datasetModeInfo(status.data, coverage.data);
   return {
     ...info,
     status: status.data,
+    coverage: coverage.data,
     isLoading: status.isLoading,
     error: status.error,
     refetch: status.refetch,

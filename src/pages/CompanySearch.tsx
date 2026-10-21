@@ -28,6 +28,7 @@ import {
 } from "@/hooks/use-api";
 import { ASSOCIATION_CATEGORY_LABELS, type AssociationCategory } from "@/shared/association";
 import { RealDataCoverageNotice, SourceScanPanel } from "@/components/realdata";
+import { ContactNumbers } from "@/components/contact-numbers";
 import { useRealDataCoverage } from "@/hooks/use-realdata";
 import { formatNumber } from "@/lib/format";
 import type { CompanyFilters, CompanySortField, SortOrder } from "@/shared/models";
@@ -527,6 +528,7 @@ export default function CompanySearch() {
                                 {hit.email}
                               </span>
                             ) : null}
+                            <ContactNumbers contact={hit} showLabels={false} />
                             {[hit.city, hit.country].filter(Boolean).length ? (
                               <span className="inline-flex items-center gap-1.5">
                                 <MapPin className="size-3" />

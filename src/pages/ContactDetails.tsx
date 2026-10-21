@@ -12,12 +12,14 @@
  */
 
 import { Link, useParams } from "react-router";
-import { ArrowLeft, Building2, Copy, Linkedin, Mail, Phone, ShieldAlert } from "lucide-react";
+import { ArrowLeft, Building2, Copy, Linkedin, Mail, ShieldAlert } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { CardShell, ErrorBlock, InfoRow, LoadingBlock, LongText, PageHeader, Section } from "@/components/common";
+import { ContactNumbers } from "@/components/contact-numbers";
 import { useContact, useDatasetStatus } from "@/hooks/use-api";
 import { ASSOCIATION_CATEGORY_LABELS, type AssociationCategory, type AssociationRecord } from "@/shared/association";
+import { contactPhoneNumbers } from "@/shared/phone";
 import type { Contact } from "@/shared/models";
 import { formatNumber } from "@/lib/format";
 
@@ -168,7 +170,23 @@ export default function ContactDetails() {
   const attributes = Object.entries(contact as unknown as Record<string, unknown>).filter(
     ([key, value]) => !HIDDEN_KEYS.has(key) && displayValue(value) !== null,
   );
-  const identityKeys = new Set(["fullName", "firstName", "lastName", "title", "designation", "seniority", "department", "email", "phone", "linkedinUrl", "country", "state", "city"]);
+  const identityKeys = new Set([
+    "fullName",
+    "firstName",
+    "lastName",
+    "title",
+    "designation",
+    "seniority",
+    "department",
+    "email",
+    "phone",
+    "mobile",
+    "additionalPhones",
+    "linkedinUrl",
+    "country",
+    "state",
+    "city",
+  ]);
   const extra = attributes.filter(([key]) => !identityKeys.has(key));
   /*
    * The columns this record carries that are NOT part of the canonical model
@@ -226,12 +244,16 @@ export default function ContactDetails() {
                     </a>
                   </Button>
                 ) : null}
-                {contact.phone ? (
-                  <Button variant="outline" size="sm" className="gap-2" onClick={() => void navigator.clipboard?.writeText(contact.phone!)}>
-                    <Phone className="size-3.5" />
-                    {contact.phone}
-                  </Button>
-                ) : null}
+              </div>
+              <div className="mt-3 border-t border-border/60 pt-3">
+                <p className="text-[11px] font-medium uppercase tracking-[0.08em] text-muted-foreground">Phone numbers</p>
+                {contactPhoneNumbers(contact).all.length ? (
+                  <ContactNumbers contact={contact} className="mt-1.5 text-sm" />
+                ) : (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    No phone or mobile number is present in this contact's source row.
+                  </p>
+                )}
               </div>
             </Section>
           </CardShell>

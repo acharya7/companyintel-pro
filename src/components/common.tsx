@@ -182,8 +182,8 @@ export function DatasetModeBanner({
       icon: <Database className="mt-0.5 size-4 shrink-0" />,
     },
     real: {
-      title: "Live data — published R2 index",
-      body: "Results come from the active index version published in company-intel-data.",
+      title: "REAL DATA — published R2 index",
+      body: "Results come from the active index version published in company-intel-data; the coverage label above states how much of the source corpus it represents.",
       tone: "border-chart-2/40 bg-chart-2/10 text-chart-2",
       icon: <Database className="mt-0.5 size-4 shrink-0" />,
     },

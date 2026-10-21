@@ -37,6 +37,7 @@ import { DEFAULT_SETTINGS } from "@/shared/models";
 import { LEAD_STATUSES } from "@/shared/models";
 import { leadId } from "@/shared/hash";
 import { normalizeEmail, normalizeQuery } from "@/shared/normalize";
+import { extractPhoneNumbers } from "@/shared/phone";
 import { searchCompanies } from "@/shared/search/engine";
 import { LocalCandidateSource } from "@/shared/search/local-index";
 import { EXPORT_COLUMN_HEADERS, exportFilename, toCsv, type CsvColumn } from "@/shared/csv";
@@ -308,6 +309,7 @@ export class LocalApiClient implements ApiClient {
       const company = contact.companyId ? this.companyById.get(contact.companyId) : undefined;
       const claimed = (contact as Partial<UnassignedContact>).claimedCompanyName ?? null;
       const association = contact.association?.category ?? (company ? null : "unresolved");
+      const numbers = extractPhoneNumbers(contact);
       return {
         id: contact.id,
         fullName: contact.fullName,
@@ -318,7 +320,9 @@ export class LocalApiClient implements ApiClient {
         seniority: contact.seniority ?? null,
         department: contact.department ?? null,
         email: contact.email ?? null,
-        phone: contact.phone ?? null,
+        phone: numbers.phone,
+        mobile: numbers.mobile,
+        additionalPhones: numbers.additional,
         linkedinUrl: contact.linkedinUrl ?? null,
         country: contact.country ?? null,
         city: contact.city ?? null,
@@ -477,6 +481,8 @@ export class LocalApiClient implements ApiClient {
         fullName: contact.fullName,
         title: contact.title,
         email: contact.email ? normalizeEmail(contact.email) ?? undefined : undefined,
+        phone: extractPhoneNumbers(contact).phone ?? undefined,
+        mobile: extractPhoneNumbers(contact).mobile ?? undefined,
         linkedinUrl: contact.linkedinUrl,
       };
     }
@@ -649,8 +655,12 @@ export class LocalApiClient implements ApiClient {
           break;
         }
         const company = this.companyById.get(contact.companyId);
+        const numbers = extractPhoneNumbers(contact);
         rows.push({
           ...contact,
+          phone: numbers.phone ?? undefined,
+          mobile: numbers.mobile ?? undefined,
+          additionalPhones: numbers.additional.length ? numbers.additional : undefined,
           companyName: company?.name ?? "",
           companyDomain: company?.domain ?? "",
           industry: company?.industry ?? "",
@@ -695,7 +705,7 @@ export class LocalApiClient implements ApiClient {
     const columns: CsvColumn<Record<string, unknown>>[] = job.columns.map((column) => ({
       id: column,
       header: EXPORT_COLUMN_HEADERS[column] ?? column,
-      value: (row) => row[column],
+      value: (row) => (Array.isArray(row[column]) ? (row[column] as unknown[]).join("; ") : row[column]),
     }));
     return { csv: toCsv(rows, columns), rowCount: rows.length, truncated };
   }

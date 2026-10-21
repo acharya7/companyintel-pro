@@ -151,6 +151,8 @@ export interface ScannedContact {
   department?: string;
   email?: string;
   phone?: string;
+  mobile?: string;
+  additionalPhones?: string[];
   linkedinUrl?: string;
   companyName?: string;
   companyId?: string | null;

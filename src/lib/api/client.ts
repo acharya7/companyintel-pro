@@ -1,12 +1,17 @@
 /**
  * API client selection + cache layer 2 wiring.
  *
- *   VITE_API_MODE=worker  → Cloudflare Worker API (production behaviour)
- *   VITE_API_MODE=local   → synthetic sample dataset (preview only)
+ *   VITE_API_MODE=worker  → Cloudflare Worker API (the default)
+ *   VITE_API_MODE=local   → synthetic sample dataset (explicit opt-in only)
  *
- * The mode is explicit configuration, never an accidental fallback: if the
- * Worker is unreachable the app reports the error instead of silently
- * switching to sample data.
+ * The default is the Worker, not the sample dataset. A build with no environment
+ * configuration is what Cloudflare Workers Builds produces, and defaulting that
+ * build to `local` is how a deployment with live R2 data ended up labelling every
+ * screen as demo data and showing the synthetic Microsoft record. Sample data is
+ * now reachable only when someone explicitly asks for it.
+ *
+ * The mode is never an accidental fallback: if the Worker is unreachable the app
+ * reports the error instead of silently switching to sample data.
  */
 
 import type {
@@ -32,14 +37,7 @@ const env = (import.meta as unknown as { env?: ViteEnv }).env ?? {};
 const configuredMode = env.VITE_API_MODE?.trim();
 const configuredBaseUrl = env.VITE_API_BASE_URL?.trim();
 
-export const apiMode: "local" | "worker" =
-  configuredMode === "local"
-    ? "local"
-    : configuredMode === "worker"
-      ? "worker"
-      : configuredBaseUrl
-        ? "worker"
-        : "local";
+export const apiMode: "local" | "worker" = configuredMode === "local" ? "local" : "worker";
 
 export const apiBaseUrl = configuredBaseUrl ?? "";
 

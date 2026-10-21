@@ -115,10 +115,10 @@ export default function DatasetManagement() {
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
           label="Application mode"
-          value={mode.label}
+          value={mode.mode === "real" ? "REAL DATA" : mode.label}
           hint={
             mode.mode === "real"
-              ? "Serving a published R2 index version"
+              ? `${mode.partial ? "PARTIAL COVERAGE" : "COMPLETE COVERAGE"} · version ${mode.version ?? data.activeVersion ?? "unknown"}`
               : mode.mode === "demo"
                 ? "Bundled synthetic dataset — never presented as production data"
                 : "R2 reachable or not, nothing is published: search has no real records to return"

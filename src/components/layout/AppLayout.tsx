@@ -30,7 +30,7 @@ import { Input } from "@/components/ui/input";
 import { Sheet, SheetContent, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import { DatasetModeBanner, StatusPill } from "@/components/common";
+import { DatasetModeBanner, ErrorBlock, StatusPill } from "@/components/common";
 import { useDatasetMode, useLeads, useSavedSearches } from "@/hooks/use-api";
 import { useHydrated } from "@/hooks/use-hydrated";
 import { apiMode, relativeTime } from "@/lib/format-bridge";
@@ -105,8 +105,30 @@ function NavItems({ onNavigate }: { onNavigate?: () => void }) {
 }
 
 function DatasetPill() {
-  const { mode, label, description, status, isLoading } = useDatasetMode();
+  const { mode, label, description, status, isLoading, error, refetch } = useDatasetMode();
   if (isLoading) return <Badge variant="outline" className="animate-pulse text-xs">Checking dataset…</Badge>;
+  // A failed status request is NOT "no dataset" and must never be reported as
+  // demo data: say the truth and offer a retry.
+  if (error && !status) {
+    return (
+      <TooltipProvider delayDuration={400}>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <span className="inline-flex">
+              <StatusPill ok={false} label="Dataset status unavailable" />
+            </span>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" className="max-w-xs text-xs">
+            <p className="font-medium">The dataset status request failed.</p>
+            <p className="text-muted-foreground">{(error as Error).message}</p>
+            <button type="button" className="mt-1 font-medium text-primary hover:underline" onClick={() => void refetch()}>
+              Retry
+            </button>
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    );
+  }
   return (
     <TooltipProvider delayDuration={400}>
       <Tooltip>
@@ -187,7 +209,7 @@ function GlobalSearchField() {
 }
 
 export function AppLayout() {
-  const { mode, status: dataset } = useDatasetMode();
+  const { mode, label, status: dataset, error: datasetError, refetch: refetchDataset } = useDatasetMode();
   const [mobileOpen, setMobileOpen] = useState(false);
 
   return (
@@ -245,7 +267,13 @@ export function AppLayout() {
           <div className="lg:hidden">
             <GlobalSearch />
           </div>
-          {mode === "demo" || mode === "no-dataset" ? <DatasetModeBanner mode={mode} detail={dataset?.message} /> : null}
+          {datasetError && !dataset ? (
+            <ErrorBlock error={datasetError as Error} onRetry={() => void refetchDataset()} />
+          ) : mode === "demo" ? (
+            <DatasetModeBanner mode="demo" detail={dataset?.message} />
+          ) : mode === "no-dataset" ? (
+            <DatasetModeBanner mode="no-dataset" detail={dataset?.message} />
+          ) : null}
           <Outlet />
         </main>
         <footer className="mx-auto w-full max-w-[1500px] px-4 pb-8 text-[11px] text-muted-foreground sm:px-6">
@@ -254,13 +282,7 @@ export function AppLayout() {
             <span aria-hidden>·</span>
             <span>Cloudflare Workers + R2</span>
             <span aria-hidden>·</span>
-            <span>
-              {mode === "real"
-                ? `Live dataset ${dataset?.activeVersion}`
-                : mode === "demo"
-                  ? "Demo mode (bundled sample data)"
-                  : "No dataset indexed"}
-            </span>
+            <span>{mode === "real" ? label : mode === "demo" ? "Demo mode (bundled sample data)" : "No dataset indexed"}</span>
           </div>
         </footer>
       </div>

@@ -19,6 +19,7 @@ import { AlertTriangle, CheckCircle2, CircleStop, Database, Loader2, Mail, Play,
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useRealDataCoverage } from "@/hooks/use-realdata";
+import { ContactNumbers } from "@/components/contact-numbers";
 import { cancelSourceScan, getSourceScan, startSourceScan } from "@/lib/api/realdata";
 import { formatBytes, formatNumber, relativeTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
@@ -168,6 +169,7 @@ function ContactLine({ contact }: { contact: ScannedContact }) {
             {contact.email}
           </a>
         ) : null}
+        <ContactNumbers contact={contact} showLabels={false} copyable={false} />
         {contact.linkedinUrl ? (
           <a className="hover:text-foreground" href={contact.linkedinUrl} target="_blank" rel="noreferrer noopener">
             LinkedIn

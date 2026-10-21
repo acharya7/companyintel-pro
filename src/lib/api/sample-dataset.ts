@@ -16,11 +16,11 @@
 import type { AssociationCounts, Company, Contact, ContactFilters, FacetBucket, UnassignedContact } from "@/shared/models";
 import {
   MAX_CANDIDATE_IDS,
-  associationMatchesFilter,
   associateContact,
   type AssociationCandidate,
   type AssociationRecord,
 } from "@/shared/association";
+import { contactMatchesFilters as sharedContactMatchesFilters } from "@/shared/contact-filter";
 import { companyId, contactId } from "@/shared/hash";
 import { normalizeName, nameVariants } from "@/shared/normalize";
 
@@ -423,17 +423,7 @@ export function buildFacets(list: Contact[]): {
   };
 }
 
+/** Kept as a named export for existing callers; the rule lives in one place. */
 export function contactMatchesFilters(contact: Contact, filters?: ContactFilters): boolean {
-  if (!filters) return true;
-  if (filters.designation && contact.designation !== filters.designation) return false;
-  if (filters.department && contact.department !== filters.department) return false;
-  if (filters.seniority && contact.seniority !== filters.seniority) return false;
-  if (filters.country && contact.country !== filters.country) return false;
-  if (filters.city && contact.city !== filters.city) return false;
-  if (filters.hasEmail && !contact.email) return false;
-  if (filters.hasLinkedin && !contact.linkedinUrl) return false;
-  // One shared rule with the Worker (see `associationMatchesFilter`), so the
-  // preview and production cannot disagree about which contacts are trusted.
-  if (!associationMatchesFilter(contact.association?.category, filters.association)) return false;
-  return true;
+  return sharedContactMatchesFilters(contact, filters);
 }

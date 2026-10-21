@@ -17,6 +17,7 @@ import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { EmptyState, PageHeader, Section, StatCard } from "@/components/common";
+import { ContactNumbers } from "@/components/contact-numbers";
 import { downloadExportFile, useCreateExport, useDeleteLead, useLeads, useUpdateLead } from "@/hooks/use-api";
 import { formatNumber, leadStatusLabel, relativeTime } from "@/lib/format";
 import { LEAD_STATUSES } from "@/shared/models";
@@ -209,9 +210,12 @@ export default function SavedLeads() {
                               {lead.name}
                             </Link>
                           ) : (
-                            <div>
+                            <div className="min-w-0">
                               <p className="font-medium">{lead.fullName}</p>
                               <p className="text-[11px] text-muted-foreground">{lead.title ?? "—"}</p>
+                              {lead.kind === "contact" && (lead.phone || lead.mobile) ? (
+                                <ContactNumbers contact={lead} className="mt-1" showLabels={false} />
+                              ) : null}
                             </div>
                           )}
                         </div>

@@ -27,6 +27,7 @@ import type { BlobStore } from "../cloud/store";
 import { CsvParser, guessDelimiter, type CsvRecord } from "../../src/shared/csv-parse";
 import { companyId, contactId } from "../../src/shared/hash";
 import { normalizeName, normalizeQuery, nameVariants } from "../../src/shared/normalize";
+import { extractPhoneNumbers } from "../../src/shared/phone";
 import { editBudgetFor, editSimilarity, tokenOverlap } from "../../src/shared/search/similarity";
 import {
   REALDATA_LIMITS,
@@ -598,6 +599,8 @@ function absorbContact(
   if (!personScore && !atMatchedCompany) return;
   const email = pick(record, map, "email");
   const linkedinUrl = pick(record, map, "linkedin");
+  const attributes = record_attributes(record, map);
+  const numbers = extractPhoneNumbers({ phone: pick(record, map, "phone"), attributes });
   const contact: ScannedContact = {
     id: contactId(`${normalizedCompany}|${email ?? linkedinUrl ?? name}`),
     fullName: name,
@@ -608,7 +611,9 @@ function absorbContact(
     seniority: pick(record, map, "seniority"),
     department: pick(record, map, "department"),
     email,
-    phone: pick(record, map, "phone"),
+    phone: numbers.phone ?? undefined,
+    mobile: numbers.mobile ?? undefined,
+    additionalPhones: numbers.additional.length ? numbers.additional : undefined,
     linkedinUrl,
     companyName,
     companyId: companyByName.get(normalizedCompany)?.id ?? null,
@@ -616,7 +621,7 @@ function absorbContact(
     state: pick(record, map, "state"),
     city: pick(record, map, "city"),
     source: { id: "csv2", row: record.line },
-    attributes: record_attributes(record, map),
+    attributes,
   };
   const key = contactKey(contact);
   if (seen.has(key)) return;
