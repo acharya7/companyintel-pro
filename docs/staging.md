@@ -14,7 +14,7 @@ Everything in this document is checked into the workspace. Nothing is deployed y
 | Cloud Pass 1 (R2 chunker + segments + checkpoints) | implemented, tested, verified against real R2 |
 | Cloud Pass 2 (partition reduce + streaming shard merge) | implemented, tested, verified against real R2 |
 | Production build (`tsc -b && vite build`) | passes in this workspace (`dist/` built) |
-| Test suite | `613 pass, 0 fail` (51 files) |
+| Test suite | `628 pass, 0 fail` (52 files) |
 | Lint / typechecks (app, worker, indexer, probe) | pass |
 | `wrangler deploy --dry-run` (production and staging) | pass; container + bindings resolve |
 | Staging Worker config (`wrangler.staging.toml`) | written, dry-run validated (`companyintel-staging` + `INDEXER_CONTAINER` + `COMPANY_DATA` + `staging/active.json` all resolve) |
@@ -128,13 +128,35 @@ connecting the repository first, then choosing the Worker name):
 | API token | created by Cloudflare for Workers Builds (§5) |
 
 Verification that runs in the build itself: `bun run verify` = four typechecks + ESLint +
-the full suite (613 tests, including the staging-isolation and secret-placement guards).
+the full suite (628 tests, including the staging-isolation, API-routing and
+secret-placement guards).
 It fails the build rather than deploying a broken Worker, and it never touches production
 resources. `wrangler deploy` only runs after it passes, so a failed build cannot alter the
 production Worker.
 
 `bun run verify` runs the typechecks, the linter and the full test suite, then `bun run
-build` produces `dist/` which the Worker serves through the `ASSETS` binding. If the whole
+build` produces `dist/` which the Worker serves through the `ASSETS` binding.
+
+### API routing (why `/api/*` must run the Worker first)
+
+Workers Static Assets serves `dist/` before the Worker script, and this project sets
+`not_found_handling = "single-page-application"`. A deployment whose `[assets]` block omits
+`run_worker_first` therefore answers API paths from the asset layer: `/api/health` came back
+as an HTML page (not JSON) and `/indexing` showed "Cloudflare Access verification failed",
+because the control-plane request never reached the Worker that verifies Access.
+
+Both `wrangler.toml` and `wrangler.staging.toml` now declare:
+
+```toml
+[assets]
+run_worker_first = ["/api", "/api/*"]
+```
+
+Do not remove it, and do not narrow it below the API prefix. `tests/worker-entry-routing.test.ts`
+parses both configs, maps every `/api` route registered in `worker/` to the routing decision,
+and calls the real entrypoint with an ASSETS binding that answers every path with the shell.
+It fails if any API path can be answered by an asset, and it also keeps `/`, `/indexing` and
+`/assets/*` out of the worker-first list so the SPA still loads. If the whole
 command approaches the 20-minute build timeout, move the tests into a separate CI job and
 keep `bun install --frozen-lockfile && bun run build` as the build command — do not shorten
 the test suite.

@@ -18,7 +18,7 @@ Objects, no Redis/Upstash, no Elasticsearch/Algolia/Meilisearch/Typesense server
 | `tools/indexer/` | Windows-compatible streaming CSV indexer (Node/Bun, disk-backed) |
 | `tests/` | Unit, relevance, indexer, CSV, and Access-security tests (`bun test`) |
 | `scripts/` | QA, benchmark and R2 verification helpers |
-| `wrangler.toml` | Worker, static assets and `COMPANY_DATA` R2 binding |
+| `wrangler.toml` | Worker, static assets (`run_worker_first` on `/api`), `COMPANY_DATA` R2 binding |
 
 `src/shared/**` is imported by the frontend, the Worker **and** the indexer, so query
 normalization, ranking and index layout cannot drift between write and read paths.

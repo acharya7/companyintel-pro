@@ -34,6 +34,15 @@ workers_dev = false
 directory = "./dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
+# Requests are routed to the asset layer FIRST. With SPA handling enabled, a path
+# that is not a file is answered with ./dist/index.html (or an asset 404), so
+# `/api/*` would never reach this Worker and `/api/health` would return HTML.
+# `run_worker_first` sends these paths to the Worker before any asset is served;
+# the Worker then answers JSON for them (worker/src/index.ts + app.ts) and keeps
+# serving the SPA shell through the ASSETS binding for everything else.
+# tests/worker-entry-routing.test.ts reads this list and fails if it stops covering
+# a real API route.
+run_worker_first = ["/api", "/api/*"]
 
 # ---------------------------------------------------------------------------
 # R2 — the ONLY persistent cloud data store. Private bucket; no r2.dev URL, no

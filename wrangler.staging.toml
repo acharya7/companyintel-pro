@@ -48,6 +48,11 @@ workers_dev = true
 directory = "./dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
+# Identical routing to production: `/api/*` reaches the Worker (and therefore
+# Cloudflare Access verification) before the asset layer. Without this the SPA
+# fallback answers the API — the staging panel showed "Cloudflare Access
+# verification failed" and `/api/health` returned an HTML page instead of JSON.
+run_worker_first = ["/api", "/api/*"]
 
 # Same bucket, private, binding-only. No S3 keys in the Worker.
 [[r2_buckets]]

@@ -28,7 +28,7 @@ bun install
 bun run check          # typechecks (frontend, worker, indexer) + full test suite
 ```
 
-Expected: `613 pass` and no TypeScript errors (`bun run verify` runs all four typechecks, the
+Expected: `628 pass` across 52 files and no TypeScript errors (`bun run verify` runs all four typechecks, the
 linter and the suite). If this fails, fix it before deploying.
 
 ## 2. Log in to Cloudflare from the command line
@@ -84,6 +84,14 @@ bun run build
 Expected: Vite writes `dist/`. `wrangler.toml` serves that directory through the `ASSETS`
 binding with an SPA fallback, so `/companies/...` deep links work.
 
+Static assets are served **before** the Worker script. `[assets]` therefore also sets
+`run_worker_first = ["/api", "/api/*"]`, which sends every API path to the Worker first;
+the Worker answers those paths as JSON and keeps serving the shell for everything else.
+Remove that line and the SPA fallback answers the API instead: `/api/health` returns an HTML
+page and `/indexing` reports "Cloudflare Access verification failed". The setting is
+therefore a deployment requirement, not a tuning knob — `tests/worker-entry-routing.test.ts`
+fails if either Wrangler config stops routing a registered `/api` route to the Worker.
+
 If you want the deployed UI to talk to the Worker API, set `VITE_API_MODE=worker` in your
 build environment (and `VITE_API_BASE_URL` only if the API lives on another origin). Without
 it the deployed bundle falls back to the clearly-labelled synthetic sample mode.
@@ -129,12 +137,17 @@ page appearing is the proof that Access is protecting the origin.
 # Unauthenticated API call must be rejected (expect 401/403, never 200)
 curl.exe -i https://companyintel.<your-subdomain>.workers.dev/api/health
 
-# Behind Access (browser session cookie present), the same route returns {"status":"ok"}
+# Behind Access (browser session cookie present), the same route returns JSON
+# {"ok":true,"service":"companyintel-worker",...}
 ```
+
+Both answers must be in the shape above: a 401/403 **JSON** error without a session, and JSON
+(never HTML) with one. An HTML page here means the request was answered by the static-asset
+layer — check `[assets].run_worker_first` before anything else.
 
 In the browser, signed in:
 
-1. `/api/health` → `{"status":"ok"}`.
+1. `/api/health` → `{"ok":true,"service":"companyintel-worker",…}`.
 2. `/dataset` → shows bucket connectivity, source files, active version (or "Dataset not
    indexed" before your first publish).
 3. `/companies` → searches return results from the active version.

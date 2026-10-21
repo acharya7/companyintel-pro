@@ -7,7 +7,7 @@
  * through the sharded index and bounded profile reads only.
  */
 
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { z } from "zod";
 import {
   MAX_EXPORT_ROWS,
@@ -1034,6 +1034,29 @@ app.get("/api/exports/:id/download", async (c) => {
   c.header("cache-control", "private, no-store");
   return c.body(csv);
 });
+
+/* --------------------------- API fallback -------------------------------- */
+
+/**
+ * An unknown `/api/*` path is an API error, never a page.
+ *
+ * Without this, an unrouted API path falls through to the static handler below
+ * and is answered with the SPA shell, which a JSON client can only report as a
+ * parse failure — the same symptom as the routing bug where the asset layer
+ * answered `/api/*` before the Worker was invoked. `/api/health` returning HTML
+ * was indistinguishable from `/api/nope` doing the same; now only the latter
+ * exists, and it is JSON.
+ */
+function apiNotFound(c: Context<{ Bindings: Env; Variables: Variables }>): Response {
+  const path = new URL(c.req.url).pathname;
+  return c.json(
+    { error: { code: "not_found" as const, message: `No API route for ${c.req.method} ${path}.` } },
+    404,
+  );
+}
+
+app.all("/api", apiNotFound);
+app.all("/api/*", apiNotFound);
 
 /* --------------------------- static frontend ----------------------------- */
 

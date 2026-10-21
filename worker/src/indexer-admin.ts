@@ -77,6 +77,32 @@ indexingAdmin.use("*", async (c, next) => {
   await next();
 });
 
+/**
+ * Unmatched `/api/cloud/…` paths are JSON errors too.
+ *
+ * Hono's default 404 is a plain-text body. A control-plane client parses JSON, so
+ * an unknown route must look like a control-plane error — and, like every route
+ * above, it must never be answered by the SPA shell.
+ */
+indexingAdmin.notFound((c) =>
+  c.json(
+    { error: { code: "not_found" as const, message: `No cloud indexing route for ${c.req.method} ${new URL(c.req.url).pathname}.` } },
+    404,
+  ),
+);
+
+indexingAdmin.onError((error, c) => {
+  if (error instanceof AccessError) {
+    return c.json({ error: { code: error.code, message: error.message } }, error.status as 401);
+  }
+  // No internal message, no binding value, no credential: the operator sees a
+  // stable code and the detail stays in the platform logs.
+  return c.json(
+    { error: { code: "internal" as const, message: "The indexing control plane failed to handle this request." } },
+    500,
+  );
+});
+
 /* ------------------------------ helpers ---------------------------------- */
 
 /**

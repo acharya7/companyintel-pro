@@ -963,3 +963,61 @@ Confirmed by bundling the real entrypoints:
 The image itself was **not** built: this workspace has no Docker daemon. Workers Builds is
 the first real builder; the build is not claimed to pass until Cloudflare reports it
 successful.
+
+## Phase P — the deployed staging API was answered by the asset layer (fixed)
+
+Symptom on `companyintel-staging`: the UI loaded behind Cloudflare Access, but `/indexing`
+reported **"Cloudflare Access verification failed"** and `/api/health` returned an HTML page
+instead of API JSON.
+
+### Root cause
+
+Workers Static Assets runs before the Worker script, and both Wrangler configs set
+`not_found_handling = "single-page-application"` without `assets.run_worker_first`. Every
+`/api/*` path was therefore resolved by the asset layer — the SPA shell, or its 404 page —
+and never reached `worker/src/index.ts`. The control-plane router (which is what emits the
+"Cloudflare Access verification failed" message) was not the code answering the request.
+The Worker code was correct; the deployment's routing was not.
+
+### Fix
+
+- `wrangler.toml` and `wrangler.staging.toml` now declare, inside `[assets]`:
+  `run_worker_first = ["/api", "/api/*"]`. `/api/*` reaches the Worker (and therefore
+  Access verification) first; `/`, `/indexing`, `/companies/…` and `/assets/*` are still
+  served by the asset layer, so the SPA keeps working.
+- `worker/src/app.ts` answers unknown `/api/*` paths with a JSON 404 instead of falling
+  through to the SPA handler, and `worker/src/indexer-admin.ts` answers unknown
+  `/api/cloud/…` paths the same way (Hono's default is plain text) and no longer leaks an
+  internal error message. A missing API route can no longer look like a page.
+- `worker/src/index.ts` documents the routing contract in the one file that depends on it.
+- `tests/worker-entry-routing.test.ts` (new) parses both real Wrangler configs, extracts
+  every `/api` route registered in `worker/src/app.ts` and `worker/src/indexer-admin.ts`,
+  and asserts each one routes to the Worker first with no negative pattern taking it back;
+  it also keeps `/`, `/indexing` and `/assets/…` out of the list. It then calls the real
+  entrypoint with an `ASSETS` binding that answers **every** path with the SPA shell and
+  requires JSON from `/api/health`, `/api/cloud/jobs`, every registered API route, and the
+  unknown-path 404s — plus the unauthenticated refusal and the dev-bypass refusal.
+
+Preserved unchanged: Access JWT verification (both routers), the four Access settings
+(`CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD`, `ALLOWED_EMAILS`, `INDEXING_ADMIN_EMAILS` remain
+`wrangler secret put` values and are absent from both configs), staging isolation
+(`STAGING_MODE`, `ACTIVE_MANIFEST_KEY`), the R2 binding, the Container block/migration and
+`CLOUD_JOB_BUDGET_USD` (30 production / 5 staging). `tests/staging-config.test.ts`,
+`tests/staging-isolation.test.ts` and `tests/cloud-admin-deploy.test.ts` still pass.
+
+### Verification
+
+| Check | Result |
+| --- | --- |
+| `bun test tests/worker-entry-routing.test.ts` | **PASS** — 15 tests, 0 fail |
+| `bun run verify` (Bun 1.4.2) | **PASS** — four typechecks, ESLint, **628 pass / 0 fail** across 52 files |
+| `bun run build` | **PASS** — `tsc -b` + Vite, 43 assets written to `dist/` |
+| `bunx wrangler deploy --dry-run --containers-rollout=none` (production) | **PASS** — config accepted, 43 asset files, `ASSETS`/`COMPANY_DATA`/`INDEXER_CONTAINER` bindings, container `companyintel-indexercontainer` |
+| `bunx wrangler deploy --dry-run --containers-rollout=none -c wrangler.staging.toml` | **PASS** — `companyintel-staging`, `STAGING_MODE="true"`, `ACTIVE_MANIFEST_KEY="staging/active.json"`, `CLOUD_JOB_BUDGET_USD="5"`, container `companyintel-staging-indexercontainer` |
+
+### Not verified here
+
+The asset router's decision is not observable locally: `--dry-run` validates the config and
+bundles the Worker but no request is served. Confirmation needs the deployed staging Worker
+(`/api/health` → JSON, `/indexing` → jobs list) after Workers Builds deploys this commit.
+Nothing was indexed, activated, deleted or promoted for this phase.

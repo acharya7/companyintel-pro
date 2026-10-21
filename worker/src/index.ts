@@ -5,6 +5,15 @@
  * served through the `ASSETS` binding (Workers Static Assets) with an SPA
  * fallback, and `/api/*` is handled by the application router.
  *
+ * Routing order matters. Workers Static Assets answers a request from `./dist`
+ * before this script runs, and with `not_found_handling = "single-page-application"`
+ * an unmatched path becomes the SPA shell (or an asset 404) — so an API path that
+ * is not listed in `assets.run_worker_first` never reaches this file at all. Both
+ * `wrangler.toml` and `wrangler.staging.toml` therefore declare
+ * `run_worker_first = ["/api", "/api/*"]`, and `tests/worker-entry-routing.test.ts` checks
+ * the config and this dispatch together, because the failure mode is silent: the
+ * browser gets HTML where it expected JSON.
+ *
  * `/api/cloud/*` is the indexing control plane. It is routed separately because it
  * is not part of the search API: it verifies Access itself, checks the admin
  * allowlist, and is the only place that can start the indexing container.
@@ -30,9 +39,13 @@ export { IndexerContainer };
 export default {
   fetch(request: Request, env: EnvWithContainer, ctx: ExecutionContext): Response | Promise<Response> {
     const path = new URL(request.url).pathname;
+    // The indexing control plane (mounted with basePath `/api/cloud`).
     if (path === "/api/cloud" || path.startsWith("/api/cloud/")) {
       return indexingAdmin.fetch(request, env, ctx);
     }
+    // Everything else — including every other `/api/*` path — goes through the
+    // Hono app, which answers unknown API paths with JSON 404 and only falls back
+    // to the SPA shell for non-API paths.
     return app.fetch(request, env, ctx);
   },
 } satisfies ExportedHandler<EnvWithContainer>;
