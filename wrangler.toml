@@ -1,7 +1,7 @@
 # CompanyIntel — Cloudflare Workers + R2 deployment configuration.
 #
 # Deploy:   bunx wrangler deploy
-# Staging:  bunx wrangler deploy -c wrangler.staging.toml   (see wrangler.staging.toml)
+# Staging:  bunx wrangler deploy -c wrangler.staging.toml --keep-vars
 # Preview:  bunx wrangler dev            (local, synthetic data allowed)
 #
 # Secrets are NEVER stored in this file. Set them once with:
