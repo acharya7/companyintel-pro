@@ -107,6 +107,8 @@ export interface ScanOptions {
   onProgress?: (status: RealDataScanStatus) => void;
   /** Test seam: makes the clock deterministic. */
   now?: () => Date;
+  /** Wall-clock cap for one attempt (milliseconds). Default 180 s. */
+  maxDurationMs?: number;
 }
 
 export interface ScanRunResult {
@@ -248,6 +250,13 @@ export async function runScan(options: ScanOptions): Promise<ScanRunResult> {
   const normalizedQuery = normalizeQuery(query);
   const store = options.store;
   const cancelKey = realDataKeys.scanCancel(options.jobId);
+  /**
+   * A time cap in addition to the byte cap. A byte budget bounds the money; this
+   * bounds how long one container attempt holds the instance, so a pathological
+   * record cannot keep a scan alive indefinitely. The job is resumable, and the byte
+   * budget is cumulative, so a resume cannot multiply the spend.
+   */
+  const deadline = Date.now() + (options.maxDurationMs ?? 180_000);
 
   const existingStatus = await store.getJson<RealDataScanStatus>(realDataKeys.scanStatus(options.jobId));
   const existingResults = await store.getJson<RealDataScanResults>(realDataKeys.scanResults(options.jobId));
@@ -426,6 +435,12 @@ export async function runScan(options: ScanOptions): Promise<ScanRunResult> {
     // A resume starts exactly on a record boundary, so the parser sees a full record
     // stream from its first byte.
     while (offset < hardEnd) {
+      if (Date.now() > deadline) {
+        status.reason = "The scan reached its time limit for one attempt; run it again to continue from the committed record boundary.";
+        status.state = "running";
+        await persist(true);
+        return { status, results };
+      }
       if (await cancelled()) {
         if (lastBoundary > progress.bytesScanned) {
           progress.bytesScanned = lastBoundary;

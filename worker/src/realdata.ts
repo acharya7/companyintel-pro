@@ -280,6 +280,8 @@ realdataRoutes.post("/api/realdata/scan", async (c) => {
     String(maxMb),
     "--limit",
     String(limit),
+    "--max-seconds",
+    "180",
     "--dataset-version",
     datasetVersion,
   ];

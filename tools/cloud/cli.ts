@@ -649,6 +649,7 @@ async function scan(store: R2BlobStore): Promise<void> {
     kindValue === "companies" || kindValue === "contacts" || kindValue === "both" ? kindValue : "both";
   const maxMb = Math.min(num("max-mb") ?? REALDATA_LIMITS.defaultScanMb, REALDATA_LIMITS.maxScanMb);
   const limit = Math.min(num("limit") ?? REALDATA_LIMITS.defaultLimit, REALDATA_LIMITS.maxLimit);
+  const maxSeconds = Math.max(10, Math.min(num("max-seconds") ?? 180, 900));
   const datasetValue = flag("dataset-version");
   const datasetVersion = typeof datasetValue === "string" ? datasetValue : "unknown";
   console.log(`Direct R2 scan ${id}\n  query ${JSON.stringify(queryValue)}\n  kind ${kind}\n  budget ${maxMb} MB/source · limit ${limit}`);
@@ -660,6 +661,7 @@ async function scan(store: R2BlobStore): Promise<void> {
     datasetVersion,
     maxBytesPerSource: Math.round(maxMb * 1024 * 1024),
     limit,
+    maxDurationMs: maxSeconds * 1000,
     onLog: (line) => console.log(`  ${line}`),
   });
   console.log(
@@ -686,7 +688,7 @@ async function main(): Promise<void> {
         "  verify    --version <id> --config <cfg>",
         "  pass2     --version <id> --config <cfg> [--partitions <n>] [--work-dir <dir>] [--allow-bounded]",
         "  assemble  --version <id> [--work-dir <dir>] [--partitions <n>]",
-        "  scan      --version scan-<id> --query <text> [--kind companies|contacts|both] [--max-mb 48] [--limit 50] [--dataset-version <id>]",
+        "  scan      --version scan-<id> --query <text> [--kind companies|contacts|both] [--max-mb 48] [--max-seconds 180] [--limit 50] [--dataset-version <id>]",
         "",
         "Sources must be r2://<bucket>/<key>; the bucket comes from the credentials.",
       ].join("\n"),

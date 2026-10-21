@@ -32,7 +32,7 @@ No Convex, no SQL database, no KV/D1/Durable Objects, no Redis, no search server
   contact is attached to a company only on evidence (row identity, email domain, country), never
   on a name match alone; ambiguous contacts are preserved under the name they claimed instead of
   being shown as employees (`docs/association.md`)
-- Tests: `bun test` (709 tests, 0 fail) — normalization, relevance, prototype-chain safety,
+- Tests: `bun test` (710 tests, 0 fail) — normalization, relevance, prototype-chain safety,
   CSV/indexer, R2 store, end-to-end index + Worker API over a generated index, the bounded
   hydration funnel, two-stage association (identity ownership, no-claim rows, preservation,
   dedupe, order-independence, reconciliation), the association scenario corpus, the association

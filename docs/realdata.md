@@ -96,6 +96,9 @@ bun tools/cloud/cli.ts scan --version scan-<id> --query "…" --kind both \
   much source remains outside the scan.
 * **Cancellation** is a durable `cancel.json` checked between windows; the job keeps
   what it already found and marks itself `cancelled`.
+* **Time and spend limits.** One attempt has a 180 s wall-clock cap in addition to the
+  per-source byte budget; a time-limited attempt is resumable and the byte budget is
+  cumulative, so a resume cannot multiply the expense.
 * **Dedupe** by normalised name **and domain** for companies (so “Acme Corporation”
   and “Acme, Inc.” stay separate records) and by email → LinkedIn → name+employer
   for contacts. The result limit is explicit (`truncated` + `dropped`).
@@ -187,6 +190,69 @@ after signing in through Access. It should answer
 counts above. The seven existing runtime settings and `--keep-vars` behaviour are
 unchanged; `REALDATA_SCAN_MAX_MB` was added as an eighth var with a code default, so
 an older deployment still behaves conservatively (48 MB) if the var is absent.
+
+## Verified against the real bucket (local harness, 2026-10-21)
+
+The **running preview** in this workspace is serving the REAL Worker API against the
+real bucket. It was switched to the launch version with the dev-only Dataset
+activation (`{version: "stg-real-2026-10-21", confirm: true}`, an in-process pointer —
+the R2 production pointer was not touched), and `GET /api/realdata/coverage` then
+answered `200` with the 30,300 / 29,291 counts, 0.1328% and the partial-coverage label.
+Over that HTTP endpoint the ten acceptance queries below returned real records with
+HTTP 200; `/api/companies/<Microsoft id>/contacts` returned its 30 contacts; and the
+new `src/components/realdata.tsx` module compiled through Vite (HTTP 200).
+
+`bun run realdata:accept` additionally drives the **real Worker fetch handler** over the
+**real R2 bucket** through a read-only binding shim with the local development identity. That is
+the production routing, Access middleware, search engine and R2 read path; the only
+substitutions are the binding and the identity. It is **not** a deployed-host
+measurement — every read below crossed the public S3 endpoint from this workspace, so
+the wall times are an upper bound for the deployed Worker, which reads through the
+in-cloud `COMPANY_DATA` binding. The raw evidence file is intentionally git-ignored
+(it contains real names and emails).
+
+Coverage route: `200`, 764 ms, `stg-real-2026-10-21`, **REAL DATA — PARTIAL COVERAGE**,
+30,300 companies, 29,291 contacts, 0.1328% of 64.26 GB.
+
+| Company query | Result | Hits | Wall / API |
+| --- | --- | --- | --- |
+| `Microsoft` | exact first | Microsoft (US, software, 30 contacts) | 5,243 / 4,689 ms |
+| `Microsft` | typo corrected | Microsoft first, 8 ranked | 2,071 / 1,801 ms |
+| `Tata Motors` | exact first | Tata Motors (India, automotive, 6 contacts) | 3,590 / 3,321 ms |
+| `Infosys` | exact first | Infosys (India, IT services, 25 contacts) | 3,309 / 3,005 ms |
+| `United Nations` | exact first | United Nations (US, international affairs, 7 contacts) | 2,091 / 1,825 ms |
+
+| Contact query | Result | Wall / API |
+| --- | --- | --- |
+| `Nancy Mugo` | Nancy Mugo · United Nations · work email present | 5,350 / 5,129 ms |
+| `Yoppi Zaburianto` | Yoppi Zaburianto · Bina Nusantara University | 4,773 / 4,313 ms |
+| `Jorge Ramos` | Jorge Ramos · Despacho Presidencial | 4,019 / 3,533 ms |
+| `Marisol Pasten` | Marisol Pasten · Independiente · email present | 3,603 / 3,017 ms |
+| `Rosa Ojeda` | Rosa Ojeda · Banco Bci · work email present | 3,462 / 2,911 ms |
+
+Company → contact relationship: `GET /api/companies/<Microsoft id>/contacts` returned
+`200` with **30** linked contacts, including titles and work addresses.
+
+Cache evidence from the same run: the cold `Microsoft` query read 76 objects (9.68 MB);
+the following `Microsft` query answered with **23 cache hits and 3 R2 reads**, and every
+later query also reused the isolate cache. The demo hides no caching: the counters come
+from the search response's own `retrieval.r2` block.
+
+Direct scan canary through the **exact CLI command the container runs**
+(`bun tools/cloud/cli.ts scan … --max-mb 2`): `scan-canary-realdata-1` scanned
+4.7 MB of the real sources, 5,465 rows, found Bina Nusantara University with two
+linked employees, and wrote `status.json`, `results.json` and the
+`cloud/jobs/<id>/{state,run}.json` heartbeat. A repeat was served from its completed
+state without reading the sources again.
+
+Through the preview's HTTP API the same five company queries answered in 1.1–7.1 s and
+the five contact queries in 3.8–7.6 s; every one reported `HTTP 200`. These are
+workspace-to-R2 times, not Cloudflare-isolate times.
+
+What this proves: real R2 records are returned for both kinds, exact/typo/partial
+matching works, relationships resolve, coverage is measured, the UI compiles and the
+scanner command is operational. What it does not prove: the deployed container start, Access sign-in,
+or live latency — see “Deployment”.
 
 ## What is deliberately not implemented
 

@@ -134,6 +134,7 @@ describe("REAL DATA direct scans", () => {
     expect(starts[0].args[starts[0].args.indexOf("--max-mb") + 1]).toBe("12");
     expect(starts[0].args[starts[0].args.indexOf("--dataset-version") + 1]).toBe(fixture.version);
     expect(starts[0].args[starts[0].args.indexOf("--query") + 1]).toBe("Microsoft");
+    expect(starts[0].args[starts[0].args.indexOf("--max-seconds") + 1]).toBe("180");
   });
 
   test("a duplicate start reuses the running job instead of launching a second scan", async () => {

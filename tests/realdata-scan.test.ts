@@ -279,6 +279,23 @@ describe("bounded direct R2 scan", () => {
     expect(result.status.totals.coveragePercent).toBeLessThan(100);
   });
 
+  test("stops an attempt at its time limit and leaves a resumable state", async () => {
+    const bucket = largeStore();
+    const result = await runScan({
+      ...base,
+      store: bucket,
+      jobId: "scan-time-limit",
+      query: "Acme",
+      kind: "companies",
+      maxDurationMs: 0,
+    });
+    expect(result.status.state).toBe("running");
+    expect(result.status.complete).toBe(false);
+    expect(result.status.reason).toContain("time limit");
+    // Nothing claimed: no source bytes were processed.
+    expect(result.status.totals.bytesScanned).toBe(0);
+  });
+
   test("refuses to scan a source whose header lost the mapped column", async () => {
     const bucket = new MemoryBlobStore();
     bucket.put("raw/file1.csv", Buffer.from("wrong\tcolumns\n1\t2\n"));
