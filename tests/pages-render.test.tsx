@@ -187,6 +187,12 @@ describe("pages render without a missing API method", () => {
     const html = await renderPage(<IndexingControl />);
     expect(html).toContain("Cloud indexing");
     expect(html).toContain("No cloud indexing job yet");
+    // The bounded benchmark is how the FIRST job is created, so its controls must
+    // render with an empty job list. They used to sit inside the non-empty branch.
+    expect(html).toContain("Bounded benchmark");
+    expect(html).toContain("Run benchmark");
+    expect(html).toContain("Version id");
+    expect(html).toContain("MB per source");
   });
 
   test("Dashboard renders in no-dataset mode and says so", async () => {

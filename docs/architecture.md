@@ -386,7 +386,7 @@ not allowed), `404`, `429` (rate limited), `500`, or `503` when no dataset versi
 
 | Method | Route | Purpose |
 | --- | --- | --- |
-| GET | `/api/health` | liveness + environment + identity email |
+| GET | `/api/health` | liveness + environment + identity email + presence (never values) of the seven runtime settings |
 | GET | `/api/dataset/status` | active/previous version, manifests, source ids, progress |
 | GET | `/api/dataset/sources` | bounded LIST of `raw/` (≤ 25 objects) — Dataset page only |
 | GET | `/api/dataset/stats` | pre-computed aggregate stats (dashboard charts) |

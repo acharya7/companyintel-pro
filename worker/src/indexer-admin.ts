@@ -374,10 +374,33 @@ async function startInContainer(
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ args, detach: true }),
     });
+    // The DO answers JSON for every failure: `container_not_ready` while a cold
+    // start is still in progress, `cli_missing` when the image is broken, or
+    // `job_failed_to_start` with the child's stderr when the command died
+    // immediately. None of those may read as a successful start.
+    const payload = (await response.json().catch(() => null)) as
+      | { started?: boolean; completed?: boolean; exitCode?: number | null; output?: string; error?: { code?: string; message?: string; detail?: string } }
+      | null;
     if (!response.ok) {
+      const code = payload?.error?.code ?? "container_rejected";
+      const message = payload?.error?.message ?? `The indexing container rejected the job (HTTP ${response.status}).`;
       return c.json(
-        { error: { code: "container_rejected" as const, message: (await response.text()).slice(0, 500) } },
-        502,
+        { error: { code, message, ...(payload?.error?.detail ? { detail: payload.error.detail } : {}) } },
+        response.status === 503 ? 503 : 502,
+      );
+    }
+    if (payload?.started === false) {
+      // The command finished inside the runner's settle window (exit 0). Reporting
+      // 202 here would be the same lie as before, only in the other direction.
+      return c.json(
+        {
+          started: false,
+          completed: Boolean(payload.completed),
+          exitCode: payload.exitCode ?? 0,
+          output: payload.output ?? "The command completed before it could be detached.",
+          ...summary,
+        },
+        200,
       );
     }
     return c.json({ started: true, ...summary }, 202);

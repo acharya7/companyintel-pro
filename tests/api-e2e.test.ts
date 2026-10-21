@@ -87,6 +87,45 @@ describe("Worker API routes (real fetch handler)", () => {
     expect(typeof body.identity).toBe("string");
   });
 
+  test("GET /api/health reports which runtime settings are present, never a value", async () => {
+    const { body } = await api("/api/health");
+    // This test environment deliberately has no Access settings and no container
+    // credentials: the payload must say so instead of omitting the section.
+    expect(body.settings.access).toEqual({
+      teamDomain: false,
+      audience: false,
+      allowedEmails: false,
+      indexingAdmins: false,
+    });
+    expect(body.settings.containerCredentials).toBe(0);
+    expect(body.settings.jobBudget).toBe(false);
+
+    // With the container settings present the count is exact — and the response
+    // still contains none of their values. (The Access values cannot be set here:
+    // configuring a team domain would disable this test's dev identity, so the
+    // Access booleans are only asserted in their absent state above.)
+    const configured = {
+      ...env,
+      INDEXING_ADMIN_EMAILS: "operator@example.com",
+      R2_ACCOUNT_ID: "account-id-value",
+      R2_ACCESS_KEY_ID: "access-key-value",
+      R2_SECRET_ACCESS_KEY: "secret-access-value",
+      CLOUD_JOB_BUDGET_USD: "5",
+    } as unknown as Env;
+    const response = await app.fetch(new Request("https://companyintel.example/api/health"), configured, ctx);
+    expect(response.status).toBe(200);
+    const text = await response.text();
+    const configuredBody = JSON.parse(text) as {
+      settings: { access: Record<string, boolean>; containerCredentials: number; jobBudget: boolean };
+    };
+    expect(configuredBody.settings.access.indexingAdmins).toBe(true);
+    expect(configuredBody.settings.containerCredentials).toBe(3);
+    expect(configuredBody.settings.jobBudget).toBe(true);
+    for (const secret of ["access-key-value", "secret-access-value", "account-id-value", "operator@example.com"]) {
+      expect(text).not.toContain(secret);
+    }
+  });
+
   test("GET /api/dataset/status reports the published fixture version", async () => {
     const { status, body } = await api("/api/dataset/status");
     expect(status).toBe(200);

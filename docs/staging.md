@@ -14,11 +14,13 @@ Everything in this document is checked into the workspace. Nothing is deployed y
 | Cloud Pass 1 (R2 chunker + segments + checkpoints) | implemented, tested, verified against real R2 |
 | Cloud Pass 2 (partition reduce + streaming shard merge) | implemented, tested, verified against real R2 |
 | Production build (`tsc -b && vite build`) | passes in this workspace (`dist/` built) |
-| Test suite | `628 pass, 0 fail` (52 files) |
+| Test suite | `651 pass, 0 fail` (55 files) |
 | Lint / typechecks (app, worker, indexer, probe) | pass |
 | `wrangler deploy --dry-run` (production and staging) | pass; container + bindings resolve |
 | Staging Worker config (`wrangler.staging.toml`) | written, dry-run validated (`companyintel-staging` + `INDEXER_CONTAINER` + `COMPANY_DATA` + `staging/active.json` all resolve) |
 | Staging isolation tests | `tests/staging-isolation.test.ts` (drives the real admin router) and `tests/staging-config.test.ts` |
+| Container entrypoint (`cloud/runner.mjs`) | root is `/app` (image parent directory), CLI spawned from there; verified end-to-end against a stub R2 and against the real bucket — see §4 |
+| Cold-start handling | the Durable Object waits for the container's `/health` and returns `503 container_not_ready` instead of a 502 |
 | GitHub synchronization | **blocked in this environment** (`git` commands are refused); see §3 |
 | Actual Cloudflare deploy | **not done** (no API token, no Docker here) |
 | Full 64.26 GB indexing | **not started, not authorised** |
@@ -122,20 +124,41 @@ connecting the repository first, then choosing the Worker name):
 | --- | --- |
 | Root directory | `/` (the repository root) |
 | Build command | `bun install --frozen-lockfile && bun run verify && bun run build` |
-| Deploy command | `bunx wrangler deploy -c wrangler.staging.toml` |
+| Deploy command | `bun scripts/deploy.mjs staging` (verifies the seven runtime settings first, then runs `wrangler deploy -c wrangler.staging.toml`) |
 | Non-production deploy command | leave empty / `bunx wrangler versions upload` (it will not deploy containers — that is expected) |
 | Production branch | `main` (or the branch the PR merged into) |
 | API token | created by Cloudflare for Workers Builds (§5) |
 
 Verification that runs in the build itself: `bun run verify` = four typechecks + ESLint +
-the full suite (628 tests, including the staging-isolation, API-routing and
-secret-placement guards).
+the full suite (651 tests, including the staging-isolation, API-routing, container-entrypoint
+and secret-placement guards).
 It fails the build rather than deploying a broken Worker, and it never touches production
 resources. `wrangler deploy` only runs after it passes, so a failed build cannot alter the
 production Worker.
 
 `bun run verify` runs the typechecks, the linter and the full test suite, then `bun run
 build` produces `dist/` which the Worker serves through the `ASSETS` binding.
+
+### The container entrypoint: root, readiness and start failures
+
+`cloud/runner.mjs` runs from `/app/cloud/runner.mjs`; the project root is `/app` (its
+parent), and it spawns `/app/tools/cloud/cli.ts` with `cwd: /app`. It previously used its
+own directory as the root, so the CLI path resolved to `/app/cloud/tools/cloud/cli.ts`,
+Bun exited with "Could not find module", and the runner still answered `202`. The panel
+therefore showed `jobs: []`, no state and no checkpoint, while the start looked successful.
+
+What the deployment now guarantees:
+
+* `/health` answers 200 only when the CLI exists, and reports `root`, `cli` and `cliPresent`;
+* a missing CLI is `503 cli_missing` and a second concurrent job is `409`;
+* a detached start is `202` only if the child survives a 1.5 s settle window; otherwise
+  it is `500 job_failed_to_start` with the child's exit code and stderr — surfaced to the
+  panel as a `502` whose message is the real reason;
+* the Durable Object polls the container's `/health` before proxying, so the first request
+  after a cold start waits instead of failing with a transport 502;
+* `cloud/runner.mjs` is covered by `tests/cloud-runner.test.ts`, which builds the Dockerfile's
+  directory layout, runs the real CLI against a stub S3 endpoint and requires Pass 1 to
+  write `state.json` plus both per-source checkpoints.
 
 ### API routing (why `/api/*` must run the Worker first)
 
@@ -237,6 +260,33 @@ Locally (no credentials needed), `tests/staging-config.test.ts` asserts that nei
 config contains a secret name or value, that only variable *names* are declared, and that the
 budget is wired through one variable. `tests/worker-r2-binding.test.ts` asserts the `R2_*`
 names appear only in the container bridge, exactly once each.
+
+### The seven settings must survive every deploy
+
+They are Worker **secrets**, not `[vars]`, so `wrangler deploy` cannot recreate them. When a
+deploy targets a renamed or recreated script, the new Worker comes up without them — which is
+how a previous staging deploy lost them. Two guards now exist:
+
+1. **Before the deploy.** `bun scripts/deploy.mjs staging` (now `bun run deploy:staging`, and
+the value to put in the Workers Builds deploy command) lists the deployed secret **names**
+with `wrangler secret list --format json` and **aborts** if any of the seven is missing,
+printing the exact `wrangler secret put` commands. It never reads or prints a value. If the
+names cannot be read at all (no authenticated Wrangler, or a build token without read
+permission) it warns loudly instead of blocking the deploy, and the check below remains.
+2. **After the deploy.** `/api/health` (behind Access) reports presence only:
+
+   ```json
+   "settings": {
+     "access": { "teamDomain": true, "audience": true, "allowedEmails": true, "indexingAdmins": true },
+     "containerCredentials": 3,
+     "jobBudget": true
+   }
+   ```
+
+`containerCredentials` counts how many of the three R2 secrets the Worker holds (0–3); a
+deployment that lost them reports `0` instead of failing silently at the next job start. No
+value is ever returned. `tests/cloud-admin-deploy.test.ts` asserts both configs declare none
+of the seven, the wrapper names all seven, and the health payload is presence-only.
 
 ## 6. The controlled benchmark
 
@@ -354,6 +404,10 @@ shard sizes to re-check.
   the deployment was validated only as a dry run;
 * the container image has never been built (no Docker here) — Workers Builds is the first
   environment that will build it;
+* the container has never run inside Cloudflare's runtime. The entrypoint's paths, readiness
+  and R2 writes were verified locally (image layout + real bucket, §4 and `docs/cloud.md`),
+  but the cold-start wait and the 202/500 behaviour under Cloudflare's Containers runtime
+  remain unobserved until this build runs;
 * every number in §6 is an estimate from bounded runs; the benchmark exists to replace it
   with a measurement;
 * Cloudflare Access was not exercised against a real deployment;
@@ -375,7 +429,13 @@ shard sizes to re-check.
 4. **Cloudflare dashboard → R2 → Manage API Tokens** (or **R2 → company-intel-data**): create
    an **Object Read & Write** token scoped to `company-intel-data` only, then run the three
    `R2_*` secret commands in §5.
-5. **Approve the bounded benchmark** described in §6: 1 × `standard-1` container, 32
+5. **Check the seven settings after the next deploy.** Open `/api/health` on the staging
+   host and confirm `settings.access` is all `true`, `settings.containerCredentials` is `3`
+   and `settings.jobBudget` is `true`. If any is missing, `bun run deploy:check` (or
+   `bunx wrangler secret list -c wrangler.staging.toml`) names it without printing a value;
+   re-add it with `wrangler secret put`. Also set the Workers Builds **deploy command** to
+   `bun scripts/deploy.mjs staging` so a deployment with missing settings is refused.
+6. **Approve the bounded benchmark** described in §6: 1 × `standard-1` container, 32
    partitions, 96 MiB per source, combined budget $5, expected cost under $0.10. Say
    "approved" and I will start it through the control plane; the 64 GB job is a separate,
    later decision.

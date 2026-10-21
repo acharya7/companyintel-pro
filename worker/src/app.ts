@@ -266,6 +266,13 @@ function filterContacts(contacts: Contact[], filters?: ContactFilters): Contact[
 
 app.get("/api/health", (c) => {
   const identity = c.get("identity");
+  // Presence of the seven runtime settings, never a value. Four are Access
+  // settings; three are the container-only R2 secrets the container bridge forwards
+  // (named here as a pattern so this file never mentions them). A redeploy that
+  // loses one shows it in this payload and in `/indexing` diagnostics instead of
+  // failing silently at the next benchmark start.
+  const names = Object.keys(c.env as unknown as Record<string, unknown>);
+  const containerCredentials = names.filter((name) => /^R2_(ACCOUNT_ID|ACCESS_KEY_ID|SECRET_ACCESS_KEY)$/.test(name)).length;
   return c.json({
     ok: true,
     service: "companyintel-worker",
@@ -275,6 +282,17 @@ app.get("/api/health", (c) => {
     time: new Date().toISOString(),
     identity: identity.email,
     environment: c.env.ENVIRONMENT ?? "unknown",
+    settings: {
+      access: {
+        teamDomain: Boolean(c.env.CF_ACCESS_TEAM_DOMAIN),
+        audience: Boolean(c.env.CF_ACCESS_AUD),
+        allowedEmails: Boolean(c.env.ALLOWED_EMAILS),
+        indexingAdmins: Boolean(c.env.INDEXING_ADMIN_EMAILS),
+      },
+      // 0..3: how many of the three container R2 secrets this deployment holds.
+      containerCredentials,
+      jobBudget: Boolean(c.env.CLOUD_JOB_BUDGET_USD),
+    },
   });
 });
 

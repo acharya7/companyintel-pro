@@ -66,6 +66,9 @@ export default function IndexingControl() {
   const [notice, setNotice] = useState<string | null>(null);
   const [verifyOutput, setVerifyOutput] = useState<string | null>(null);
   const [staging, setStaging] = useState(false);
+  // `null` until the first successful read, so the panel does not warn about a
+  // missing container before it knows.
+  const [containerBound, setContainerBound] = useState<boolean | null>(null);
   const [benchVersion, setBenchVersion] = useState(`bench-${new Date().toISOString().slice(0, 10)}`);
   const stagingPrefixApplied = useRef(false);
   const [benchMb, setBenchMb] = useState("16");
@@ -77,6 +80,7 @@ export default function IndexingControl() {
       setJobs(data.jobs);
       setSelected((current) => current ?? data.jobs[0]?.state.version ?? null);
       setStaging(Boolean(data.staging));
+      setContainerBound(Boolean(data.containerBound));
       // A staging deployment only accepts `stg-` version ids; default the benchmark
       // field to one so the first attempt is not a 400.
       if (data.staging && !stagingPrefixApplied.current) {
@@ -499,39 +503,55 @@ export default function IndexingControl() {
                 ) : null}
               </Section>
 
-              <Section
-                title="Bounded benchmark"
-                description="Reads the first N MB of BOTH real sources, verifies every uploaded segment, and records the measured ratios the full-run forecast is built from."
-                className="mt-6"
-              >
-                <div className="grid gap-3 sm:grid-cols-4">
-                  <label className="space-y-1 text-xs">
-                    <span className="text-muted-foreground">Version id</span>
-                    <Input value={benchVersion} onChange={(event) => setBenchVersion(event.target.value)} />
-                  </label>
-                  <label className="space-y-1 text-xs">
-                    <span className="text-muted-foreground">MB per source (1–256)</span>
-                    <Input value={benchMb} onChange={(event) => setBenchMb(event.target.value)} inputMode="numeric" />
-                  </label>
-                  <label className="space-y-1 text-xs">
-                    <span className="text-muted-foreground">Partitions</span>
-                    <Input value={benchPartitions} onChange={(event) => setBenchPartitions(event.target.value)} inputMode="numeric" />
-                  </label>
-                  <div className="flex items-end">
-                    <Button className="w-full gap-2" disabled={busy !== null} onClick={() => void startBenchmark()}>
-                      <Play className="size-4" /> {busy === "benchmark" ? "Starting…" : "Run benchmark"}
-                    </Button>
-                  </div>
-                </div>
-                <p className="mt-3 text-xs text-muted-foreground">
-                  Partitions below 256 are a benchmark-only shortcut (the forecast scales object counts back up). A real run always
-                  uses the configured partition count.
-                </p>
-              </Section>
             </>
           ) : null}
         </>
       )}
+
+      {/*
+       * Outside the `jobs.length` branch on purpose: the bounded benchmark is how a
+       * first job is created, so hiding it behind "a job already exists" made the
+       * only start control unreachable on a fresh deployment. It also stays visible
+       * while a start is failing, so the error and the retry are on screen together.
+       */}
+      <Section
+        title="Bounded benchmark"
+        description="Reads the first N MB of BOTH real sources, verifies every uploaded segment, and records the measured ratios the full-run forecast is built from."
+        className={jobs.length === 0 ? "" : "mt-6"}
+      >
+        {containerBound === false ? (
+          <div className="mb-3 flex items-start gap-2 rounded-lg border border-chart-3/40 bg-chart-3/10 p-3 text-xs text-chart-3">
+            <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+            <span>
+              No container binding is deployed on this Worker, so starting a job is refused. The panel can still read job state from
+              R2.
+            </span>
+          </div>
+        ) : null}
+        <div className="grid gap-3 sm:grid-cols-4">
+          <label className="space-y-1 text-xs">
+            <span className="text-muted-foreground">Version id</span>
+            <Input value={benchVersion} onChange={(event) => setBenchVersion(event.target.value)} />
+          </label>
+          <label className="space-y-1 text-xs">
+            <span className="text-muted-foreground">MB per source (1–256)</span>
+            <Input value={benchMb} onChange={(event) => setBenchMb(event.target.value)} inputMode="numeric" />
+          </label>
+          <label className="space-y-1 text-xs">
+            <span className="text-muted-foreground">Partitions</span>
+            <Input value={benchPartitions} onChange={(event) => setBenchPartitions(event.target.value)} inputMode="numeric" />
+          </label>
+          <div className="flex items-end">
+            <Button className="w-full gap-2" disabled={busy !== null || containerBound === false} onClick={() => void startBenchmark()}>
+              <Play className="size-4" /> {busy === "benchmark" ? "Starting…" : "Run benchmark"}
+            </Button>
+          </div>
+        </div>
+        <p className="mt-3 text-xs text-muted-foreground">
+          Partitions below 256 are a benchmark-only shortcut (the forecast scales object counts back up). A real run always uses the
+          configured partition count. A cold container start is waited for, so the first attempt is not refused while the image boots.
+        </p>
+      </Section>
     </>
   );
 }

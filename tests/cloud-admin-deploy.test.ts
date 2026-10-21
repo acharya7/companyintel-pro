@@ -13,10 +13,15 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const root = join(import.meta.dir, "..");
-const config = readFileSync(join(root, "wrangler.toml"), "utf8")
-  .split("\n")
-  .filter((line) => !line.trimStart().startsWith("#"))
-  .join("\n");
+const stripComments = (path: string) =>
+  readFileSync(path, "utf8")
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("#"))
+    .join("\n");
+const config = stripComments(join(root, "wrangler.toml"));
+const stagingConfig = stripComments(join(root, "wrangler.staging.toml"));
+const deployScript = readFileSync(join(root, "scripts/deploy.mjs"), "utf8");
+const adminHealth = readFileSync(join(root, "worker/src/app.ts"), "utf8");
 const entry = readFileSync(join(root, "worker/src/index.ts"), "utf8");
 const admin = readFileSync(join(root, "worker/src/indexer-admin.ts"), "utf8");
 const container = readFileSync(join(root, "worker/src/indexer-container.ts"), "utf8");
@@ -65,6 +70,83 @@ describe("Cloudflare Containers deployment config", () => {
     expect(runner).toContain('"pass2"');
     expect(runner).toContain("detach");
     expect(runner).toContain("202");
+  });
+
+  test("the runner resolves the image root (the parent directory), not its own", () => {
+    // The staging bug: `resolve(import.meta.url, "..")` produced `/app/cloud`, so
+    // `bun tools/cloud/cli.ts` looked under `/app/cloud/tools/...` and died instantly.
+    expect(runner).toContain('dirname(fileURLToPath(import.meta.url)), ".."');
+    expect(runner).toContain('join(root, "tools", "cloud", "cli.ts")');
+    expect(runner).toContain("cwd: root");
+    expect(runner).toContain("[cliPath, ...args]");
+    expect(runner).not.toMatch(/resolve\(new URL\(import\.meta\.url\)/);
+  });
+
+  test("a detached start reports an immediate failure instead of a false success", () => {
+    expect(runner).toContain("job_failed_to_start");
+    expect(runner).toContain("START_SETTLE_MS");
+    expect(runner).toContain("stderr");
+    expect(runner).toContain("cli_missing");
+    expect(runner).toContain("job_already_running");
+  });
+
+  test("the Durable Object waits for readiness and answers JSON 503s", () => {
+    expect(container).toContain("container_not_ready");
+    expect(container).toContain("container.running");
+    expect(container).toContain("CONTAINER_READY_TIMEOUT_MS");
+    expect(container).toContain("http://container/health");
+    expect(container).not.toContain(".inspect()");
+  });
+});
+
+/**
+ * The seven runtime settings are Worker secrets, never config values. A deploy that
+ * targets a renamed or recreated script comes up without them; the guard below and
+ * `/api/health` exist so that cannot be discovered only when a job fails.
+ */
+const RUNTIME_SETTINGS = [
+  "CF_ACCESS_TEAM_DOMAIN",
+  "CF_ACCESS_AUD",
+  "ALLOWED_EMAILS",
+  "INDEXING_ADMIN_EMAILS",
+  "R2_ACCOUNT_ID",
+  "R2_ACCESS_KEY_ID",
+  "R2_SECRET_ACCESS_KEY",
+];
+
+describe("the seven runtime settings survive a deployment", () => {
+  test("neither Wrangler config declares them as a var or secret", () => {
+    for (const [name, text] of [
+      ["wrangler.toml", config],
+      ["wrangler.staging.toml", stagingConfig],
+    ] as const) {
+      for (const setting of RUNTIME_SETTINGS) {
+        // Absent from the config entirely: a name there would be a `[vars]` entry and
+        // replace the secret with a plain-text value (or fail the deploy).
+        expect(`${name}:${setting}:${text.includes(setting)}`).toBe(`${name}:${setting}:false`);
+      }
+    }
+  });
+
+  test("the deploy wrapper checks all seven names before deploying", () => {
+    for (const setting of RUNTIME_SETTINGS) expect(deployScript).toContain(`"${setting}"`);
+    expect(deployScript).toContain('"secret", "list"');
+    // Missing names abort the deploy and print the exact recovery commands.
+    expect(deployScript).toContain("REFUSING to deploy");
+    expect(deployScript).toContain("secret put");
+  });
+
+  test("both deploy scripts go through the guard, not straight to wrangler", () => {
+    const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as { scripts: Record<string, string> };
+    expect(pkg.scripts["deploy:staging"]).toBe("bun scripts/deploy.mjs staging");
+    expect(pkg.scripts["deploy:production"]).toBe("bun scripts/deploy.mjs production");
+  });
+
+  test("health reports presence only, by count, and never a value", () => {
+    expect(adminHealth).toContain("containerCredentials");
+    expect(adminHealth).toContain("indexingAdmins: Boolean(c.env.INDEXING_ADMIN_EMAILS)");
+    // The R2 names are matched as a pattern so no Worker file but the bridge names them.
+    expect(adminHealth).toContain("/^R2_(ACCOUNT_ID|ACCESS_KEY_ID|SECRET_ACCESS_KEY)$/");
   });
 });
 

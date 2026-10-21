@@ -1021,3 +1021,86 @@ The asset router's decision is not observable locally: `--dry-run` validates the
 bundles the Worker but no request is served. Confirmation needs the deployed staging Worker
 (`/api/health` → JSON, `/indexing` → jobs list) after Workers Builds deploys this commit.
 Nothing was indexed, activated, deleted or promoted for this phase.
+
+## Phase Q — the staging container never started Pass 1 (fixed)
+
+Symptom on `companyintel-staging`: `POST /api/cloud/jobs/benchmark` returned **202**, but
+`GET /api/cloud/jobs` kept returning `{"jobs":[],"containerBound":true,"staging":true}`, no
+`state.json` or checkpoint appeared in R2, and an earlier cold request had returned **502**
+because port 8080 was not listening yet.
+
+### Root cause (confirmed in `cloud/runner.mjs`)
+
+The container WORKDIR is `/app` and the runner is `/app/cloud/runner.mjs`. The runner
+computed its root as the directory of its own file:
+
+```js
+resolve(new URL(import.meta.url).pathname, "..")   // → /app/cloud
+```
+
+and then spawned `bun tools/cloud/cli.ts` with that directory as `cwd`, which resolves to
+`/app/cloud/tools/cloud/cli.ts`. The real file is `/app/tools/cloud/cli.ts`. Bun exited
+immediately with "Could not find module". The detached branch resumed the child's stdout,
+piped stderr and returned `202 {started:true}` **without looking at the child**, so the
+Worker told the panel a job had started, the CLI never ran, and nothing was written to R2.
+The 502 was a separate, second-order effect: the same crash meant the container never bound
+:8080, and the Durable Object proxied the request into a container that was still starting.
+
+### Fix
+
+- `cloud/runner.mjs`: root is now `resolve(dirname(fileURLToPath(import.meta.url)), "..")`
+  (`/app`), the CLI is addressed absolutely (`join(root, "tools", "cloud", "cli.ts")`) and
+  spawned with `cwd: root` via `process.execPath`, so PATH cannot change the interpreter.
+- Immediate-failure detection: a detached start waits a 1.5 s settle window. Still running →
+  `202`. Exited non-zero or failed to spawn → `500 job_failed_to_start` with the exit code
+  and the stderr tail. Exited 0 inside the window → `200 {started:false, completed:true}`.
+  A missing CLI is `503 cli_missing` (also from `/health`), and a second concurrent job is
+  `409 job_already_running`.
+- `/health` now reports `root`, `cli`, `cliPresent` and the active/last job, and answers 503
+  when the CLI is absent, so a broken image is visible rather than accepting work.
+- `worker/src/indexer-container.ts`: cold-start readiness. The DO starts the container only
+  when `!container.running`, polls the runner's `/health` (250 ms interval,
+  `CONTAINER_READY_TIMEOUT_MS`, default 60 s) and only then proxies. Timeout →
+  `503 container_not_ready` (JSON, with `waitedMs` and the last probe error); a runner that
+  answers 503 itself (unusable image) fails immediately; a throwing `start()` →
+  `503 container_start_failed`; no binding → `503 indexing_container_unavailable`. No code
+  path returns a bare transport 502 any more.
+- `worker/src/indexer-admin.ts`: the DO's JSON error is propagated with its code, message and
+  detail (`503` stays 503, everything else `502`). A `200 {started:false}` answer is passed
+  through instead of being re-labelled `202`.
+- `src/pages/IndexingControl.tsx`: the **Bounded benchmark** section moved out of the
+  `jobs.length === 0 ? … : …` branch. It is how the first job is created, so its version,
+  size, partition inputs and **Run benchmark** button now render on an empty deployment
+  (and while a failed start's error is on screen). The button is disabled with a warning
+  when `/api/cloud/jobs` reports `containerBound: false`.
+- Runtime settings: `scripts/deploy.mjs` (wired to `deploy:staging` / `deploy:production`)
+  lists the deployed secret names and refuses to deploy when any of the seven (four Access
+  settings + three R2 secrets) is missing, printing the `wrangler secret put` commands.
+  `/api/health` reports presence only — `settings.access` booleans,
+  `settings.containerCredentials` (0–3), `settings.jobBudget` — so a deploy that loses them
+  is visible in one request. Neither Wrangler config declares them; both container safety
+  settings (`STAGING_MODE`, `ACTIVE_MANIFEST_KEY`) and the budget (`CLOUD_JOB_BUDGET_USD`
+  30 / 5) are unchanged.
+
+### Verification
+
+| Check | Result |
+| --- | --- |
+| `bun test tests/cloud-runner.test.ts` | **PASS** — 3 tests: image layout + real CLI + stub S3 writes state/checkpoints; immediate failure is 500 with stderr; missing CLI is 503 |
+| `bun test tests/indexer-container-readiness.test.ts` | **PASS** — 6 tests: start-once with env, readiness polling, timeout 503, unusable-runner fail-fast, missing binding, throwing start |
+| `bun test tests/cloud-start-errors.test.ts` | **PASS** — 6 tests: DO error → admin status/code, 200-not-202 for an early exit, 202 only when accepted |
+| `bun test tests/cloud-admin-deploy.test.ts` | **PASS** — 16 tests, incl. root/CLI guard, readiness guard and the seven-settings guards |
+| `bun test tests/pages-render.test.tsx` | **PASS** — benchmark controls render with an empty job list |
+| `bun run verify` | **PASS** — four typechecks, ESLint, **651 pass / 0 fail** across 55 files |
+| Real R2, same entrypoint layout, `benchmark --max-source-mb 4 --partitions 8` | **PASS** — `202`, then `cloud/jobs/stg-container-fix-20261021-80887/state.json` (9,676 rows, 16 segments) and `checkpoints/csv1.json` / `csv2.json` (401/402 B) exist; `verify` returns PASS for every segment checksum |
+
+### Not verified here
+
+No Docker and no Cloudflare credentials exist in this workspace, so the image was not built
+and the container was not executed by Cloudflare's runtime. The entrypoint, its paths and its
+R2 writes were exercised directly (image directory layout + real bucket), and the readiness
+logic was exercised against a fake container. The live confirmation is the next staging
+deploy: `/indexing` must show the benchmark controls on an empty list, a start must return
+`202`, and `/api/cloud/jobs` must list `stg-…` with a checkpoint within one chunk. `raw/` was
+only read (ranged GETs); no index was activated, no production pointer moved, and the full
+corpus was not started.

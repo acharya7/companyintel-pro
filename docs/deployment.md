@@ -72,6 +72,18 @@ bunx wrangler secret put ALLOWED_EMAILS          # your email address (comma-sep
 `CF_ACCESS_AUD` comes from step 6. You can set it after creating the Access application and
 re-run the command; nothing else needs to change.
 
+These are **Worker secrets**: they survive a redeploy of the same Worker, and they are
+absent from both Wrangler configs on purpose. A deploy that targets a renamed or recreated
+script comes up without them. Two checks exist so that is never discovered at job-start
+time:
+
+* `bun run deploy:production` / `bun run deploy:staging` run `scripts/deploy.mjs`, which
+  lists the deployed secret **names** and refuses to deploy if any of the seven is missing
+  (four Access settings + `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`).
+  It never reads a value. `bun run deploy:check` runs the check without deploying.
+* `/api/health` (behind Access) reports presence only — `settings.access` booleans,
+  `settings.containerCredentials` (0–3), `settings.jobBudget`. Values are never returned.
+
 Never set `DEV_ALLOW_UNAUTHENTICATED` in production. The Worker refuses the bypass when
 `ENVIRONMENT=production`, and it fails closed when Access is unconfigured.
 
@@ -124,8 +136,11 @@ verifies the Access JWT itself.
 ## 7. Deploy
 
 ```powershell
-bunx wrangler deploy
+bun run deploy:production      # = bun scripts/deploy.mjs production
 ```
+
+The wrapper verifies the seven runtime settings (step 4) and then runs
+`wrangler deploy`. If you must call Wrangler directly, run `bun run deploy:check` first.
 
 Expected output ends with `Deployed companyintel triggers` and a URL. Visit it: Cloudflare
 Access asks you to authenticate with your email OTP or SSO **before** the app loads. That login
@@ -147,7 +162,10 @@ layer — check `[assets].run_worker_first` before anything else.
 
 In the browser, signed in:
 
-1. `/api/health` → `{"ok":true,"service":"companyintel-worker",…}`.
+1. `/api/health` → `{"ok":true,"service":"companyintel-worker",…,"settings":{…}}`. The
+   `settings` block is presence-only: all four `access` booleans `true`,
+   `containerCredentials: 3`, `jobBudget: true`. A `0` there means the container's R2
+   secrets did not survive the deploy — re-add them before starting any job.
 2. `/dataset` → shows bucket connectivity, source files, active version (or "Dataset not
    indexed" before your first publish).
 3. `/companies` → searches return results from the active version.
@@ -181,7 +199,15 @@ first deploy; later deploys push only changed layers.
    curl.exe localhost:8080/health
    ```
 
-   Expected: `{"ok":true,...}`.
+   Expected: `{"ok":true,"root":"/app","cli":"/app/tools/cloud/cli.ts","cliPresent":true,…}`.
+   A `503` with `cliPresent:false` means the image did not copy `tools/` into `/app`; do not
+   deploy it. The runner derives `/app` from its own file (`/app/cloud/runner.mjs`), spawns
+   the CLI from there, and reports a child that dies immediately as a `500` instead of a
+   misleading `202`.
+
+   On Cloudflare the first request after a cold start waits for the container's `/health`
+   (up to `CONTAINER_READY_TIMEOUT_MS`, default 60 s) and answers `503 container_not_ready`
+   with the probe error if it never becomes ready — not a bare 502.
 
 2. Set the container's R2 credentials as Worker secrets. The container DO forwards them
    to the container at start; they are never returned to a browser and are never in this

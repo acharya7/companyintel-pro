@@ -260,6 +260,37 @@ docker run --rm -p 8080:8080 \
 curl -X POST localhost:8080/job -d '{"args":["run","--version","v1-cloud-2026-10-19","--max-source-mb","16","--partitions","16"]}'
 ```
 
+### Container entrypoint contract
+
+`cloud/runner.mjs` is the image's `CMD`. Its paths are fixed, not relative to a caller:
+
+| | Value |
+| --- | --- |
+| Image working directory | `/app` (`WORKDIR` in both Dockerfiles) |
+| Runner | `/app/cloud/runner.mjs` |
+| Project root | `/app` — the **parent** of the runner's directory |
+| CLI | `/app/tools/cloud/cli.ts`, spawned with `cwd: /app` |
+
+The root is derived with `dirname(fileURLToPath(import.meta.url))` + `..`. It must never be
+the runner's own directory: doing that produced `/app/cloud`, so `bun tools/cloud/cli.ts`
+became `/app/cloud/tools/cloud/cli.ts`, the child exited instantly with "Could not find
+module", and the runner still answered `202` — the job never started and R2 stayed empty.
+
+`GET /health` reports the resolved `root`, the absolute `cli` path and `cliPresent`. It
+answers **503** when the CLI is missing, so a broken image is visible instead of accepting
+work. `POST /job` refuses to start when the CLI is missing (`503 cli_missing`) or when
+another job is running (`409 job_already_running`).
+
+A detached start answers `202` only if the child is still alive after a short settle
+window (1.5 s). A child that fails sooner is `500 job_failed_to_start`, with its exit code
+and the tail of its stderr; a command that exits 0 inside the window is
+`200 {started:false, completed:true}`. Those become a `503`/`502` on the admin route with
+the same code — never a false success.
+
+The Durable Object waits for `/health` to answer 200 before proxying (`CONTAINER_READY_TIMEOUT_MS`,
+default 60 s) and answers `503 container_not_ready` with the last probe error instead of a
+bare 502 during a cold start.
+
 Deploying it as a Cloudflare Container is configured in `wrangler.toml`
 (`[[containers]]`, the `INDEXER_CONTAINER` Durable Object binding and migration) and
 uses the root `Dockerfile`. `wrangler deploy` builds that image with Docker and pushes it
@@ -270,6 +301,15 @@ Both images pin `oven/bun:1.4.3-slim`. `bun.lock` is lockfile format 2, and the 
 `oven/bun:1.2-slim` image (Bun 1.2.23) refused it during the Container build with
 `Unknown lockfile version`. Keep the image on the Bun line the repository is tested with;
 `bun install --frozen-lockfile --production` is the only install the image performs.
+
+**Verified against real R2 without Docker:** the runner was started from the repository in
+the same relative layout as the image (`root/cloud/runner.mjs` + `root/tools/…`), given a
+bounded `benchmark --max-source-mb 4 --partitions 8` job through `POST /job`, and it wrote
+to the live bucket: `cloud/jobs/stg-container-fix-20261021-80887/state.json`
+(9,676 rows read, 16 segments) plus `checkpoints/csv1.json` and `checkpoints/csv2.json`
+(4,194,594 / 4,194,487 bytes consumed). `bun tools/cloud/cli.ts verify --version …`
+returned **PASS** for every segment checksum and row count. That proves the entrypoint,
+paths and R2 writes the image depends on, not that Cloudflare's runtime executed it.
 
 **Not verified here:** Docker is not installed in this workspace, there is no Cloudflare
 API token, and nothing was deployed. The config matches Cloudflare's documented schema
