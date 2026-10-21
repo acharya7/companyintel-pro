@@ -814,8 +814,8 @@ async function resumeExecution(
   // a guess: a bound that cannot be recovered is reported, not invented.
   const maxSourceMb: number | undefined =
     (typeof recordedMb === "number" ? recordedMb : undefined) ??
-    (bounded ? inferredMaxSourceMb(checkpoints) ?? undefined : undefined) ??
-    explicitMaxSourceMb;
+    explicitMaxSourceMb ??
+    (bounded ? inferredMaxSourceMb(checkpoints) ?? undefined : undefined);
   if (!Number.isInteger(partitions) || partitions < 1 || partitions > 256) {
     return badRequest(c, "invalid_partitions", `The recorded partition count (${partitions}) is not valid for a resume.`);
   }

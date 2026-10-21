@@ -102,8 +102,8 @@ buffer (bounded by `SHARD_FLUSH_BYTES`).
 | Segment verification (SHA-256 + row accounting + coverage) | **IMPLEMENTED AND VERIFIED** |
 | Cloud → v2 spool assembly (format compatibility with existing merge) | **IMPLEMENTED AND VERIFIED** on fixtures |
 | Control panel + dev backend controls (R2 state and control flags) | **IMPLEMENTED AND VERIFIED** in the preview (a benchmark was started through it) |
-| Deployed admin API + container orchestration | **IMPLEMENTED BUT UNVERIFIED** (static/type checks only) |
-| Container image and runner | **IMPLEMENTED BUT NOT VERIFIED** — no Cloudflare API token in this workspace, nothing deployed |
+| Deployed admin API + container orchestration | **DEPLOYED TO STAGING** through Workers Builds (the panel lists `stg-bench-2026-10-21`); the Resume/Pass 2 behaviour is regression-tested and proven against live R2 checkpoints |
+| Container image and runner | **DEPLOYED**; the runner started a real bounded job (`stg-container-fix-20261021-80887`) that wrote 9,676 rows to the live bucket |
 | Full-corpus container execution | **NOT RUN** (requires your approval) |
 | Cloud-native Pass 2 (partition reduce + streaming shard merge) | **IMPLEMENTED AND VERIFIED** on fixtures and a bounded real-R2 job |
 | Pause/resume, corrupted segment, immutable completed version | **IMPLEMENTED AND VERIFIED** (`tests/cloud-pass2.test.ts`) |
@@ -241,10 +241,42 @@ free), and retries beyond the measured ones.
 * run a bounded benchmark (1–256 MB per source) through the real chunker/segment writer;
 * start or resume **Cloud Pass 2** and watch its partition progress, shard-object count,
   index bytes, rate, ETA and running cost;
-* pause, resume or abort — the engine checks the flag between chunks/partitions;
+* pause or abort — the engine checks the flag between chunks/partitions;
+* **resume** — an action, not just a flag: see below;
 * verify every uploaded Pass 1 segment independently (re-reads sizes and row counts);
 * activate a **completed full run** only; the button is disabled for benchmarks;
 * view the last checkpoint, errors, source-row accounting and the R2 estimate.
+
+### What Resume actually does
+
+Clearing `pause` only helps a process that is still alive, and a detached job has no
+process once its container stopped. `POST /api/cloud/jobs/<version>/control` with
+`{"action":"resume"}` therefore restarts work from durable state:
+
+1. **No duplicate runner.** A `run.json` heartbeat younger than 2 minutes answers
+   `200 {started:false, alreadyRunning:true}`. The runner's own `409 job_already_running`
+   is reported the same way, and `/start`, `/pass2` and `/jobs/benchmark` answer
+   `409 job_already_running` while a run is live.
+2. **The command is rebuilt, never guessed.** `state.json` → `config` records the stage,
+   partition count, bounded limit and chunk size written when Pass 1 started.
+3. **A pre-upgrade job is proven, not assumed.** A job started before `config` existed
+   has no saved execution metadata. Its limit is recovered from R2 only when the
+   checkpoint proves it: an operator stop, a signal or a crash is honoured at a chunk
+   boundary, so `nextOffset === chunks * chunkBytes`; a run that ended on its per-source
+   limit leaves a **partial** last chunk just past `maxSourceMb * MiB`. Rounding that
+   offset down to the nearest MiB recovers the bound (16 MiB for
+   `stg-bench-2026-10-21`), and only ever a bound no larger than the original.
+4. **A reached limit is reconciled.** When every source is at its bound, the Worker
+   publishes the checkpoints' progress, records `config`, sets `coverage: "bounded"`
+   and marks `pass1-complete` — then starts bounded **Pass 2** (`--allow-bounded`, the
+   recorded 16 partitions) in the same click. Pass 2 re-verifies every chunk manifest
+   and segment size before it writes anything.
+5. **An unknown limit is refused, not invented.** If the job stopped at a whole chunk
+   boundary its original limit is genuinely unknown; the resume answers
+   `400 benchmark_limit_unknown` and names the two actions that continue it at a known
+   limit: `{"action":"resume","maxSourceMb":16}` (recorded in `config` for next time) or
+   a bounded benchmark for the same version. It is never resumed as a full-corpus run,
+   and staging refuses a full job outright.
 
 It cannot start the full corpus. `run` requires `--approve-full`, and that refuses unless
 `control.json` records `approvedFullRun: true`. The dev server's `/api/cloud/...` routes
@@ -344,12 +376,14 @@ to the live bucket: `cloud/jobs/stg-container-fix-20261021-80887/state.json`
 returned **PASS** for every segment checksum and row count. That proves the entrypoint,
 paths and R2 writes the image depends on, not that Cloudflare's runtime executed it.
 
-**Not verified here:** Docker is not installed in this workspace, there is no Cloudflare
-API token, and nothing was deployed. The config matches Cloudflare's documented schema
-(instance types, DO binding, migration), but a real deploy has not been attempted. See
-`docs/deployment.md` for the exact commands, and `docs/staging.md` for the isolated
-staging Worker (`wrangler.staging.toml`), the Workers Builds settings that remove the
-Docker requirement, and the controlled benchmark plan.
+**How it is deployed:** Workers Builds builds the image and deploys the Worker from
+`acharya7/companyintel-pro` (deploy command `bunx wrangler deploy -c wrangler.staging.toml
+--keep-vars`), so a change is live only after it is published to that repository. This
+workspace cannot run `git` (Vly owns version control) and has no Cloudflare API token, so
+a deploy from here is impossible; the deployed staging Worker is what served the panel
+that lists `stg-bench-2026-10-21`. See `docs/deployment.md` for the exact commands and
+`docs/staging.md` for the isolated staging Worker (`wrangler.staging.toml`) and the
+benchmark plan.
 
 ## Approval needed before the full run
 

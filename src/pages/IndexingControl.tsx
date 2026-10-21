@@ -131,16 +131,37 @@ export default function IndexingControl() {
     if (action === "approve" && !window.confirm(`Record approval for a full-corpus run of ${state.version}? This is the gate that allows Pass 1 to read all 64 GB.`)) return;
     setBusy(action);
     setNotice(null);
+    setError(null);
     try {
-      await admin(`/api/cloud/jobs/${encodeURIComponent(state.version)}/control`, {
+      // Resume is an action, not a flag: the server restarts the job (or the merge)
+      // from its durable configuration and answers with what it actually did. Showing
+      // that answer is what makes "recorded" and "started" distinguishable.
+      const result = await admin<{
+        ok?: boolean;
+        started?: boolean;
+        alreadyRunning?: boolean;
+        stage?: string;
+        partitions?: number;
+        maxSourceMb?: number;
+        message?: string;
+      }>(`/api/cloud/jobs/${encodeURIComponent(state.version)}/control`, {
         method: "POST",
         body: JSON.stringify({ action }),
       });
-      setNotice(
-        action === "approve"
-          ? "Full-run approval recorded in control.json. Nothing has started; use Start full Pass 1 when you are ready."
-          : `${action} recorded — the engine checks it between chunks/partitions.`,
-      );
+      if (action === "resume") {
+        setNotice(
+          result.message ??
+            (result.started
+              ? `Resumed ${state.version} at the ${result.stage} stage.`
+              : `Nothing was started for ${state.version}: no execution is pending.`),
+        );
+      } else {
+        setNotice(
+          action === "approve"
+            ? "Full-run approval recorded in control.json. Nothing has started; use Start full Pass 1 when you are ready."
+            : `${action} recorded — the engine checks it between chunks/partitions.`,
+        );
+      }
       await refresh();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -204,11 +225,18 @@ export default function IndexingControl() {
     setBusy("pass2");
     setNotice(null);
     try {
-      const result = await admin<{ started: boolean; partitions: number }>(`/api/cloud/jobs/${encodeURIComponent(state.version)}/pass2`, {
-        method: "POST",
-        body: JSON.stringify({ confirm: "PASS2", partitions: state.partitions }),
-      });
-      setNotice(`Cloud Pass 2 started with ${result.partitions} partitions. It merges one partition at a time and writes the index to R2.`);
+      const result = await admin<{ started: boolean; partitions: number; message?: string }>(
+        `/api/cloud/jobs/${encodeURIComponent(state.version)}/pass2`,
+        {
+          method: "POST",
+          body: JSON.stringify({ confirm: "PASS2", partitions: state.partitions }),
+        },
+      );
+      setNotice(
+        result.started
+          ? `Cloud Pass 2 started with ${result.partitions} partitions. It merges one partition at a time and writes the index to R2.`
+          : result.message ?? "Pass 2 was not started; a run is already active.",
+      );
       await refresh();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -355,6 +383,19 @@ export default function IndexingControl() {
               <span>
                 Run {run.attempt} is alive · stage {run.stage} · last heartbeat {new Date(run.heartbeatAt).toLocaleTimeString()}
                 {run.pid ? ` · pid ${run.pid}` : ""}
+              </span>
+            </div>
+          ) : run && run.outcome !== "completed" && (run.reason ?? state?.interruption?.reason) ? (
+            /*
+             * A terminal failure on a job whose stage is no longer in flight (failed,
+             * paused after a stop) still needs its reason in the most visible place: the
+             * stage pill alone does not say why it stopped.
+             */
+            <div className="mb-4 flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-xs text-destructive">
+              <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+              <span>
+                <strong>{WARNING_LABEL[run.outcome as JobWarning["kind"]] ?? "Run stopped"}</strong> — {run.reason ?? state?.interruption?.reason}
+                <span className="text-muted-foreground"> · {new Date(run.heartbeatAt).toLocaleString()}</span>
               </span>
             </div>
           ) : null}

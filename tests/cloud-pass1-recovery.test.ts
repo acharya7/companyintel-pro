@@ -172,8 +172,12 @@ describe("cloud Pass 1 interruption and resume", () => {
 
     const second = await runPass1({ ...options });
     expect(second.stopped).toBe("bounded");
-    expect(second.state.stage).toBe("pass1");
-    expect(second.state.note).toMatch(/per-source limit/);
+    // Reaching the per-source limit IS the end of a bounded Pass 1: the job is shown
+    // as pass1-complete (so Pass 2 can merge the prefix), never as a paused job that
+    // looks like it is still working.
+    expect(second.state.stage).toBe("pass1-complete");
+    expect(second.state.coverage).toBe("bounded");
+    expect(second.state.note).toMatch(/per-source limit|Bounded benchmark complete/);
     expect(second.state.totals.rowsRead).toBe(rows);
     // Nothing was re-read and nothing was re-uploaded for a chunk already committed.
     expect(second.state.totals.segments).toBe(first.state.totals.segments);

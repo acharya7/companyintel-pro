@@ -230,7 +230,7 @@ describe("resuming a job started before execution metadata existed", () => {
     const captured: Captured[] = [];
     const bucket = bucketWith({ atLimit: false });
     for (const sourceId of ["csv1", "csv2"]) {
-      bucket.putBytes(cloudKeys.checkpoint(VERSION, sourceId), Buffer.from(JSON.stringify(checkpoint(sourceId, 32 * MIB, 9_000))), {
+      bucket.putBytes(cloudKeys.checkpoint(VERSION, sourceId), Buffer.from(JSON.stringify(checkpoint(sourceId, 8 * MIB, 9_000))), {
         contentType: "application/json",
       });
     }

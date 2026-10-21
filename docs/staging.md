@@ -419,18 +419,35 @@ boundary and writes `run.json` heartbeats plus an explicit `interruption` reason
 
 Resuming is safe and uses only the durable checkpoint: the committed csv2 chunk is not read
 again, and its 28,298 rows are counted. **Do not start a second benchmark for this version** —
-start the same version to resume it.
+resume the same version instead.
+
+### Finishing `stg-bench-2026-10-21`
+
+That job predates `config` and the DO job record, and it had already reached its bound:
+csv1 `nextOffset 16,778,741` and csv2 `16,777,313` bytes against a 16 MiB limit with
+32 MiB chunks, so both last chunks are partial — R2 proves the bound. One **Resume** click
+now:
+
+1. publishes the checkpoints into `state.json` (36,432 rows, 32 segments — unchanged,
+   because nothing is re-read) and records
+   `config = {mode: benchmark, partitions: 16, maxSourceMb: 16, chunkMb: 32}`;
+2. marks the job `pass1-complete` with `coverage: "bounded"` instead of leaving it paused;
+3. starts bounded **Pass 2** in the container: `pass2 --version stg-bench-2026-10-21
+   --partitions 16 --allow-bounded`;
+4. shows Pass 2's partition progress, then `complete` (benchmarks stay non-activatable).
+
+The panel message quotes the server's answer, so a click that starts nothing says so.
+If the container is stopped mid-merge, the DO alarm resumes the same arguments.
 
 ## 9. What is not verified (what stays unknown until it runs)
 
-* nobody has deployed to Cloudflare from this workspace; there is no API token here, and
-  the deployment was validated only as a dry run;
-* the container image has never been built (no Docker here) — Workers Builds is the first
-  environment that will build it;
-* the container has never run inside Cloudflare's runtime. The entrypoint's paths, readiness
-  and R2 writes were verified locally (image layout + real bucket, §4 and `docs/cloud.md`),
-  but the cold-start wait and the 202/500 behaviour under Cloudflare's Containers runtime
-  remain unobserved until this build runs;
+* the workspace has no Cloudflare API token, so a deploy from here is impossible; the
+  deployment is the Workers Builds job connected to `acharya7/companyintel-pro`, which is
+  why every change must reach GitHub before it can run (Vly publishes the workspace);
+* the container image is built by Workers Builds, not here (no Docker in this workspace);
+* the container has run inside Cloudflare's Containers runtime for the benchmark's first
+  chunk (36,432 rows are in R2), but the cold-start wait and the 202/500 behaviour under
+  a fresh rollout were only observed through the deployed Worker's own responses;
 * every number in §6 is an estimate from bounded runs; the benchmark exists to replace it
   with a measurement;
 * Cloudflare Access was not exercised against a real deployment;
@@ -438,11 +455,12 @@ start the same version to resume it.
 
 ## 10. Actions required from you
 
-1. **Repository (GitHub → `acharya7/companyintel-pro`)**: publish this workspace. Either let
-   Vly publish the source, or run `bun scripts/source-archive.mjs` here, download the
-   archive, and commit its contents on a branch such as `staging-cloud-indexer`. The
-   repository does not currently contain the cloud indexing work.
-2. **Cloudflare dashboard → Workers & Pages → Create → Workers → connect the repository**:
+1. **Repository (GitHub → `acharya7/companyintel-pro`)**: Vly owns version control here and
+   publishes the workspace to the repository; this workspace cannot run `git`. Every change
+   in this document is in that tree, so the next Workers Builds run deploys it. No manual
+   archive or branch is needed.
+2. **Cloudflare dashboard → Workers & Pages → connect the repository** (already done for
+   `companyintel-staging`; kept here for a rebuild):
    name it `companyintel-staging`; set root directory `/`, build command
    `bun install --frozen-lockfile && bun run verify && bun run build`, deploy command
    `bunx wrangler deploy -c wrangler.staging.toml --keep-vars`, production branch = your merge
@@ -460,10 +478,11 @@ start the same version to resume it.
    `bunx wrangler secret list -c wrangler.staging.toml`) names it without printing a value;
    re-add it with `wrangler secret put`. Also set the Workers Builds **deploy command** to
    `bun scripts/deploy.mjs staging` so a deployment with missing settings is refused.
-6. **Approve the bounded benchmark** described in §6: 1 × `standard-1` container, 32
-   partitions, 96 MiB per source, combined budget $5, expected cost under $0.10. Say
-   "approved" and I will start it through the control plane; the 64 GB job is a separate,
-   later decision.
+6. **Finish the bounded benchmark that already ran** (`stg-bench-2026-10-21`, 16 MB per
+   source, 16 partitions, 36,432 rows): after the next Workers Builds deploy, press
+   **Resume** once on `/indexing`. It reconciles the checkpoints and starts bounded Pass 2
+   from the same durable state (§8a). No new benchmark version and no full-corpus run. The
+   64 GB job remains a separate, later decision.
 
 Nothing else is needed from your machine: no Docker, no PowerShell sequence, no local
 indexing.

@@ -1211,3 +1211,56 @@ rollout shows `run.json` `interrupted` with a SIGTERM reason rather than a silen
 No full-corpus run was started, nothing was activated, `raw/` was read only, and the stuck
 job's state was repaired in place — `run.json` + `state.json` only, with its real csv2
 checkpoint progress (28,298 rows) published and an explicit interruption reason recorded.
+
+## Phase S — Resume starts work, and finishes the bounded benchmark
+
+### Root cause 4 — Resume cleared a flag and nothing else
+
+The deployed `POST /api/cloud/jobs/:version/control` with `{"action":"resume"}` set
+`pause:false`/`abort:false` and answered `ok`. That only helps a process that is still
+alive, and a detached job has none once its container stopped — so
+`stg-bench-2026-10-21` stayed at 36,432 rows / 32 segments. The job also predates
+`state.config`, so there was no saved command to rebuild.
+
+What changed in `worker/src/indexer-admin.ts`:
+
+* `resume` now **restarts work**: no live `run.json` heartbeat → it rebuilds the original
+  command and starts it in the container, detached; otherwise it answers
+  `200 {started:false, alreadyRunning:true}` with the attempt and pid.
+* The command comes from `state.config`; a pre-upgrade job is recovered from R2 only when
+  the checkpoint **proves** the bound. A pause/signal/crash stops at a chunk boundary
+  (`nextOffset === chunks * chunkBytes`), while a run that hit `maxSourceMb * MiB` leaves
+  a partial chunk just past the limit. Both sources must agree on the rounded-down MiB, so
+  `stg-bench-2026-10-21` resolves to 16 MB/source and 16 partitions — never a full run.
+* A benchmark already at its bound is **reconciled** (checkpoint progress published,
+  `config` recorded, `coverage: "bounded"`, `stage: pass1-complete`) and then bounded
+  **Pass 2** starts in the same click (`--allow-bounded`, the recorded partitions).
+* An unrecoverable limit is refused with `400 benchmark_limit_unknown`, naming the two
+  actions that continue it at a known limit (`control {resume, maxSourceMb}` records it,
+  or a bounded benchmark for the same version); it is never widened.
+* Duplicate starts are refused before a process exists: `/start`, `/pass2` and
+  `/jobs/benchmark` answer `409 job_already_running` while a run is live, the runner keeps
+  its own in-process 409, and the DO alarm treats a 409 as "already working".
+* The panel (`src/pages/IndexingControl.tsx`) now shows the server's answer for Resume and
+  Pass 2, so a click that starts nothing says so instead of "recorded".
+
+### Verification
+
+| Check | Result |
+| --- | --- |
+| `bun test tests/cloud-resume-legacy.test.ts` | **PASS** — 8 tests: a pre-upgrade job at its bound reconciles to `pass1-complete` and starts `pass2 --partitions 16 --allow-bounded`; an unprovable limit is refused (no start); an explicit `maxSourceMb` resumes from the checkpoints and is recorded; a recorded limit below the bound resumes with exactly that limit; a live attempt is not started twice; the start route answers `409 job_already_running`; no checkpoints means no guess; a full job is refused on staging |
+| `bun test tests/cloud-pass2-bounded.test.ts` | **PASS** — 2 tests: a bounded 16-partition benchmark merges its prefix, every row reaches the index, `manifest.validationPassed` is true and the job ends `complete`; the mid-Pass-1 legacy shape is accepted only with `--allow-bounded` |
+| `bun test tests/cloud-pass1-recovery.test.ts` | **PASS** — 5 tests, updated: reaching the per-source limit now reports `stage: pass1-complete` with `coverage: "bounded"` (so Pass 2 can merge it) instead of a paused-looking job |
+| Live R2, read-only (`stg-bench-2026-10-21`, 2026-10-21) | **PASS** — 32 segments exist with the recorded sizes and row counts (7,180 + 28,298 = 36,432 rows, 10,544,166 segment bytes), both checkpoints are `partitions: 16`, `chunkBytes: 33,554,432`, `nextOffset` 16,778,741 / 16,777,313; `state.json` is `paused`, `mode: benchmark`, no `config`. Both offsets are partial chunks just past 16 MiB, which is what the resume proves the bound from. |
+| `bun run verify` | **PASS** — 4 typechecks, ESLint, 689 tests, 0 fail across 60 files |
+
+### Not verified here (and why)
+
+Deployment still cannot be performed from this workspace: `wrangler` has no authenticated
+account, no Cloudflare API token is available, and Vly owns version control, so `git` is
+blocked and the GitHub push that triggers Workers Builds is performed by Vly, not by this
+run. The live confirmation after that build is one Resume click on `/indexing`: the notice
+quotes `Pass 1 is complete; started Cloud Pass 2 … (16 partitions).`, `state.json` moves to
+`pass1-complete` with `config.maxSourceMb: 16`, and Pass 2's partitions advance to
+`stage: complete` with 36,432 rows. No new benchmark version, no checkpoint deletion, no
+full-corpus start, and no change to `raw/` is part of this change.
