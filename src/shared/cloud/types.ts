@@ -169,7 +169,7 @@ export interface CloudJobState {
   config?: CloudJobConfig;
   /** `bounded` when Pass 1 covered only a benchmark prefix, `full` when it read to EOF. */
   coverage?: "full" | "bounded";
-  /** Cloud Pass 2 progress, written after every merged partition. */
+  /** Cloud Pass 2 progress, written after every merged partition and during finalize. */
   pass2?: {
     partitionsDone: number;
     partitionsTotal: number;
@@ -178,6 +178,22 @@ export interface CloudJobState {
     indexBytes: number;
     /** Measured on this run, not estimated. */
     rowsPerSecond: number | null;
+    /**
+     * Which part of Pass 2 is running.
+     *
+     * The merge, finalize and validation phases all report `stage: "pass2"`, so the
+     * phase is what tells the panel (and an operator) whether the job is merging
+     * partitions, uploading the generated index, or reading it back to validate it.
+     * Without it a job that has merged every partition still reads as "pass2" with
+     * whatever ETA the merge last computed.
+     */
+    phase?: "merge" | "finalize" | "validate" | "complete";
+    /** Finalize progress: generated objects (index shards + directory) written. */
+    finalizeDone?: number;
+    finalizeTotal?: number;
+    /** Validation progress: generated objects read back from R2 and checksummed. */
+    validationDone?: number;
+    validationTotal?: number;
     updatedAt: string;
   };
   errors: { at: string; stage: CloudStage; message: string }[];
@@ -213,6 +229,15 @@ export interface CloudPass2Checkpoint {
    */
   mergeComplete: boolean;
   resume?: unknown;
+  /**
+   * Finalize/validation progress, so a restart after the merge reports what it is
+   * doing and a stopped job can be told apart from one uploading its last shards.
+   */
+  finalize?: {
+    phase: "finalize" | "validate" | "complete";
+    objectsDone: number;
+    objectsTotal: number;
+  };
 }
 
 export interface CloudSegmentRef {

@@ -283,6 +283,50 @@ describe("resuming a job started before execution metadata existed", () => {
     ]);
   });
 
+  test("a job whose merge is complete resumes finalization instead of the merge", async () => {
+    const captured: Captured[] = [];
+    const state = legacyState({
+      stage: "pass2",
+      config: { stage: "pass1", mode: "benchmark", partitions: 16, maxSourceMb: 16, chunkMb: 32, requestedAt: "2026-10-21T09:28:29.897Z" },
+      pass2: {
+        partitionsDone: 16,
+        partitionsTotal: 16,
+        shardParts: 11_264,
+        indexObjects: 366,
+        indexBytes: 512_000,
+        rowsPerSecond: 5,
+        phase: "finalize",
+        finalizeDone: 368,
+        finalizeTotal: 2_817,
+        updatedAt: "2026-10-21T11:39:07.720Z",
+      },
+      // The container was stopped mid-finalize: the run is no longer alive.
+      interruption: { at: "2026-10-21T11:45:00.000Z", outcome: "interrupted", reason: "the container was stopped (SIGTERM)" },
+    });
+    const run: CloudRunStatus = {
+      version: VERSION,
+      stage: "pass2",
+      outcome: "interrupted",
+      attempt: 2,
+      recordedBy: "runner",
+      startedAt: "2026-10-21T09:28:34.502Z",
+      heartbeatAt: "2026-10-21T11:45:00.000Z",
+      pid: 81,
+      reason: "the container was stopped (SIGTERM)",
+    };
+    const env = envWith(bucketWith({ state, run }), captured);
+
+    const response = await resume(env);
+
+    expect(response.status).toBe(202);
+    expect(response.body.stage).toBe("pass2");
+    // Same version, same 16 partitions, still bounded: the merge is not repeated and
+    // the benchmark can never become a full-corpus job.
+    expect(captured[0]!.body.args).toEqual(["pass2", "--version", VERSION, "--partitions", "16", "--allow-bounded"]);
+    expect(String(response.body.message)).toContain("merge is already complete");
+    expect(String(response.body.message)).toContain("finalization");
+  });
+
   test("a live attempt is never started twice", async () => {
     const captured: Captured[] = [];
     const run: CloudRunStatus = {

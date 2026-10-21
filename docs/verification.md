@@ -1264,3 +1264,79 @@ quotes `Pass 1 is complete; started Cloud Pass 2 … (16 partitions).`, `state.j
 `pass1-complete` with `config.maxSourceMb: 16`, and Pass 2's partitions advance to
 `stage: complete` with 36,432 rows. No new benchmark version, no checkpoint deletion, no
 full-corpus start, and no change to `raw/` is part of this change.
+
+## Phase T — finalization: measured, made observable, and resumed without the merge
+
+### What the live bucket actually said
+
+The report was "16/16 partitions, 0 B final index, 0 index objects, no validation". It was
+**not** a stall and **not** a failed merge. Read-only evidence from R2
+(`stg-bench-2026-10-21`, 2026-10-21):
+
+| Fact | Value |
+| --- | --- |
+| `pass2/checkpoint.json` | `mergeComplete: true`, `partitionsDone: 16/16`, `rowsMerged: 35,478`, `shardParts: 11,264`, `shardPartBytes: 19,751,087` |
+| `pass2/shards/` listing | **11,264 objects, 19,751,087 bytes** — exactly the checkpoint's count and total, so the shard-integrity check the resume performs passes |
+| `state.json` | `stage: pass2`, `pass2.partitionsDone: 16`, `indexObjects: 0`, written `11:39:02Z` |
+| `run.json` | `outcome: running`, attempt 2, `heartbeatAt: 11:09:21Z` — older than the merge completion (`11:39:07Z`) |
+| `manifests/stg-bench-2026-10-21/` | **empty** (no manifest, no validation report — both are written last, on purpose) |
+| Listings over 11 minutes | `indexes/` 242 → 430 → 531 objects while `companies/` (90), `contacts/` (23) and `details/` (113) stayed fixed |
+
+So the merge was complete and verified, finalization was **running**, and every 40–60
+seconds another index shard appeared. What made it look dead, and what made it slow:
+
+1. finalize wrote `state.json` **only** at merge partition boundaries, so the phase was
+   invisible and the merge's last ETA stayed on screen;
+2. finalize emitted **no heartbeat**, so the Durable Object's own stall detector saw a
+   dead run (11:09 vs 11:39) even though the process was alive;
+3. finalize wrote an object for **every configured shard** — 1,792 company + 1,024 contact
+   shards + the directory = 2,897 tasks, most of them empty `{"terms":{}}` — and issued a
+   LIST per shard before reading its parts; validation then re-read every object
+   sequentially. At the container's measured ~1.8 s per R2 round trip that is hours.
+
+### What changed
+
+* `tools/indexer/src/build.ts`: a new `onFinalize` hook reports progress for the `index`
+  and `validate` phases; cloud finalize builds four shards concurrently, lists each kind's
+  parts once, and **skips empty shards** (a local run always did, and the reader treats a
+  missing shard as empty); cloud validation reads eight objects concurrently and reports
+  each batch. Local runs keep the sequential path, so their bytes and order are unchanged.
+* `tools/cloud/pass2.ts`: publishes `pass2.phase` (`merge` / `finalize` / `validate` /
+  `complete`), `finalizeDone/Total`, `indexObjects` from objects actually written, and
+  `validationDone/Total`; writes the same progress into `pass2/checkpoint.json` while
+  keeping the merge snapshot; clears the row ETA in those phases; heartbeats.
+* `tools/cloud/cli.ts`: one throttled (15 s) heartbeat writer for the whole attempt, used by
+  every progress event.
+* `src/shared/cloud/types.ts`: the phase and counters are part of the durable schema.
+* `src/pages/IndexingControl.tsx`: the stage pill shows `pass2 · finalize`, and the cards
+  show merge partitions, finalize shards processed, validation objects checked and the
+  index objects/bytes — no row ETA during request-bound work.
+* `worker/src/indexer-admin.ts`: a resume of a job whose merge completed says so
+  ("The merge is already complete; resumed finalization…") instead of "Pass 2 started".
+
+### Verification
+
+| Check | Result |
+| --- | --- |
+| `bun test tests/cloud-pass2.test.ts` | **PASS** — 8 tests, including the new one: a run killed during finalize leaves `mergeComplete: true`; the restart reads **zero** segments, publishes `pass2:finalize`, `pass2:validate` and `complete:complete`, heartbeats, ends with `validationDone === indexObjects`, a `complete` checkpoint, a passing manifest, and **no empty index object** (every written shard has terms; object count is below the configured shard count) |
+| `bun test tests/cloud-resume-legacy.test.ts` | **PASS** — 9 tests, including: a job at `pass2` / `phase: finalize` with an interrupted run resumes `pass2 --partitions 16 --allow-bounded` and its message names finalization; the 16-partition merge is not re-run |
+| `bun test tests/cloud-job-listing.test.ts` | **PASS** — 8 tests, including: a finalizing job with a fresh heartbeat has **no** stale warning and exposes `phase: finalize`, `finalizeDone/Total` |
+| `bun run verify` | **PASS** — 4 typechecks, ESLint, **692 tests, 0 fail, 60 files** |
+| Live R2, read-only | **PASS** — the evidence table above; no write of any kind was made by this run, no new version was started, no checkpoint was deleted, `raw/` was not touched |
+
+### Remaining live step
+
+The deployed container is still running the previous build (it has been finalizing since
+11:39; the old code cannot publish phase progress). The workspace has no Cloudflare
+credential (`wrangler whoami` → not authenticated) and Vly owns version control, so the
+build that carries this change is triggered by Vly's publish, not from here. When it
+deploys, the new image replaces the instance; the Durable Object alarm then reads
+`run.json` (stale), sees `stage: pass2`, and re-runs the remembered
+`pass2 --partitions 16 --allow-bounded`. The driver finds `mergeComplete`, verifies the
+11,264 shard parts, and finishes **without repeating the merge** — with visible phase
+progress this time. If the old process completes first, the manifest and validation
+report exist and the alarm sees `stage: complete` and stops.
+
+The comparison the next decision needs — current hash-sharded layout versus the proposed
+AA–ZZ letter buckets, with measured bucket skew, object sizes, R2 operations, projected
+full-corpus cost and search-accuracy risk — is in `docs/two-letter-design.md`.

@@ -132,6 +132,23 @@ Restart is now checkpointed, not blind:
   assigned sequentially across partitions and a partial replay would produce a different
   index. The checkpoint makes the cost visible and bounds the loss to the finalize tail.
 
+The phases after the merge are observable and resumable in their own right:
+
+* `state.pass2.phase` is `merge`, `finalize`, `validate` or `complete`, with
+  `finalizeDone/finalizeTotal` (shards processed) and `validationDone/validationTotal`
+  (objects read back). That is what the panel renders instead of a merge-era ETA;
+* the same progress is written into `pass2/checkpoint.json` (which keeps the merge
+  snapshot), so a stop during finalize restarts at finalize;
+* finalize and validation **heartbeat** `run.json` (at most one write every 15 s), which
+  is the only proof of life the Durable Object keep-alive has between partitions;
+* empty shards write **no object** (a local run already skipped them, and the reader
+  treats a missing shard as empty). A 2,816-shard layout used to upload 2,816 objects,
+  most of them `{"terms":{}}`;
+* shard parts are listed **once per kind** instead of once per shard, four shards are
+  built concurrently, and validation reads eight objects at a time. The checks are
+  identical; only the wall-clock time changes (a live finalize measured ~0.27 shards/s
+  with the old sequential, one-LIST-per-shard path).
+
 Only one output shard is serialised at a time, and it is streamed rather than stringified
 whole (`shardJsonParts` → incremental gzip): peak memory is the largest single term plus
 compressor state, not the payload plus two full copies of it. The measured worst case and

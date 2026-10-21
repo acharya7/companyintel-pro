@@ -354,6 +354,7 @@ export default function IndexingControl() {
             {state ? (
               <span className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-medium ${STAGE_TONE[state.stage] ?? "border-border bg-muted/40 text-muted-foreground"}`}>
                 {state.stage}
+                {state.stage === "pass2" && state.pass2?.phase ? ` · ${state.pass2.phase}` : ""}
               </span>
             ) : null}
             {control ? (
@@ -522,32 +523,66 @@ export default function IndexingControl() {
                 description="Merges the verified segments directly from R2, one partition at a time. The whole spool and the whole index are never on local disk, and the source objects are read-only."
                 className="mt-6"
               >
-                <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-                  <StatCard
-                    label="Pass 2 partitions"
-                    value={state.pass2 ? `${state.pass2.partitionsDone.toLocaleString()} / ${state.pass2.partitionsTotal.toLocaleString()}` : "—"}
-                    hint={state.pass2 ? `${(state.rate.rowsPerSecond ?? 0).toLocaleString()} rows/s · ETA ${formatDuration(state.rate.etaSeconds)}` : "not started"}
-                    icon={<Layers className="size-4" />}
-                  />
-                  <StatCard
-                    label="Index in R2"
-                    value={formatBytes(state.pass2?.indexBytes)}
-                    hint={`${(state.pass2?.indexObjects ?? 0).toLocaleString()} objects · ${(state.pass2?.shardParts ?? 0).toLocaleString()} shard parts`}
-                    icon={<Database className="size-4" />}
-                  />
-                  <StatCard
-                    label="Source rows"
-                    value={state.totals.rowsRead.toLocaleString()}
-                    hint={`${state.totals.rowsRejected.toLocaleString()} rejected · ${state.accounting.bytesRead ? formatBytes(state.accounting.bytesRead) : "no reads yet"} read from R2`}
-                    icon={<Activity className="size-4" />}
-                  />
-                  <StatCard
-                    label="Estimated spend"
-                    value={`$${(state.accounting.estimatedUsd + state.accounting.containerUsd).toFixed(3)}`}
-                    hint={`R2 requests + container time · ${state.accounting.budgetUsd ? `budget $${state.accounting.budgetUsd} for the whole job · ` : ""}not a billing cap`}
-                    icon={<Timer className="size-4" />}
-                  />
-                </div>
+                {(() => {
+                  /*
+                   * A job used to sit at `stage: pass2` with the merge's last ETA for the
+                   * entire finalize and validation tail, so a healthy upload looked
+                   * stuck. The phase and its object counters are written by the engine;
+                   * they are rendered here as the progress they are, and no ETA is shown
+                   * for work that is request-bound rather than row-bound.
+                   */
+                  const pass2 = state.pass2;
+                  const phase = pass2?.phase ?? (pass2 ? "merge" : null);
+                  const merging = phase === "merge";
+                  return (
+                    <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+                      <StatCard
+                        label="Pass 2 merge"
+                        value={pass2 ? `${pass2.partitionsDone.toLocaleString()} / ${pass2.partitionsTotal.toLocaleString()}` : "—"}
+                        hint={
+                          !pass2
+                            ? "not started"
+                            : merging
+                              ? `${(state.rate.rowsPerSecond ?? 0).toLocaleString()} rows/s · ETA ${formatDuration(state.rate.etaSeconds)}`
+                              : "merge complete — not repeated on resume"
+                        }
+                        icon={<Layers className="size-4" />}
+                      />
+                      <StatCard
+                        label={phase === "validate" ? "Validation" : "Finalize"}
+                        value={
+                          phase === "finalize"
+                            ? `${(pass2?.finalizeDone ?? 0).toLocaleString()} / ${(pass2?.finalizeTotal ?? 0).toLocaleString()}`
+                            : phase === "validate" || phase === "complete"
+                              ? "done"
+                              : "—"
+                        }
+                        hint={
+                          phase === "validate"
+                            ? `${(pass2?.validationDone ?? 0).toLocaleString()} / ${(pass2?.validationTotal ?? 0).toLocaleString()} objects read back and checksummed`
+                            : phase === "finalize"
+                              ? "shards processed and written to R2 (empty shards write no object)"
+                              : phase === "complete"
+                                ? "manifest and validation report published"
+                                : "starts after the merge"
+                        }
+                        icon={<ShieldCheck className="size-4" />}
+                      />
+                      <StatCard
+                        label="Index in R2"
+                        value={formatBytes(pass2?.indexBytes)}
+                        hint={`${(pass2?.indexObjects ?? 0).toLocaleString()} objects · ${(pass2?.shardParts ?? 0).toLocaleString()} shard parts`}
+                        icon={<Database className="size-4" />}
+                      />
+                      <StatCard
+                        label="Estimated spend"
+                        value={`$${(state.accounting.estimatedUsd + state.accounting.containerUsd).toFixed(3)}`}
+                        hint={`R2 requests + container time · ${state.accounting.budgetUsd ? `budget $${state.accounting.budgetUsd} for the whole job · ` : ""}not a billing cap`}
+                        icon={<Timer className="size-4" />}
+                      />
+                    </div>
+                  );
+                })()}
 
                 <div className="mt-4 flex flex-wrap gap-2">
                   <Button
@@ -569,7 +604,7 @@ export default function IndexingControl() {
                 <p className="mt-3 text-xs text-muted-foreground">
                   {state.mode !== "full"
                     ? "This job is a bounded benchmark: it can build and verify an index, but activation is refused."
-                    : "Activation re-checks the uploaded manifest and validation report in R2. A paused Pass 2 replays from partition 1; every output is overwritten with identical bytes, so nothing is duplicated."}
+                    : "Activation re-checks the uploaded manifest and validation report in R2. A Pass 2 resumed after its merge continues at finalization: the 16 partition merge is not repeated, and every output is written idempotently, so nothing is duplicated."}
                 </p>
                 {state.errors.length ? (
                   <div className="mt-3 space-y-1 text-xs text-destructive">

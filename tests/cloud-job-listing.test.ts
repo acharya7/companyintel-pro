@@ -128,6 +128,41 @@ describe("cloud job listing", () => {
     expect(body.jobs.map((job) => job.state.version)).toEqual(["stg-owned"]);
   });
 
+  test("a finalizing job with a fresh heartbeat is not reported as stalled", async () => {
+    const version = "stg-finalizing";
+    const now = Date.now();
+    const bucket = bucketWith({
+      [`cloud/jobs/${version}/state.json`]: jobState(version, {
+        stage: "pass2",
+        pass2: {
+          partitionsDone: 16,
+          partitionsTotal: 16,
+          shardParts: 11_264,
+          indexObjects: 366,
+          indexBytes: 512_000,
+          rowsPerSecond: 5,
+          phase: "finalize",
+          finalizeDone: 368,
+          finalizeTotal: 2_817,
+          validationDone: 0,
+          validationTotal: 0,
+          updatedAt: new Date(now - 20_000).toISOString(),
+        },
+      }),
+      [`cloud/jobs/${version}/run.json`]: runStatus(version, {
+        stage: "pass2",
+        // Finalize has no partition boundaries; the new heartbeat is what keeps this
+        // from looking stopped for the whole upload.
+        heartbeatAt: new Date(now - 20_000).toISOString(),
+      }),
+    });
+
+    const { body } = await getJobs(env(bucket));
+
+    expect(body.jobs[0]!.warning).toBeNull();
+    expect(body.jobs[0]!.state.pass2).toMatchObject({ phase: "finalize", finalizeDone: 368, finalizeTotal: 2_817 });
+  });
+
   test("a job with no heartbeat for a while is reported as stale, not as running", async () => {
     const version = "stg-silent";
     const old = new Date(Date.now() - 10 * 60_000).toISOString();

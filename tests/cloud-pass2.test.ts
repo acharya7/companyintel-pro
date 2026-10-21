@@ -27,7 +27,13 @@ import { MemoryBlobStore } from "../tools/cloud/store";
 import { resetCredentialCache } from "../tools/indexer/src/credentials";
 import type { IndexerConfig } from "../tools/indexer/src/build";
 import { runIndex } from "../tools/indexer/src/build";
-import { CLOUD_CONTROL_VERSION, cloudKeys, type CloudControl } from "../src/shared/cloud/types";
+import {
+  CLOUD_CONTROL_VERSION,
+  cloudKeys,
+  type CloudControl,
+  type CloudJobState,
+  type CloudPass2Checkpoint,
+} from "../src/shared/cloud/types";
 
 const COMPANY_HEADER = ["organization_id", "organization_name", "organization_domain", "description"];
 const CONTACT_HEADER = ["person_name", "person_email", "sanitized_organization_name_unanalyzed"];
@@ -459,6 +465,104 @@ describe("cloud Pass 2", () => {
         runCloudPass2({ store, version: "cloud-p2-corrupt", config: configFor("cloud-p2-corrupt", join(dir, "work")), workDir: join(dir, "work") }),
       ).rejects.toThrow(/checksum mismatch/);
       expect((await store.head("manifests/cloud-p2-corrupt/manifest.json")).exists).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("a restart after the merge publishes finalize progress and does not repeat the merge", async () => {
+    const version = "cloud-p2-finalize";
+    /**
+     * Records the phase of every state write and can fail the finalize phase.
+     *
+     * A state.json write is what the dashboard reads, so the recorded sequence is the
+     * evidence that finalize and validation are observable instead of an indefinitely
+     * `pass2` job. `segmentReads` proves the resumed attempt did not touch Pass 1.
+     */
+    class RecordingStore extends FaultInjectingStore {
+      readonly phases: string[] = [];
+      override async put(key: string, body: Buffer): Promise<{ etag: string | null }> {
+        if (key === cloudKeys.state(version)) {
+          const parsed = JSON.parse(body.toString("utf8")) as { stage: string; pass2?: { phase?: string } };
+          const phase = `${parsed.stage}:${parsed.pass2?.phase ?? "none"}`;
+          if (this.phases[this.phases.length - 1] !== phase) this.phases.push(phase);
+        }
+        return super.put(key, body);
+      }
+    }
+
+    const store = new RecordingStore();
+    const { data } = await seedPass1(version, 8, store);
+    const dir = mkdtempSync(join(tmpdir(), "cloud-pass2-finalize-"));
+    try {
+      const workDir = join(dir, "work");
+      // The merge finishes, then the first index shard write is cut off — the shape of
+      // a container stopped during finalization.
+      store.failIndexWrites = true;
+      await expect(runCloudPass2({ store, version, config: configFor(version, workDir), workDir })).rejects.toThrow(
+        /simulated interruption/,
+      );
+
+      const afterFailure = await store.getJson<CloudPass2Checkpoint>(cloudKeys.pass2Checkpoint(version));
+      expect(afterFailure?.mergeComplete).toBe(true);
+      expect(afterFailure?.stage).toBe("merge");
+      expect((await store.getJson<{ stage: string }>(cloudKeys.state(version)))?.stage).toBe("failed");
+      expect(store.segmentReads).toBeGreaterThan(0);
+
+      // The operator fixes the cause and resumes: only finalize + validation run.
+      store.failIndexWrites = false;
+      store.segmentReads = 0;
+      let heartbeats = 0;
+      const resumed = await runCloudPass2({
+        store,
+        version,
+        config: configFor(version, workDir),
+        workDir,
+        onHeartbeat: () => {
+          heartbeats += 1;
+        },
+      });
+
+      expect(resumed.stopped).toBe("complete");
+      // The 16-partition-equivalent merge is not repeated: not one segment is read.
+      expect(store.segmentReads).toBe(0);
+      // Proof of life during the phases that have no partition boundaries.
+      expect(heartbeats).toBeGreaterThan(0);
+      expect(store.phases).toContain("pass2:finalize");
+      expect(store.phases).toContain("pass2:validate");
+      // Completion moves the job out of `pass2`, so the dashboard stops polling it as
+      // work in flight and the phase reads `complete`.
+      expect(store.phases).toContain("complete:complete");
+
+      const state = await store.getJson<CloudJobState>(cloudKeys.state(version));
+      expect(state?.stage).toBe("complete");
+      expect(state?.pass2?.phase).toBe("complete");
+      expect(state?.pass2?.finalizeDone).toBe(state?.pass2?.finalizeTotal);
+      expect(state?.pass2?.validationDone).toBe(state?.pass2?.indexObjects);
+      expect(state?.pass2?.indexObjects).toBeGreaterThan(0);
+      expect(resumed.rows).toBe(data.companyRows + data.contactRows);
+
+      const finalCheckpoint = await store.getJson<CloudPass2Checkpoint>(cloudKeys.pass2Checkpoint(version));
+      expect(finalCheckpoint?.stage).toBe("complete");
+      expect(finalCheckpoint?.finalize).toEqual({ phase: "complete", objectsDone: expect.any(Number), objectsTotal: expect.any(Number) });
+      expect(finalCheckpoint?.mergeComplete).toBe(true);
+
+      // Empty shards write no object (a local run already skipped them), so the index
+      // has fewer objects than the configured shard count and every object is real.
+      const shardKeys = store.keys(`indexes/${version}/`).filter((key) => key.endsWith(".json.gz"));
+      expect(shardKeys.length).toBeGreaterThan(0);
+      expect(shardKeys.length).toBeLessThan(1 + 8 * 5 + 8 * 3);
+      for (const key of shardKeys) {
+        const payload = JSON.parse(gunzipSync(store.bytes(key)!).toString("utf8")) as { terms: Record<string, unknown> };
+        expect(Object.keys(payload.terms).length).toBeGreaterThan(0);
+      }
+
+      const manifest = await store.getJson<{ validationPassed: boolean; counters: { uniqueCompanies: number; uniqueContacts: number } }>(
+        `manifests/${version}/manifest.json`,
+      );
+      expect(manifest?.validationPassed).toBe(true);
+      expect(manifest?.counters.uniqueCompanies).toBe(resumed.companies);
+      expect(manifest?.counters.uniqueContacts).toBe(resumed.contacts);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -911,8 +911,14 @@ async function resumeExecution(
     return c.json({ error: { code: "approval_required" as const, message: "A full-corpus Pass 2 requires approvedFullRun." } }, 403);
   }
   const pass2Args = ["pass2", "--version", version, "--partitions", String(partitions), ...(bounded ? ["--allow-bounded"] : [])];
+  // A job whose merge already completed resumes at finalization; the driver verifies
+  // the posting shards in R2 and never repeats the merge. Saying "Pass 2 started" for
+  // that case reads as if the whole merge were about to run again.
+  const resumePhase = state.pass2?.phase === "finalize" || state.pass2?.phase === "validate" ? state.pass2.phase : null;
   return startOrReport(c, pass2Args, { version, stage: "pass2", partitions, maxSourceMb }, {
-    message: `Pass 1 is complete; started Cloud Pass 2 for ${version} (${partitions} partitions).`,
+    message: resumePhase
+      ? `The merge is already complete; resumed ${resumePhase === "validate" ? "validation" : "finalization"} for ${version} from its durable checkpoint.`
+      : `Pass 1 is complete; started Cloud Pass 2 for ${version} (${partitions} partitions).`,
   });
 }
 

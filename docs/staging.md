@@ -14,7 +14,7 @@ Everything in this document is checked into the workspace. Nothing is deployed y
 | Cloud Pass 1 (R2 chunker + segments + checkpoints) | implemented, tested, verified against real R2 |
 | Cloud Pass 2 (partition reduce + streaming shard merge) | implemented, tested, verified against real R2 |
 | Production build (`tsc -b && vite build`) | passes in this workspace (`dist/` built) |
-| Test suite | `651 pass, 0 fail` (55 files) |
+| Test suite | `692 pass, 0 fail` (60 files) |
 | Lint / typechecks (app, worker, indexer, probe) | pass |
 | `wrangler deploy --dry-run` (production and staging) | pass; container + bindings resolve |
 | Staging Worker config (`wrangler.staging.toml`) | written, dry-run validated (`companyintel-staging` + `INDEXER_CONTAINER` + `COMPANY_DATA` + `staging/active.json` all resolve) |
@@ -130,8 +130,8 @@ connecting the repository first, then choosing the Worker name):
 | API token | created by Cloudflare for Workers Builds (§5) |
 
 Verification that runs in the build itself: `bun run verify` = four typechecks + ESLint +
-the full suite (679 tests, including the staging-isolation, API-routing, container-entrypoint,
-keep-alive/auto-resume and secret-placement guards).
+the full suite (692 tests, including the staging-isolation, API-routing, container-entrypoint,
+keep-alive/auto-resume, finalize-progress/resume and secret-placement guards).
 It fails the build rather than deploying a broken Worker, and it never touches production
 resources. `wrangler deploy` only runs after it passes, so a failed build cannot alter the
 production Worker.
@@ -420,6 +420,30 @@ boundary and writes `run.json` heartbeats plus an explicit `interruption` reason
 Resuming is safe and uses only the durable checkpoint: the committed csv2 chunk is not read
 again, and its 28,298 rows are counted. **Do not start a second benchmark for this version** —
 resume the same version instead.
+
+### The merge completed, and finalization is now observable (this round)
+
+`stg-bench-2026-10-21` reached 16/16 Pass 2 partitions and then appeared to stall at
+`stage: pass2` with `indexObjects: 0` and a 0-minute ETA. It had not stalled: the merge
+checkpoint recorded `mergeComplete: true`, all **11,264** posting-shard parts and
+**19,751,087** bytes (exactly what a listing of `pass2/shards/` returns), and
+`indexes/stg-bench-2026-10-21/` was growing object by object while `manifests/` stayed
+empty. What was missing was *observability and speed*:
+
+* `state.json` was only written at merge partition boundaries, so the finalize phase was
+  invisible — and `run.json`'s heartbeat was frozen at 11:09 although the merge completed
+  at 11:39, because finalize emitted no heartbeats at all;
+* finalize wrote an object for **every configured shard** (2,896 tasks: 1,792 company +
+  1,024 contact shards + the directory), most of them empty, and listed each shard's
+  parts separately; validation then re-read every object one at a time. At the measured
+  ~1.8 s per R2 round trip inside the container, that is hours of work reported as
+  "nothing happening".
+
+The driver now publishes `pass2.phase` plus object counters into both `state.json` and
+`pass2/checkpoint.json`, heartbeats during finalize/validation, lists shard parts once per
+kind, builds four shards concurrently, validates eight objects concurrently, and skips
+empty shards. A stop at any point resumes at finalize (the merge is never repeated), and
+the Durable Object's stall detector now sees a live heartbeat instead of guessing.
 
 ### Finishing `stg-bench-2026-10-21`
 

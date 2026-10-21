@@ -93,6 +93,16 @@ export interface RunCloudPass2Options {
    * prefix, but only for a job already marked `mode: "benchmark"`.
    */
   allowBounded?: boolean;
+  /**
+   * Proof of life for the two phases after the merge.
+   *
+   * The durable state is published on a schedule here, but `run.json` is what the
+   * Durable Object's keep-alive reads. Without a heartbeat during finalize and
+   * validation a perfectly healthy job is indistinguishable from a dead one, so the
+   * alarm may try to start a second attempt (the runner answers 409) and the panel
+   * reports a stale run. The CLI throttles this to a few writes a minute.
+   */
+  onHeartbeat?: () => Promise<void> | void;
   now?: () => number;
 }
 
@@ -325,6 +335,50 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
     await store.putJson(cloudKeys.pass2Checkpoint(version), checkpoint);
   };
 
+  /**
+   * The merge snapshot, once the engine has reported it.
+   *
+   * Every checkpoint written during finalize/validation carries it forward. Losing it
+   * would turn a restart after a 16-partition merge into a full replay of that merge,
+   * which is the expensive mistake this bookkeeping exists to prevent.
+   */
+  let mergeSnapshot: CloudMergeResume | null = existingCheckpoint?.mergeComplete
+    ? (existingCheckpoint.resume as CloudMergeResume | undefined) ?? null
+    : null;
+  const beat = async () => {
+    await options.onHeartbeat?.();
+  };
+
+  /**
+   * Posting-shard parts, listed once per kind instead of once per shard.
+   *
+   * Finalize asks for one shard at a time, and each request used to LIST
+   * `…/shards/<kind>/<shard>/` before reading its parts. That is one Class A request
+   * per shard — 2,300+ on a full run — and inside the container one round trip is
+   * ~0.7 s, so the listing dominated the phase. One paginated listing per kind
+   * returns every part; grouping by directory keeps the per-shard read order (batch
+   * filename) identical to before.
+   */
+  const shardPartIndex = new Map<string, Promise<Map<string, { key: string; size: number }[]>>>();
+  const shardPartsFor = (kind: string): Promise<Map<string, { key: string; size: number }[]>> => {
+    let pending = shardPartIndex.get(kind);
+    if (!pending) {
+      pending = store.list(`${cloudKeys.jobRoot(version)}/pass2/shards/${kind}/`).then((parts) => {
+        const grouped = new Map<string, { key: string; size: number }[]>();
+        for (const part of parts) {
+          const directory = part.key.slice(0, part.key.lastIndexOf("/"));
+          const list = grouped.get(directory);
+          if (list) list.push(part);
+          else grouped.set(directory, [part]);
+        }
+        for (const list of grouped.values()) list.sort((a, b) => a.key.localeCompare(b.key));
+        return grouped;
+      });
+      shardPartIndex.set(kind, pending);
+    }
+    return pending;
+  };
+
   let stopped: CloudPass2Result["stopped"] = "complete";
   let result: Awaited<ReturnType<typeof runIndex>> | null = null;
 
@@ -337,6 +391,7 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
       ...(resumeState ? { cloudResume: resumeState } : {}),
       cloud: {
         onMergeComplete: async (snapshot) => {
+          mergeSnapshot = snapshot;
           await writeCheckpoint({
             version,
             stage: "merge",
@@ -352,6 +407,64 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
             // Everything finalize needs, so a restart in that phase is exact.
             resume: snapshot,
           });
+        },
+
+        /*
+         * Finalize and validation progress.
+         *
+         * Both phases are pure R2 work and used to be invisible: the job stayed at
+         * `pass2` with `indexObjects: 0` and the merge's last ETA while hundreds of
+         * objects were uploaded and read back. Each report now records the phase, the
+         * object counters and the checkpoint (still carrying the merge snapshot), and
+         * touches the heartbeat — so the dashboard, the Durable Object keep-alive and
+         * an operator all see the same truth.
+         */
+        onFinalize: async (progress) => {
+          const at = new Date(now()).toISOString();
+          const current = (await store.getJson<CloudJobState>(cloudKeys.state(version))) ?? state;
+          const validating = progress.phase === "validate";
+          current.stage = "pass2";
+          current.updatedAt = at;
+          // No ETA here on purpose: this phase is request-bound, not row-bound, and a
+          // stale row ETA is exactly what made the panel look stuck at `pass2`.
+          current.rate = { rowsPerSecond: current.rate.rowsPerSecond, bytesPerSecond: null, etaSeconds: null };
+          current.pass2 = {
+            partitionsDone: config.partitions,
+            partitionsTotal: config.partitions,
+            shardParts,
+            // Actual objects in R2: empty shards are skipped, so the processed-shard
+            // counter and the object count are deliberately different numbers.
+            indexObjects: progress.objectsWritten,
+            indexBytes: current.pass2?.indexBytes ?? 0,
+            rowsPerSecond: current.pass2?.rowsPerSecond ?? null,
+            phase: validating ? "validate" : "finalize",
+            finalizeDone: validating ? (current.pass2?.finalizeDone ?? progress.objectsTotal) : progress.objectsDone,
+            finalizeTotal: validating ? (current.pass2?.finalizeTotal ?? progress.objectsTotal) : progress.objectsTotal,
+            validationDone: validating ? progress.objectsDone : (current.pass2?.validationDone ?? 0),
+            validationTotal: validating ? progress.objectsTotal : (current.pass2?.validationTotal ?? 0),
+            updatedAt: at,
+          };
+          await store.putJson(cloudKeys.state(version), current);
+          if (mergeSnapshot) {
+            await writeCheckpoint({
+              version,
+              stage: "finalize",
+              partitionsDone: config.partitions,
+              partitionsTotal: config.partitions,
+              shardParts,
+              shardPartBytes,
+              rowsMerged: current.totals.rowsIndexed || totalRows,
+              updatedAt: at,
+              mergeComplete: true,
+              resume: mergeSnapshot,
+              finalize: {
+                phase: validating ? "validate" : "finalize",
+                objectsDone: progress.objectsDone,
+                objectsTotal: progress.objectsTotal,
+              },
+            });
+          }
+          await beat();
         },
         preparePartition: async (entry) => {
           const target = join(spoolDir, entry.file);
@@ -468,6 +581,7 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
             indexObjects,
             indexBytes: 0,
             rowsPerSecond: current.rate.rowsPerSecond,
+            phase: "merge",
             updatedAt: current.updatedAt,
           };
           await store.putJson(cloudKeys.state(version), current);
@@ -503,8 +617,8 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
         },
 
         readShardParts: async function* (kind, shard) {
-          const prefix = `${cloudKeys.jobRoot(version)}/pass2/shards/${kind}/${String(shard).padStart(4, "0")}/`;
-          const parts = (await store.list(prefix)).sort((a, b) => a.key.localeCompare(b.key));
+          const directory = `${cloudKeys.jobRoot(version)}/pass2/shards/${kind}/${String(shard).padStart(4, "0")}`;
+          const parts = (await shardPartsFor(kind)).get(directory) ?? [];
           for (const part of parts) {
             const body = await store.getRange(part.key, 0, part.size);
             const text = gunzipSync(body).toString("utf8");
@@ -537,7 +651,7 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
       current.updatedAt = new Date(now()).toISOString();
       current.note =
         error.kind === "paused"
-          ? `${error.reason ?? "Paused by operator."} Resume replays Cloud Pass 2 from partition 1; outputs are deterministic and overwritten.`
+          ? `${error.reason ?? "Paused by operator."} Resume continues from the last durable Pass 2 checkpoint: a completed merge is not repeated, and every output is written idempotently.`
           : "Aborted. Pass 1 segments are untouched; no activation happened.";
       await reconcileAccounting(current);
       current.accounting.budgetUsd = cloudJobBudgetUsd() ?? undefined;
@@ -589,6 +703,11 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
     shardParts,
     indexObjects: output.length,
     indexBytes,
+    phase: "complete",
+    finalizeDone: output.length,
+    finalizeTotal: output.length,
+    validationDone: output.length,
+    validationTotal: output.length,
     rowsPerSecond:
       result.counters.rowsRead > 0 && result.stages.pass2Ms > 0
         ? Math.round(result.counters.rowsRead / (result.stages.pass2Ms / 1000))
@@ -612,6 +731,8 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
     rowsMerged: current.totals.rowsIndexed,
     updatedAt: current.updatedAt,
     mergeComplete: true,
+    ...(mergeSnapshot ? { resume: mergeSnapshot } : {}),
+    finalize: { phase: "complete", objectsDone: output.length, objectsTotal: output.length },
   });
 
   log(

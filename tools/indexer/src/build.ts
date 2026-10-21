@@ -1087,6 +1087,28 @@ async function collectBuffers(parts: AsyncIterable<Buffer>): Promise<Buffer[]> {
   return chunks;
 }
 
+/**
+ * Run `run` over `items` with at most `limit` in flight, preserving nothing but
+ * call order (each call receives its own item and index).
+ *
+ * Used by the cloud finalize and validation phases, where every unit of work is a
+ * few R2 round trips: sequentially the job spends its time waiting, and unbounded it
+ * would open thousands of requests. A local run never uses this, so its output order
+ * and byte-for-byte result are untouched.
+ */
+async function mapLimit<T>(items: readonly T[], limit: number, run: (item: T, index: number) => Promise<void>): Promise<void> {
+  let next = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    for (;;) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) return;
+      await run(items[index]!, index);
+    }
+  });
+  await Promise.all(workers);
+}
+
 /* -------------------------------------------------------------------------- */
 /* Pass-2 restart safety                                                      */
 /* -------------------------------------------------------------------------- */
@@ -1273,6 +1295,24 @@ export interface CloudMergeIo {
    * the (long, R2-bound) finalize and validation phases can skip the merge.
    */
   onMergeComplete?(snapshot: CloudMergeResume): Promise<void>;
+  /**
+   * Progress of the two phases after the merge: writing the generated objects
+   * (`index`) and reading every one of them back from R2 to validate it (`validate`).
+   *
+   * Both phases are network-bound and can take many minutes on a real bucket, while
+   * the job's durable state otherwise only changes at merge partition boundaries. A
+   * driver that does not publish this progress makes a working finalize look exactly
+   * like a stalled run — which is what a live benchmark did. `objectsTotal` for the
+   * `index` phase is known up front (the configured shard count plus the directory).
+   */
+  onFinalize?(progress: {
+    phase: "index" | "validate";
+    /** Work units finished (shards processed / objects validated). */
+    objectsDone: number;
+    objectsTotal: number;
+    /** Objects that actually exist in R2 so far (empty shards write nothing). */
+    objectsWritten: number;
+  }): Promise<void>;
 }
 
 /**
@@ -3022,50 +3062,107 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
 
   const finalizeStart = Date.now();
   emit({ stage: "indexing", message: "finalizing index shards" });
-  const indexPathIndex = async (kind: ShardKind, shards: number) => {
-    for (let shard = 0; shard < shards; shard += 1) {
-      const name = String(shard).padStart(4, "0");
-      const linesPath = join(shardDir, `${kind}/${name}.lines`);
-      if (!cloud && !existsSync(linesPath)) continue;
-      // Read with the same `\n`-only splitter as the spool (see jsonl.ts):
-      // `readline` split on U+2028/U+2029, so a term containing one produced a
-      // fragment with no `\u0001` and the old code discarded the posting silently.
-      const payload = cloud
-        ? await companyShardPayload(linesFromParts(cloud.readShardParts(kind, shard)), `${kind}/${name}`)
-        : await companyShardPayload(readJsonlLines(linesPath), `${kind}/${name}`);
-      await writer.writeJsonParts(folderFor("indexes", config.datasetVersion, `${kind}/${name}.json`), shardJsonParts(payload.terms));
-      if (!cloud) await rm(linesPath, { force: true });
-    }
-  };
 
-  /*
-   * Contact name shards: same line format, but the target is a contact id.
+  /**
+   * Every generated object the finalize phase will write, in a stable order.
    *
-   * A malformed line is a hard error for the same reason it is for a company
-   * shard: silently dropping it would make a person unfindable while the index
-   * still claims to cover every contact.
+   * Declared up front for two reasons: the count is published as the finalize
+   * denominator (so progress is "231 of 2,562", not a guess), and the cloud path can
+   * then build independent shards concurrently without changing which objects exist.
+   * A local run keeps the sequential loop so its output order — and every byte of
+   * `objects.jsonl` — is unchanged.
    */
-  const indexContactShard = async (kind: ShardKind, shards: number) => {
-    for (let shard = 0; shard < shards; shard += 1) {
-      const name = String(shard).padStart(4, "0");
-      const linesPath = join(shardDir, `${kind}/${name}.lines`);
-      if (!cloud && !existsSync(linesPath)) continue;
-      const payload = cloud
-        ? await contactShardPayload(linesFromParts(cloud.readShardParts(kind, shard)), `${kind}/${name}`)
-        : await contactShardPayload(readJsonlLines(linesPath), `${kind}/${name}`);
-      await writer.writeJsonParts(folderFor("indexes", config.datasetVersion, `${kind}/${name}.json`), shardJsonParts(payload.terms));
-      if (!cloud) await rm(linesPath, { force: true });
-    }
+  const finalizeTasks: { kind: ShardKind; shard: number; contact: boolean }[] = [];
+  for (const kind of ["exact", "prefix", "token", "trigram", "ids"] as const) {
+    for (let shard = 0; shard < config.shards[kind]; shard += 1) finalizeTasks.push({ kind, shard, contact: false });
+  }
+  for (const [kind, count] of [
+    ["contactToken", config.shards.token],
+    ["contactPrefix", config.shards.prefix],
+    ["contactTrigram", config.shards.trigram],
+  ] as const) {
+    for (let shard = 0; shard < count; shard += 1) finalizeTasks.push({ kind, shard, contact: true });
+  }
+  // The directory object is written after the shards; counting it keeps the last
+  // progress report from claiming completion before it exists.
+  const finalizeTotal = finalizeTasks.length + 1;
+  let finalizeDone = 0;
+  /**
+   * Publish finalize progress.
+   *
+   * Batched (one write per eight objects): each report is a state PUT plus a
+   * checkpoint PUT, and a job with thousands of shards must not turn progress
+   * reporting into the bottleneck. The remaining tail is always reported.
+   */
+  const reportFinalize = async (force = false): Promise<void> => {
+    if (!cloud?.onFinalize) return;
+    if (!force && finalizeDone % 8 !== 0) return;
+    await cloud.onFinalize({
+      phase: "index",
+      objectsDone: finalizeDone,
+      objectsTotal: finalizeTotal,
+      objectsWritten: writer.objects.length,
+    });
   };
 
-  await indexPathIndex("exact", config.shards.exact);
-  await indexPathIndex("prefix", config.shards.prefix);
-  await indexPathIndex("token", config.shards.token);
-  await indexPathIndex("trigram", config.shards.trigram);
-  await indexPathIndex("ids", config.shards.ids);
-  await indexContactShard("contactToken", config.shards.token);
-  await indexContactShard("contactPrefix", config.shards.prefix);
-  await indexContactShard("contactTrigram", config.shards.trigram);
+  // Read with the same `\n`-only splitter as the spool (see jsonl.ts): `readline`
+  // split on U+2028/U+2029, so a term containing one produced a fragment with no
+  // `\u0001` and the old code discarded the posting silently.
+  const writeIndexShard = async (task: { kind: ShardKind; shard: number; contact: boolean }): Promise<void> => {
+    const name = String(task.shard).padStart(4, "0");
+    const linesPath = join(shardDir, `${task.kind}/${name}.lines`);
+    if (!cloud && !existsSync(linesPath)) return;
+    // A company shard targets a company id and a contact shard targets a contact id;
+    // the payload builder is the only difference between them.
+    let payload;
+    if (cloud) {
+      /*
+       * An empty shard writes NO object, exactly as a local run does (it skips a
+       * shard with no `.lines` file). The reader treats a missing shard as empty, so
+       * the index is identical — but a 2,816-shard layout used to upload 2,816
+       * objects, most of them `{"terms":{}}`, at one PUT each. That was a large part
+       * of a finalize that took hours. Peeking the first posting keeps the payload
+       * streaming, so memory stays one shard at a time.
+       */
+      const parts = cloud.readShardParts(task.kind, task.shard);
+      const iterator = parts[Symbol.asyncIterator]();
+      const first = await iterator.next();
+      if (first.done) return;
+      const rest = (async function* () {
+        yield first.value as string;
+        for (;;) {
+          const next = await iterator.next();
+          if (next.done) return;
+          yield next.value as string;
+        }
+      })();
+      // `rest` re-yields the peeked first line, so `linesFromParts` numbers the
+      // postings exactly as it would for an unpaused stream.
+      payload = task.contact
+        ? await contactShardPayload(linesFromParts(rest), `${task.kind}/${name}`)
+        : await companyShardPayload(linesFromParts(rest), `${task.kind}/${name}`);
+    } else {
+      payload = task.contact
+        ? await contactShardPayload(readJsonlLines(linesPath), `${task.kind}/${name}`)
+        : await companyShardPayload(readJsonlLines(linesPath), `${task.kind}/${name}`);
+    }
+    await writer.writeJsonParts(folderFor("indexes", config.datasetVersion, `${task.kind}/${name}.json`), shardJsonParts(payload.terms));
+    if (!cloud) await rm(linesPath, { force: true });
+  };
+
+  if (cloud) {
+    // Four shards in flight: enough to hide the per-request RTT that made a
+    // sequential finalize take tens of minutes, while peak memory stays a few
+    // shard payloads (each streamed into its own gzip).
+    await mapLimit(finalizeTasks, 4, async (task) => {
+      await writeIndexShard(task);
+      finalizeDone += 1;
+      await reportFinalize();
+    });
+  } else {
+    for (const task of finalizeTasks) await writeIndexShard(task);
+  }
+  await reportFinalize();
 
   const stats: DatasetStats = {
     version: config.datasetVersion,
@@ -3137,6 +3234,10 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     fields: { company: ["name", "domain", "industry", "country", "city", "companySize", "revenue"], contact: ["fullName", "title", "email", "phone", "linkedinUrl", "country", "city"] },
   };
   await writer.writeJson(`indexes/${config.datasetVersion}/directory.json`, directory, false);
+  // Everything the index needs now exists; the manifest is deliberately still
+  // absent until validation has read all of it back.
+  finalizeDone = finalizeTotal;
+  await reportFinalize(true);
   const finalizeMs = Date.now() - finalizeStart;
 
   const elapsedMs = Date.now() - startedAt;
@@ -3159,23 +3260,46 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   const validateStart = Date.now();
   emit({ stage: "validating", message: "validating generated objects" });
   const missing: string[] = [];
-  for (const object of writer.objects) {
-    let body: Buffer | null;
-    if (cloud) {
-      // Read the object back from R2: local validation only proves what is in the
-      // writer's memory, not what a search will actually fetch.
-      body = await cloud.readObject(object.key).catch(() => null);
-    } else {
+  if (cloud) {
+    /*
+     * Read every generated object back from R2: local validation only proves what is
+     * in the writer's memory, not what a search will actually fetch.
+     *
+     * Concurrent (8 at a time) because this is one HEAD + one GET per object against
+     * the bucket's S3 endpoint. Sequentially, a full-corpus index of a few thousand
+     * objects spends most of an hour in round-trip latency while the job looks stuck;
+     * the checks themselves are unchanged, and the `missing` list is rebuilt in the
+     * writer's order so the report is identical.
+     */
+    const failures = new Array<string | null>(writer.objects.length).fill(null);
+    let checked = 0;
+    await mapLimit(writer.objects, 8, async (object, index) => {
+      const body = await cloud.readObject(object.key).catch(() => null);
+      const ok = body !== null && createHash("sha256").update(body).digest("hex") === object.sha256;
+      failures[index] = ok ? null : object.key;
+      checked += 1;
+      if (cloud.onFinalize && (checked % 8 === 0 || checked === writer.objects.length)) {
+        await cloud.onFinalize({
+          phase: "validate",
+          objectsDone: checked,
+          objectsTotal: writer.objects.length,
+          objectsWritten: writer.objects.length,
+        });
+      }
+    });
+    for (const key of failures) if (key) missing.push(key);
+  } else {
+    for (const object of writer.objects) {
       const path = join(config.outputDir, object.key);
       const info = await stat(path).catch(() => null);
-      body = info ? await readFile(path) : null;
+      const body = info ? await readFile(path) : null;
+      if (!body) {
+        missing.push(object.key);
+        continue;
+      }
+      const sha256 = createHash("sha256").update(body).digest("hex");
+      if (sha256 !== object.sha256) missing.push(object.key);
     }
-    if (!body) {
-      missing.push(object.key);
-      continue;
-    }
-    const sha256 = createHash("sha256").update(body).digest("hex");
-    if (sha256 !== object.sha256) missing.push(object.key);
   }
 
   const validateMs = Date.now() - validateStart;

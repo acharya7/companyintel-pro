@@ -403,6 +403,18 @@ function printState(state: CloudJobState): void {
   console.log(`  rows indexed           ${state.totals.rowsIndexed.toLocaleString()}`);
   console.log(`  rejected               ${state.totals.rowsRejected.toLocaleString()}`);
   console.log(`  segments               ${state.totals.segments.toLocaleString()} (${gb(state.totals.segmentBytes)})`);
+  if (state.pass2) {
+    const phase = state.pass2.phase ?? "merge";
+    const detail =
+      phase === "finalize"
+        ? ` · ${(state.pass2.finalizeDone ?? 0).toLocaleString()}/${(state.pass2.finalizeTotal ?? 0).toLocaleString()} objects written`
+        : phase === "validate"
+          ? ` · ${(state.pass2.validationDone ?? 0).toLocaleString()}/${(state.pass2.validationTotal ?? 0).toLocaleString()} objects validated`
+          : "";
+    console.log(
+      `  pass 2                 ${(state.pass2.partitionsDone ?? 0).toLocaleString()}/${(state.pass2.partitionsTotal ?? 0).toLocaleString()} partitions · ${phase}${detail}`,
+    );
+  }
   console.log(`  source read            ${gb(state.totals.sourceBytesRead)}`);
   console.log(`  rate                   ${state.rate.rowsPerSecond?.toFixed(0) ?? "?"} rows/s · ETA ${state.rate.etaSeconds === null ? "?" : hhmm(state.rate.etaSeconds)}`);
   console.log(`  R2 requests            ${state.accounting.classA.toLocaleString()} A / ${state.accounting.classB.toLocaleString()} B`);
@@ -545,6 +557,22 @@ async function pass2(store: R2BlobStore): Promise<void> {
   const before = store.countersSnapshot();
   const started = Date.now();
   const run = await beginRun(store, id, "pass2");
+  /*
+   * One heartbeat writer for the whole attempt.
+   *
+   * The merge reports at partition boundaries, and finalize/validation now report
+   * every few objects. Writing run.json for every report would add a PUT per report
+   * (and slow the phase down); writing it never is what made a live finalize look
+   * dead. Fifteen seconds is well inside the Durable Object's stall window and the
+   * panel's three-minute warning.
+   */
+  let lastHeartbeat = 0;
+  const heartbeat = async () => {
+    const at = Date.now();
+    if (at - lastHeartbeat < 15_000) return;
+    lastHeartbeat = at;
+    await touchRun(store, run);
+  };
   let result;
   try {
     result = await runCloudPass2({
@@ -554,11 +582,13 @@ async function pass2(store: R2BlobStore): Promise<void> {
       workDir,
       allowBounded: Boolean(flag("allow-bounded")),
       onLog: (line) => console.log(`  ${line}`),
+      onHeartbeat: heartbeat,
       onProgress: (event) => {
-        if (event.stage === "pass2-merge" || event.stage === "validating") console.log(`  [${event.stage}] ${event.message}`);
-        // One heartbeat per partition boundary: a Pass 2 that is killed is visible
-        // as a stale run instead of an indefinitely "merging" job.
-        if (event.stage === "pass2-merge") void touchRun(store, run);
+        if (event.stage === "pass2-merge" || event.stage === "indexing" || event.stage === "validating") {
+          console.log(`  [${event.stage}] ${event.message}`);
+        }
+        // Any progress event proves the process is alive; the heartbeat is throttled.
+        void heartbeat();
       },
     });
   } catch (error) {
@@ -575,6 +605,7 @@ async function pass2(store: R2BlobStore): Promise<void> {
   const seconds = (Date.now() - started) / 1000;
   console.log("\nCloud Pass 2 result");
   console.log(`  stage                  ${result.stopped}`);
+  console.log(`  phase                  ${result.state.pass2?.phase ?? "—"}`);
   console.log(`  partitions             ${result.partitions}`);
   console.log(`  rows                   ${result.rows.toLocaleString()}`);
   console.log(`  companies / contacts   ${result.companies.toLocaleString()} / ${result.contacts.toLocaleString()}`);
