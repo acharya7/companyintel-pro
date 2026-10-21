@@ -105,7 +105,20 @@ describe("Cloudflare Containers deployment config", () => {
     expect(container).toContain("setInactivityTimeout");
     expect(container).toContain("async alarm()");
     expect(container).toContain("CONTAINER_KEEPALIVE_MS");
-    expect(container).toContain("job?.running");
+    expect(container).toMatch(/job\?\.running|decision\.kind === "running"/);
+  });
+
+  test("a stopped job is recovered from the cloud, without a browser", () => {
+    // The alarm restarts a job whose durable state says it stopped, using the
+    // arguments recorded when it was accepted; operator pause/abort and the budget
+    // are never overridden.
+    expect(container).toContain("CONTAINER_AUTO_RESUME");
+    expect(container).toContain("CONTAINER_MAX_RESUMES");
+    expect(container).toContain("CONTAINER_STALL_MS");
+    expect(container).toContain("rememberJob");
+    expect(container).toContain("operator-stop");
+    expect(container).toContain('kind: "budget"');
+    expect(container).toContain("RESUME_BACKOFF_MS");
   });
 
   test("the runner forwards a stop to the child and records it in R2", () => {

@@ -1150,12 +1150,19 @@ half of the defect.
 
 Fix:
 
-* `worker/src/indexer-container.ts` calls `setInactivityTimeout()` (default 1 h, max 6 h,
-  `CONTAINER_JOB_INACTIVITY_MS`) when a `/job` request is accepted, arms a DO alarm
+* `worker/src/indexer-container.ts` calls `setInactivityTimeout()`  (default 1 h, max 6 h, `CONTAINER_JOB_INACTIVITY_MS`) when a `/job` request is accepted, arms a DO alarm
   (`CONTAINER_KEEPALIVE_MS`, default 10 min) and renews the timeout from that alarm **only
   while the runner's `/health` reports `job.running`**. A finished job stops renewing, so it
   stops costing container time. A redeployed DO restores the timeout in its constructor when
   the container is already running.
+* **Cloud-side recovery, no browser needed.** The DO persists the job (version, stage, args,
+  attempts) in its own storage and, from the same alarm, re-issues those arguments when R2
+  says the run stopped: `run.json` `failed`/`interrupted`/`terminated`, a `running`
+  heartbeat older than `CONTAINER_STALL_MS` (15 min), or `state.json` `failed`/`paused`.
+  `control.pause`/`abort` and the job budget always win; resumes are capped at
+  `CONTAINER_MAX_RESUMES` (5) with 1/5/15/30/60 min backoff; `CONTAINER_AUTO_RESUME=false`
+  disables them. The resume is a normal start, so the CLI continues from its checkpoint —
+  committed chunks are never re-read and segment keys are deterministic.
 * `cloud/runner.mjs` now owns detached children: `/health` reports `job.running`, a
   SIGTERM/SIGINT handler forwards SIGTERM to the child, waits up to `JOB_STOP_GRACE_MS`
   (90 s) for a boundary exit, ends it forcibly otherwise, and then records the stop through
@@ -1184,8 +1191,8 @@ job look "stuck in Pass 1".
 | `bun test tests/cloud-job-listing.test.ts` | **PASS** — 6 tests: a job with 1,200 segment objects is listed (nothing under `segments/` is listed or fetched), staging still filters, stale/interrupted/failed reasons, truncation at 25 jobs |
 | `bun test tests/cloud-pass1-recovery.test.ts` | **PASS** — 5 tests: SIGTERM-equivalent stop at a chunk boundary resumes to the exact totals, a thrown error is persisted then resumes, a bounded re-run reports `bounded`, a lagging state is repaired from the checkpoint, resume never re-reads a committed chunk |
 | `bun test tests/cloud-runner.test.ts` | **PASS** — 4 tests, including a real SIGTERM to the runner: the child stops at a boundary, `run.json` and `state.json` record the interruption, and a new container process resumes the same version to 2,400 rows / `completed` |
-| `bun test tests/indexer-container-keepalive.test.ts` | **PASS** — 5 tests: timeout + alarm on an accepted job, alarm renewal only while the job runs, probe failure keeps the window open, a rejected keep-alive never breaks the 202, constructor restore after a DO restart |
-| `bun test` | **PASS** — 673 tests, 0 fail across 58 files |
+| `bun test tests/indexer-container-keepalive.test.ts` | **PASS** — 10 tests: timeout + job record + alarm on an accepted job, renewal only while the job runs, **automatic resume of an interrupted run with its recorded arguments**, a quiet job left alone while a stale heartbeat is recovered, operator pause/abort and the job budget never overridden, bounded attempts + `CONTAINER_AUTO_RESUME=false`, backoff after a failed resume, readiness failure does not mark a job finished, rejected keep-alive does not break the 202, constructor restores the timeout and the alarm |
+| `bun test` | **PASS** — 679 tests, 0 fail across 58 files |
 | Typechecks | **PASS** — frontend/shared, `worker/tsconfig.json`, `tools/indexer/tsconfig.json` |
 
 ### Not verified here
