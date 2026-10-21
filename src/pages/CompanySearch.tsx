@@ -27,6 +27,8 @@ import {
   recordActivity,
 } from "@/hooks/use-api";
 import { ASSOCIATION_CATEGORY_LABELS, type AssociationCategory } from "@/shared/association";
+import { RealDataCoverageNotice, SourceScanPanel } from "@/components/realdata";
+import { useRealDataCoverage } from "@/hooks/use-realdata";
 import { formatNumber } from "@/lib/format";
 import type { CompanyFilters, CompanySortField, SortOrder } from "@/shared/models";
 import { cn } from "@/lib/utils";
@@ -207,6 +209,8 @@ export default function CompanySearch() {
   }
 
   const activeFilterCount = Object.values(state.filters).filter(Boolean).length;
+  const realData = useRealDataCoverage();
+  const partialCoverage = realData.data?.partial !== false;
   const hits = state.mode === "contacts" ? [] : query.data?.hits ?? [];
   const contactHits = state.mode === "companies" ? [] : contactQuery.data?.hits ?? [];
   const suggestionHits = state.mode === "contacts" ? [] : suggestions.data?.hits ?? [];
@@ -253,6 +257,8 @@ export default function CompanySearch() {
           </>
         }
       />
+
+      <RealDataCoverageNotice className="mb-4" compact />
 
       <div className="surface p-4 sm:p-5">
         <form onSubmit={submit} className="flex flex-col gap-3 sm:flex-row sm:items-center">
@@ -478,8 +484,12 @@ export default function CompanySearch() {
           ) : resultsEmpty ? (
             <EmptyState
               icon={<Search className="size-5" />}
-              title="No results"
-              description="We did not find anything related to this company or contact in our database."
+              title={partialCoverage ? "No match in the indexed coverage" : "No results"}
+              description={
+                partialCoverage
+                  ? "Nothing in the activated index matches this query. Only part of the 64 GB corpus is indexed, so the record may still exist — run a bounded source scan below to look outside that coverage. No absence is claimed."
+                  : "We did not find anything related to this company or contact in our database."
+              }
             />
           ) : (
             <>
@@ -788,6 +798,14 @@ export default function CompanySearch() {
           ) : null}
         </aside>
       </div>
+
+      {state.q && realData.data?.directScan ? (
+        <SourceScanPanel
+          className="mt-4"
+          query={state.q}
+          kind={state.mode === "companies" ? "companies" : state.mode === "contacts" ? "contacts" : "both"}
+        />
+      ) : null}
 
       <Dialog open={saveOpen} onOpenChange={setSaveOpen}>
         <DialogContent>

@@ -66,6 +66,14 @@ export interface Env {
    * combined running estimate reaches it. This is a guard, not a billing cap.
    */
   CLOUD_JOB_BUDGET_USD?: string;
+  /**
+   * Byte budget per source for ONE direct R2 search scan, in MiB (default 48).
+   *
+   * A request may ask for less, never more: the Worker clamps to this value before
+   * it starts the container, so a query cannot turn into an unrestricted corpus
+   * scan. 48 MiB per source is a few seconds of R2 reads and well under a cent.
+   */
+  REALDATA_SCAN_MAX_MB?: string;
 }
 
 export interface AccessIdentity {

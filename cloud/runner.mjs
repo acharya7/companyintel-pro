@@ -67,6 +67,9 @@ const ALLOWED_COMMANDS = new Set([
   "resume",
   "abort",
   "interrupt",
+  // Bounded direct R2 search (REAL DATA level 3). The command is resumable and
+  // writes the same `cloud/jobs/<id>/` heartbeat the keep-alive alarm inspects.
+  "scan",
 ]);
 
 /** The CLI is present only when the image was copied correctly. */

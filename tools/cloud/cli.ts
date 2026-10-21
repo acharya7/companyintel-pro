@@ -41,6 +41,8 @@ import { forecast, type BenchmarkMeasurement } from "./cost";
 import { cloudSourcesFromConfig, runPass1, syncStateFromCheckpoints, verifyRun } from "./pass1";
 import { runCloudPass2 } from "./pass2";
 import { R2BlobStore } from "./store";
+import { runScan } from "../realdata/scan";
+import { REALDATA_LIMITS, isScanJobId, type RealDataScanKind } from "../../src/shared/realdata/types";
 
 const root = resolve(dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "../..");
 
@@ -630,6 +632,43 @@ async function verify(store: R2BlobStore): Promise<void> {
   process.exitCode = report.ok ? 0 : 1;
 }
 
+/**
+ * Bounded direct R2 scan (level 3 of the real-data search path).
+ *
+ * Started by the Worker with `detach: true`, so it must be idempotent and
+ * resumable: it reads `status.json` for the job and continues from each source's
+ * committed record boundary. A cancel object stops it between windows.
+ */
+async function scan(store: R2BlobStore): Promise<void> {
+  const id = version();
+  if (!isScanJobId(id)) throw new Error("--version must be a scan-… job id for the scan command.");
+  const queryValue = flag("query");
+  if (typeof queryValue !== "string" || !queryValue.trim()) throw new Error("--query <text> is required.");
+  const kindValue = flag("kind");
+  const kind: RealDataScanKind =
+    kindValue === "companies" || kindValue === "contacts" || kindValue === "both" ? kindValue : "both";
+  const maxMb = Math.min(num("max-mb") ?? REALDATA_LIMITS.defaultScanMb, REALDATA_LIMITS.maxScanMb);
+  const limit = Math.min(num("limit") ?? REALDATA_LIMITS.defaultLimit, REALDATA_LIMITS.maxLimit);
+  const datasetValue = flag("dataset-version");
+  const datasetVersion = typeof datasetValue === "string" ? datasetValue : "unknown";
+  console.log(`Direct R2 scan ${id}\n  query ${JSON.stringify(queryValue)}\n  kind ${kind}\n  budget ${maxMb} MB/source · limit ${limit}`);
+  const result = await runScan({
+    store,
+    jobId: id,
+    query: queryValue,
+    kind,
+    datasetVersion,
+    maxBytesPerSource: Math.round(maxMb * 1024 * 1024),
+    limit,
+    onLog: (line) => console.log(`  ${line}`),
+  });
+  console.log(
+    `\nScan ${result.status.state}: ${result.results.companies.length} company matches, ${result.results.contacts.length} contact matches ` +
+      `(${(result.status.totals.bytesScanned / 1e6).toFixed(1)} MB of ${(result.status.totals.bytesTotal / 1e9).toFixed(2)} GB scanned)`,
+  );
+  if (!result.status.complete) process.exitCode = 2;
+}
+
 async function main(): Promise<void> {
   const command = process.argv[2];
   if (!command || command === "--help" || command === "help") {
@@ -647,6 +686,7 @@ async function main(): Promise<void> {
         "  verify    --version <id> --config <cfg>",
         "  pass2     --version <id> --config <cfg> [--partitions <n>] [--work-dir <dir>] [--allow-bounded]",
         "  assemble  --version <id> [--work-dir <dir>] [--partitions <n>]",
+        "  scan      --version scan-<id> --query <text> [--kind companies|contacts|both] [--max-mb 48] [--limit 50] [--dataset-version <id>]",
         "",
         "Sources must be r2://<bucket>/<key>; the bucket comes from the credentials.",
       ].join("\n"),
@@ -661,6 +701,7 @@ async function main(): Promise<void> {
   if (command === "jobs") return listJobs(store);
   if (command === "verify") return verify(store);
   if (command === "assemble") return assemble(store);
+  if (command === "scan") return scan(store);
   if (command === "pass2") return pass2(store);
   if (command === "interrupt") return interrupt(store);
   if (command === "pause" || command === "resume" || command === "abort" || command === "approve") return control(store, command);

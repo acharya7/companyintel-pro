@@ -1,0 +1,81 @@
+{
+  "$comment": [
+    "CompanyIntel \u2014 REAL DATA early-access build configuration.",
+    "",
+    "Same sources, same mapping and same code as indexer.config.json; the only",
+    "differences are the scratch/output directories and a smaller partition/shard",
+    "layout so a bounded build publishes a manageable number of objects over a slow",
+    "link. A run is always bounded with `--sample <n>` (records per source); nothing",
+    "here authorises a full-corpus run.",
+    "",
+    "Build (bounded, real R2, both original files):",
+    "  bun tools/indexer/src/cli.ts run \\",
+    "    --config tools/indexer/indexer.early-access.json \\",
+    "    --sample 120000 --version stg-real-2026-10-21 \\",
+    "    --work-dir .realdata-work --disk-floor 128",
+    "",
+    "Publish (resumable, bounded per call):",
+    "  bun scripts/dev-index-r2.mjs upload --dir .realdata-output --limit 120",
+    "  bun scripts/dev-index-r2.mjs verify --dir .realdata-output --limit 200",
+    "",
+    "Activation is a separate, validated step (scripts/activate-early-access.mjs);",
+    "this file never writes a pointer."
+  ],
+  "datasetVersion": "stg-real-2026-10-21",
+  "sources": [
+    {
+      "id": "csv1",
+      "path": "r2://company-intel-data/raw/file1.csv",
+      "encoding": "utf-8",
+      "delimiter": "\t",
+      "columns": {
+        "companyid": "organization_id",
+        "companyname": "organization_name",
+        "companydomain": "organization_domain",
+        "companywebsite": "organization_website_url",
+        "industry": "organization_industries",
+        "companysize": "organization_num_current_employees",
+        "companyrevenue": "organization_revenue_in_thousands_int",
+        "companycity": "organization_hq_location_city",
+        "companystate": "organization_hq_location_state",
+        "companycountry": "organization_hq_location_country"
+      }
+    },
+    {
+      "id": "csv2",
+      "path": "r2://company-intel-data/raw/file2.csv",
+      "encoding": "utf-8",
+      "delimiter": "\t",
+      "columns": {
+        "contactname": "person_name",
+        "firstname": "person_first_name_unanalyzed",
+        "lastname": "person_last_name_unanalyzed",
+        "jobtitle": "person_title",
+        "seniority": "person_seniority",
+        "department": "person_functions",
+        "email": "person_email",
+        "phone": "person_phone",
+        "linkedin": "person_linkedin_url",
+        "contactcity": "person_location_city",
+        "contactstate": "person_location_state",
+        "contactcountry": "person_location_country",
+        "companyname": "sanitized_organization_name_unanalyzed"
+      }
+    }
+  ],
+  "workDir": ".realdata-work",
+  "outputDir": ".realdata-output",
+  "rawCacheDir": ".realdata-raw-cache",
+  "partitions": 32,
+  "shards": {
+    "exact": 32,
+    "prefix": 16,
+    "token": 16,
+    "trigram": 32,
+    "ids": 16
+  },
+  "upload": {
+    "enabled": false,
+    "bucket": "company-intel-data"
+  }
+}

@@ -5,6 +5,12 @@ Private B2B company intelligence, contact discovery and lead management.
 Search a large private company/contact database with typo tolerance, open a company to see its
 contacts, save leads and searches, and export clean prospect lists.
 
+**REAL DATA launch:** the staging deployment searches a versioned, R2-derived dataset of
+30,300 companies and 29,291 contacts (0.13% of the 64.26 GB corpus, both original files) and can
+start a bounded direct scan of the source files for records outside that indexed coverage. Every
+screen labels the provenance and measured coverage; no synthetic record appears in a real result.
+See `docs/realdata.md`.
+
 **Runtime: Cloudflare Workers. Persistent cloud storage: Cloudflare R2 (only).**
 No Convex, no SQL database, no KV/D1/Durable Objects, no Redis, no search server, no VPS.
 
@@ -26,7 +32,7 @@ No Convex, no SQL database, no KV/D1/Durable Objects, no Redis, no search server
   contact is attached to a company only on evidence (row identity, email domain, country), never
   on a name match alone; ambiguous contacts are preserved under the name they claimed instead of
   being shown as employees (`docs/association.md`)
-- Tests: `bun test` (491 tests, 0 fail) — normalization, relevance, prototype-chain safety,
+- Tests: `bun test` (709 tests, 0 fail) — normalization, relevance, prototype-chain safety,
   CSV/indexer, R2 store, end-to-end index + Worker API over a generated index, the bounded
   hydration funnel, two-stage association (identity ownership, no-claim rows, preservation,
   dedupe, order-independence, reconciliation), the association scenario corpus, the association
@@ -37,6 +43,7 @@ No Convex, no SQL database, no KV/D1/Durable Objects, no Redis, no search server
 
 | Document | Contents |
 | --- | --- |
+| `docs/realdata.md` | REAL DATA launch dataset, coverage semantics, cache/index/scan order, bounded direct R2 scan, publisher, costs, deployment state |
 | `docs/architecture.md` | components, data flow, canonical model, entity resolution, search, R2 layout, caching |
 | `docs/association.md` | company identity rules, the contact-association evidence hierarchy and categories, preservation of unresolved contacts, format v3, the isolated Pass 2 rebuild from the existing spool, the audit |
 | `docs/configuration.md` | frontend API mode, `wrangler.toml`, Worker secrets, indexer config, R2 credentials |

@@ -25,6 +25,7 @@ import { BarList, EmptyState, ErrorBlock, LoadingBlock, PageHeader, Section, Sta
 import { useActivity, useDatasetStats, useDatasetStatus, useLeads, useSavedSearches, apiMode } from "@/hooks/use-api";
 import { formatBytes, formatCompact, formatNumber, relativeTime } from "@/lib/format";
 import { readRecentCompanies } from "@/lib/recent";
+import { RealDataCoverageNotice } from "@/components/realdata";
 import { LEAD_STATUSES } from "@/shared/models";
 
 export default function Dashboard() {
@@ -83,6 +84,8 @@ export default function Dashboard() {
           </>
         }
       />
+
+      <RealDataCoverageNotice className="mb-4" />
 
       {!indexed ? (
         <div className="surface border-chart-3/40 bg-chart-3/[0.06] p-5">

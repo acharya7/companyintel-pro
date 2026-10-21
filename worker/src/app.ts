@@ -52,6 +52,7 @@ import { R2Store } from "./store";
 import { R2CandidateSource } from "./search-source";
 import { ReadMetrics, searchCacheFor } from "./search-cache";
 import { AccessError, verifyAccess } from "./access";
+import { realdataRoutes } from "./realdata";
 import type { AccessIdentity, Env } from "./env";
 
 type Variables = { identity: AccessIdentity; requestId: string; store: R2Store; metrics: ReadMetrics };
@@ -1052,6 +1053,18 @@ app.get("/api/exports/:id/download", async (c) => {
   c.header("cache-control", "private, no-store");
   return c.body(csv);
 });
+
+/* ------------------------------ real data -------------------------------- */
+
+/**
+ * REAL DATA provenance and bounded source scans.
+ *
+ * Mounted inside this app (rather than dispatched beside it) so every route gets
+ * the same Access verification, same-origin rule and rate limit as the search
+ * API — a direct scan is a privileged operation and must never be reachable by a
+ * path that forgot one of those checks.
+ */
+app.route("/", realdataRoutes);
 
 /* --------------------------- API fallback -------------------------------- */
 

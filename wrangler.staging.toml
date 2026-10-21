@@ -91,6 +91,10 @@ ACTIVE_MANIFEST_KEY = "staging/active.json"
 CLOUD_JOB_BUDGET_USD = "5"
 MAX_SEARCHES_PER_MINUTE = "120"
 SEARCH_MAX_HYDRATE = "16"
+# REAL DATA direct source scan: 48 MiB per source per job. The real-data launch
+# relies on this fallback for records outside the activated partial coverage, and
+# a bounded budget keeps each search far below a cent.
+REALDATA_SCAN_MAX_MB = "48"
 
 [observability]
 enabled = true

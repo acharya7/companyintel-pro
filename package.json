@@ -43,7 +43,13 @@
     "index:upload": "bun tools/indexer/src/cli.ts run --config tools/indexer/indexer.config.json --version v1 --upload",
     "index:sample-report": "bun scripts/sample-report.mjs",
     "index:validate": "bun tools/indexer/src/cli.ts validate --config tools/indexer/indexer.config.json --version v1",
-    "index:publish": "bun tools/indexer/src/cli.ts publish --config tools/indexer/indexer.config.json --version v1 --yes"
+    "index:publish": "bun tools/indexer/src/cli.ts publish --config tools/indexer/indexer.config.json --version v1 --yes",
+    "realdata:measure": "bun scripts/early-access.mjs measure",
+    "realdata:publish": "bun scripts/early-access.mjs publish",
+    "realdata:verify": "bun scripts/early-access.mjs verify",
+    "realdata:activate": "bun scripts/early-access.mjs activate",
+    "realdata:status": "bun scripts/early-access.mjs status",
+    "realdata:accept": "bun scripts/realdata-acceptance.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.2.2",

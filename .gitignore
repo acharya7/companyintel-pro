@@ -25,3 +25,12 @@ src/convex/_generated
 
 # Wrangler dev state written while the read-only probe runs locally.
 .wrangler/
+
+# REAL DATA early-access build/publish scratch (derived from real rows).
+.realdata-work/
+.realdata-output/
+.realdata-raw-cache/
+
+# Acceptance evidence embeds real names/emails from the source and must never be
+# committed. Regenerate it locally with `bun run realdata:accept`.
+index-reports/realdata-acceptance-*.json

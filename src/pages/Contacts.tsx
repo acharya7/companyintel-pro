@@ -32,6 +32,7 @@ import {
 } from "@/hooks/use-api";
 import { formatNumber } from "@/lib/format";
 import { readRecentCompanies } from "@/lib/recent";
+import { RealDataCoverageNotice } from "@/components/realdata";
 import type { ContactFilters, ContactSortField, SortOrder } from "@/shared/models";
 
 interface PickedCompany {
@@ -140,6 +141,8 @@ export default function Contacts() {
           </>
         }
       />
+
+      <RealDataCoverageNotice className="mb-4" compact />
 
       <Section
         title="Companies in scope"

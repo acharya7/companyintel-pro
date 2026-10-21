@@ -95,6 +95,11 @@ CLOUD_JOB_BUDGET_USD = "30"
 # bytes and CPU of every query. The engine clamps it to 1..64.
 SEARCH_MAX_HYDRATE = "16"
 
+# Direct R2 source search (REAL DATA level 3): the byte budget PER SOURCE for one
+# scan. A request can lower it, never raise it. 48 MiB is a few seconds of ranged
+# reads and a fraction of a cent; increase deliberately, never automatically.
+REALDATA_SCAN_MAX_MB = "48"
+
 # ---------------------------------------------------------------------------
 # Observability: keep logs; no payload logging of private contact data.
 # ---------------------------------------------------------------------------
@@ -118,3 +123,4 @@ APP_VERSION = "0.1.0-dev"
 DEV_ALLOW_UNAUTHENTICATED = "false"
 MAX_SEARCHES_PER_MINUTE = "600"
 SEARCH_MAX_HYDRATE = "16"
+REALDATA_SCAN_MAX_MB = "48"
