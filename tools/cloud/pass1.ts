@@ -188,6 +188,14 @@ async function runPass1Internal(options: RunPass1Options): Promise<Pass1Result> 
   };
   state.mode = mode;
   state.partitions = options.partitions;
+  state.config = {
+    stage: "pass1",
+    mode,
+    partitions: options.partitions,
+    ...(options.maxSourceBytes === undefined ? {} : { maxSourceMb: Math.round(options.maxSourceBytes / (1024 * 1024)) }),
+    chunkMb: Math.round((chunkBytes / (1024 * 1024)) * 100) / 100,
+    requestedAt: new Date(now()).toISOString(),
+  };
   state.stage = "pass1";
   // A new attempt supersedes the previous attempt's interruption record. The
   // message itself stays in `errors` (history), but a live job must not keep
@@ -471,13 +479,26 @@ async function runPass1Internal(options: RunPass1Options): Promise<Pass1Result> 
   }
 
   const complete = checkpoints.length === options.sources.length && checkpoints.every((entry) => entry.complete);
-  const bounded = !complete && options.maxSourceBytes !== undefined;
-  state.stage = complete ? "pass1-complete" : "pass1";
+  /*
+   * A bounded benchmark is "complete" when every source reached its limit, even
+   * though the checkpoints are deliberately `complete: false` (they describe a
+   * prefix, not the whole object). Without this the job stayed on `stage: pass1`
+   * with a note, which the dashboard — correctly — could only read as unfinished.
+   */
+  const boundedReached =
+    !complete &&
+    options.maxSourceBytes !== undefined &&
+    checkpoints.length === options.sources.length &&
+    checkpoints.every((entry) => entry.nextOffset >= Math.min(entry.sourceSize, options.maxSourceBytes!));
+  state.stage = complete || boundedReached ? "pass1-complete" : "pass1";
+  state.coverage = complete ? "full" : boundedReached ? "bounded" : state.coverage;
   state.note = complete
     ? "Pass 1 complete: every source read to EOF and every segment verified."
-    : bounded
-      ? `Bounded benchmark reached its per-source limit (${(options.maxSourceBytes! / 1024 / 1024).toFixed(0)} MB); the prefix is durable and Pass 2 can merge it.`
-      : "Partially processed. Re-running the same version resumes at the recorded offsets.";
+    : boundedReached
+      ? `Bounded benchmark complete: ${(options.maxSourceBytes! / 1024 / 1024).toFixed(0)} MB per source, every segment verified. Pass 2 merges that prefix; activation stays disabled for a benchmark.`
+      : options.maxSourceBytes !== undefined
+        ? `Bounded benchmark stopped before its ${(options.maxSourceBytes / 1024 / 1024).toFixed(0)} MB limit; re-running the same version resumes at the recorded offsets.`
+        : "Partially processed. Re-running the same version resumes at the recorded offsets.";
   state.interruption = undefined;
   if (complete) state.finishedAt = new Date(now()).toISOString();
   updateTotals(state, options.sources, now(), startedMs);

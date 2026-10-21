@@ -92,6 +92,26 @@ export interface CloudInterruption {
 }
 
 /**
+ * The durable execution configuration of a job.
+ *
+ * Written when Pass 1 starts so a resume can rebuild the exact command even if the
+ * Durable Object's own job record is gone (a redeploy, a job started before the
+ * keep-alive existed, or a start through the CLI). A bounded benchmark must never
+ * be resumed as a full-corpus run, so the bound is part of the state, not of the
+ * caller's request.
+ */
+export interface CloudJobConfig {
+  stage: "pass1" | "pass2";
+  mode: "full" | "benchmark" | "custom";
+  partitions: number;
+  /** Benchmark only: source bytes per source, in MiB. */
+  maxSourceMb?: number;
+  /** Source bytes per chunk, in MiB. A resume must reuse it (it is part of the checkpoint identity). */
+  chunkMb?: number;
+  requestedAt: string;
+}
+
+/**
  * The last run attempt, written to `cloud/jobs/<version>/run.json`.
  *
  * A heartbeat is the only evidence that a detached process is still alive: the
@@ -145,6 +165,10 @@ export interface CloudJobState {
   accounting: CloudAccounting;
   /** Last durable checkpoint that a restart would use. */
   checkpoint: { at: string; sources: { id: string; nextOffset: number; nextLine: number }[] } | null;
+  /** How Pass 1 was run; a resume rebuilds the command from this. */
+  config?: CloudJobConfig;
+  /** `bounded` when Pass 1 covered only a benchmark prefix, `full` when it read to EOF. */
+  coverage?: "full" | "bounded";
   /** Cloud Pass 2 progress, written after every merged partition. */
   pass2?: {
     partitionsDone: number;
