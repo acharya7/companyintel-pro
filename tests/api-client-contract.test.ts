@@ -31,7 +31,7 @@ import {
 } from "../src/lib/api/types";
 import { LocalApiClient } from "../src/lib/api/local";
 import { ApiRequestError, WorkerApiClient } from "../src/lib/api/worker";
-import { apiMode, withPersistentCache } from "../src/lib/api/client";
+import { apiMode, resolveApiMode, withPersistentCache } from "../src/lib/api/client";
 
 type AnyClient = Record<string, unknown>;
 
@@ -84,6 +84,15 @@ describe("the caching wrapper delegates instead of replacing", () => {
     // synthetic adapter is what labelled a live deployment as demo data and showed
     // the 9-contact synthetic Microsoft instead of the 30-contact real record.
     expect(apiMode).toBe("worker");
+  });
+
+  test("a production build refuses the sample adapter even if the environment asks for it", () => {
+    // A `.env.local` left over from a preview must not ship a live deployment that
+    // mixes synthetic rows into real R2 coverage. DEV can still opt in explicitly.
+    expect(resolveApiMode("local", true)).toBe("worker");
+    expect(resolveApiMode("local", false)).toBe("local");
+    expect(resolveApiMode(undefined, false)).toBe("worker");
+    expect(resolveApiMode("worker", false)).toBe("worker");
   });
 
   test("datasetStatus reaches the underlying client and keeps its contract", async () => {

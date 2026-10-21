@@ -17,9 +17,10 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { CardShell, ErrorBlock, InfoRow, LoadingBlock, LongText, PageHeader, Section } from "@/components/common";
 import { ContactNumbers } from "@/components/contact-numbers";
+import { RealDataCoverageNotice } from "@/components/realdata";
 import { useContact, useDatasetStatus } from "@/hooks/use-api";
 import { ASSOCIATION_CATEGORY_LABELS, type AssociationCategory, type AssociationRecord } from "@/shared/association";
-import { contactPhoneNumbers } from "@/shared/phone";
+import { contactPhoneNumbers, phoneKindOfHeader } from "@/shared/phone";
 import type { Contact } from "@/shared/models";
 import { formatNumber } from "@/lib/format";
 
@@ -194,7 +195,10 @@ export default function ContactDetails() {
    * verbatim and shown verbatim — this is the “51 company / 39 contact fields” part
    * of the record, and it must never be a truncated sample.
    */
-  const captured = Object.entries(contact.attributes ?? {});
+  // Phone-like source columns are rendered once, in the Phone numbers block above;
+  // repeating `person_phone` and its sanitized twin here would show the same number
+  // twice. The values are not dropped — that block reads these same attributes.
+  const captured = Object.entries(contact.attributes ?? {}).filter(([key]) => !phoneKindOfHeader(key));
 
   return (
     <>
@@ -222,6 +226,8 @@ export default function ContactDetails() {
         }
       />
 
+      <RealDataCoverageNotice className="mb-4" compact />
+
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
         <div className="space-y-6">
           <CardShell>
@@ -237,10 +243,10 @@ export default function ContactDetails() {
               </dl>
               <div className="mt-3 flex flex-wrap items-center gap-2">
                 {contact.email ? (
-                  <Button variant="outline" size="sm" className="gap-2" asChild>
-                    <a href={`mailto:${contact.email}`}>
-                      <Mail className="size-3.5" />
-                      {contact.email}
+                  <Button variant="outline" size="sm" className="max-w-full gap-2" asChild>
+                    <a href={`mailto:${contact.email}`} className="min-w-0" title={contact.email}>
+                      <Mail className="size-3.5 shrink-0" />
+                      <span className="truncate">{contact.email}</span>
                     </a>
                   </Button>
                 ) : null}
@@ -261,7 +267,7 @@ export default function ContactDetails() {
           <CardShell>
             <Section
               title="All source fields"
-              description={`Every column the source row carried — ${captured.length} captured source fields plus ${extra.length} derived ones, none truncated`}
+              description={`Every column the source row carried — ${captured.length} captured source fields plus ${extra.length} derived ones, none truncated. Phone-like columns are shown in the number block above.`}
             >
               {captured.length ? (
                 <dl className="mb-4 grid gap-x-8 border-b border-border/60 pb-2 sm:grid-cols-2">

@@ -110,7 +110,7 @@ export default function DatasetManagement() {
         }
       />
 
-      <DatasetModeBanner mode={mode.mode} detail={mode.description} />
+      <DatasetModeBanner mode={mode.mode} label={mode.label} detail={mode.description} />
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
@@ -146,8 +146,14 @@ export default function DatasetManagement() {
         />
         <StatCard
           label="Data origin"
-          value={data.dataOrigin === "sample" ? "Sample" : "R2 index"}
-          hint={data.dataOrigin === "sample" ? "Preview only — not your dataset" : "Serving the published index"}
+          value={data.dataOrigin === "sample" ? "Sample" : "REAL DATA"}
+          hint={
+            data.dataOrigin === "sample"
+              ? "Preview only — not your dataset"
+              : mode.mode === "real"
+                ? `${mode.partial ? "PARTIAL COVERAGE" : "COMPLETE COVERAGE"} · ${mode.version ?? data.activeVersion ?? "unknown"}`
+                : "Serving the published index"
+          }
           icon={<Database className="size-4" />}
           tone={data.dataOrigin === "sample" ? "accent" : "default"}
         />

@@ -169,10 +169,13 @@ export function DatasetModeBanner({
   mode,
   detail,
   action,
+  label,
 }: {
   mode: DatasetMode;
   detail?: ReactNode;
   action?: ReactNode;
+  /** Override the title with the coverage-aware label the API reports. */
+  label?: string;
 }) {
   const copy: Record<DatasetMode, { title: string; body: string; tone: string; icon: ReactNode }> = {
     demo: {
@@ -203,7 +206,7 @@ export function DatasetModeBanner({
     >
       {item.icon}
       <div className="text-xs leading-5">
-        <p className="font-medium text-foreground">{item.title}</p>
+        <p className="font-medium text-foreground">{label ?? item.title}</p>
         <p className="text-muted-foreground">{detail ?? item.body}</p>
       </div>
       {action ? <div className="ml-auto shrink-0 self-center">{action}</div> : null}

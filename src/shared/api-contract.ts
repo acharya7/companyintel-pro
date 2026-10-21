@@ -485,17 +485,19 @@ export const companySearchResponseSchema = z.object({
 
 const facetBucketSchema = z.object({ value: z.string(), count: z.number().int() });
 
+export const companyFacetsSchema = z.object({
+  designations: z.array(facetBucketSchema),
+  departments: z.array(facetBucketSchema),
+  seniority: z.array(facetBucketSchema),
+  countries: z.array(facetBucketSchema),
+  cities: z.array(facetBucketSchema),
+  emailAvailable: z.number().int(),
+  linkedinAvailable: z.number().int(),
+});
+
 export const companyDetailResponseSchema = z.object({
   company: companySchema,
-  facets: z.object({
-    designations: z.array(facetBucketSchema),
-    departments: z.array(facetBucketSchema),
-    seniority: z.array(facetBucketSchema),
-    countries: z.array(facetBucketSchema),
-    cities: z.array(facetBucketSchema),
-    emailAvailable: z.number().int(),
-    linkedinAvailable: z.number().int(),
-  }),
+  facets: companyFacetsSchema,
   datasetVersion: z.string(),
 });
 
@@ -505,6 +507,8 @@ export const contactPageResponseSchema = z.object({
   page: pageInfoSchema,
   datasetVersion: z.string(),
   associations: associationCountsSchema.nullable().optional(),
+  /** Facets over the complete (unfiltered) company contact collection. */
+  facets: companyFacetsSchema.optional(),
 });
 
 export const unassignedContactsResponseSchema = z.object({
@@ -551,6 +555,7 @@ export const savedLeadSchema = z.discriminatedUnion("kind", [
     email: z.string().optional(),
     phone: z.string().optional(),
     mobile: z.string().optional(),
+    additionalPhones: z.array(z.string()).optional(),
     linkedinUrl: z.string().optional(),
     status: leadStatusSchema,
     tags: z.array(z.string()),

@@ -329,14 +329,16 @@ export default function Contacts() {
                           </TableCell>
                           <TableCell>
                             {contact.email ? (
-                              <button
-                                type="button"
-                                className="inline-flex items-center gap-1.5 text-primary hover:underline"
-                                onClick={() => void navigator.clipboard?.writeText(contact.email!)}
-                              >
-                                <Mail className="size-3.5" />
-                                <span className="max-w-[180px] truncate">{contact.email}</span>
-                              </button>
+                              <span className="inline-flex min-w-0 items-center gap-1.5">
+                                <Mail className="size-3.5 shrink-0 text-muted-foreground" />
+                                <a
+                                  href={`mailto:${contact.email}`}
+                                  title={contact.email}
+                                  className="max-w-[180px] truncate text-primary hover:underline"
+                                >
+                                  {contact.email}
+                                </a>
+                              </span>
                             ) : (
                               <span className="text-muted-foreground">—</span>
                             )}

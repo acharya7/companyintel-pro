@@ -37,6 +37,7 @@ import { DEFAULT_SETTINGS } from "@/shared/models";
 import { LEAD_STATUSES } from "@/shared/models";
 import { leadId } from "@/shared/hash";
 import { normalizeEmail, normalizeQuery } from "@/shared/normalize";
+import { contactFacets } from "@/shared/facets";
 import { extractPhoneNumbers } from "@/shared/phone";
 import { searchCompanies } from "@/shared/search/engine";
 import { LocalCandidateSource } from "@/shared/search/local-index";
@@ -392,6 +393,9 @@ export class LocalApiClient implements ApiClient {
     const sort: ContactSortField = params.sort ?? "name";
     const order: SortOrder = params.order ?? "asc";
 
+    // Facets describe the whole collection, so a filtered view still offers every
+    // designation/department/location this company has.
+    const facets = contactFacets(pool);
     const filtered = pool.filter((contact) => contactMatchesFilters(contact, params.filters));
     const sorted = [...filtered].sort((a, b) => {
       const pick = (c: Contact) =>
@@ -413,6 +417,7 @@ export class LocalApiClient implements ApiClient {
         hasMore: start + pageSize < sorted.length,
       },
       datasetVersion: SAMPLE_DATASET_VERSION,
+      facets,
     };
   }
 
@@ -472,6 +477,7 @@ export class LocalApiClient implements ApiClient {
       assertFound(this.contactById.get(input.targetId), "contact", input.targetId);
       const contact = this.contactById.get(input.targetId)!;
       const company = this.companyById.get(contact.companyId);
+      const numbers = extractPhoneNumbers(contact);
       lead = {
         ...base,
         kind: "contact",
@@ -481,8 +487,9 @@ export class LocalApiClient implements ApiClient {
         fullName: contact.fullName,
         title: contact.title,
         email: contact.email ? normalizeEmail(contact.email) ?? undefined : undefined,
-        phone: extractPhoneNumbers(contact).phone ?? undefined,
-        mobile: extractPhoneNumbers(contact).mobile ?? undefined,
+        phone: numbers.phone ?? undefined,
+        mobile: numbers.mobile ?? undefined,
+        additionalPhones: numbers.additional.length ? numbers.additional : undefined,
         linkedinUrl: contact.linkedinUrl,
       };
     }
@@ -693,6 +700,9 @@ export class LocalApiClient implements ApiClient {
           companyName: lead.kind === "company" ? lead.name : lead.companyName,
           title: lead.kind === "contact" ? lead.title : "",
           email: lead.kind === "contact" ? lead.email : "",
+          phone: lead.kind === "contact" ? lead.phone : "",
+          mobile: lead.kind === "contact" ? lead.mobile : "",
+          additionalPhones: lead.kind === "contact" ? lead.additionalPhones : "",
           linkedinUrl: lead.kind === "contact" ? lead.linkedinUrl : "",
           status: lead.status,
           tags: lead.tags.join("; "),

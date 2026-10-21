@@ -56,7 +56,10 @@ under. A company also carries `associations {highConfidence, plausible, conflict
 
 `facets` on each company (designation/department/seniority/country/city buckets plus
 `emailAvailable` / `linkedinAvailable`) are precomputed at index time so the Company Details
-filter dropdowns never require a scan.
+filter dropdowns never require a scan. The contact-page response also carries facets computed
+from the company's complete collection, with `title` as the designation fallback: the active
+index maps `person_title` to `title`, so its stored designation buckets are empty. Filters still
+run over every contact, and their counts describe the collection rather than the visible page.
 
 ### Entity resolution (conservative by design)
 

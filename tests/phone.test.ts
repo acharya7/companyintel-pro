@@ -84,6 +84,29 @@ describe("phone columns and values", () => {
     expect(numbers.phone).toBe("(503) 443-7070");
     expect(numbers.mobile).toBe("503.555.0199");
   });
+
+  test("a display value and its sanitized +1 form are one number, not two", () => {
+    // The real active-index record for Katie Gerber carries both columns.
+    const numbers = contactPhoneNumbers({
+      phone: "(707) 603-3027",
+      attributes: { person_sanitized_phone: "+17076033027" },
+    });
+    expect(numbers.all).toEqual(["(707) 603-3027"]);
+    expect(numbers.additional).toEqual([]);
+    expect(numbers.mobile).toBeNull();
+
+    const slaminko = contactPhoneNumbers({
+      phone: "(212) 957-2509",
+      attributes: { person_sanitized_phone: "+12129572509" },
+    });
+    expect(slaminko.all).toEqual(["(212) 957-2509"]);
+  });
+
+  test("a non-NANP country code is never stripped from the displayed number", () => {
+    const numbers = contactPhoneNumbers({ phone: "+52 55 5387 5429" });
+    expect(numbers.phone).toBe("+52 55 5387 5429");
+    expect(telHref(numbers.phone)).toBe("tel:+525553875429");
+  });
 });
 
 describe("contact filtering", () => {
@@ -116,5 +139,12 @@ describe("contact filtering", () => {
   test("filters combine with AND", () => {
     expect(contactMatchesFilters(contact, { hasPhone: true, hasEmail: true, country: "United States" })).toBe(true);
     expect(contactMatchesFilters({ ...contact, country: "Canada" }, { hasPhone: true, country: "United States" })).toBe(false);
+  });
+
+  test("a designation filter falls back to the job title the source actually carried", () => {
+    const titleOnly: Contact = { ...contact, designation: undefined, title: "Head of Sales" };
+    expect(contactMatchesFilters(titleOnly, { designation: "Head of Sales" })).toBe(true);
+    expect(contactMatchesFilters(titleOnly, { designation: "head of sales" })).toBe(true);
+    expect(contactMatchesFilters(titleOnly, { designation: "Head of Marketing" })).toBe(false);
   });
 });

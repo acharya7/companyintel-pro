@@ -303,6 +303,68 @@ describe("pages render without a missing API method", () => {
     expect(html).toContain("lg:grid-cols-[minmax(0,13fr)_minmax(0,7fr)]");
   });
 
+  test("company totals come from the collection, not the visible page, and filters are populated", async () => {
+    const id = "c_5186f026d7931e60";
+    const company = {
+      id,
+      name: "Microsoft",
+      normalizedName: "microsoft",
+      contactCount: 30,
+      sources: [{ source: "csv1", row: 4319 }],
+      associations: { highConfidence: 27, plausible: 3, conflicting: 0, total: 30 },
+      attributes: { organization_short_description: "Microsoft builds platforms and tools." },
+    };
+    const rows = Array.from({ length: 9 }, (_, index) => ({
+      id: `p_${index.toString().padStart(16, "0")}`,
+      companyId: id,
+      fullName: `Person ${index + 1}`,
+      title: index === 0 ? "Software Engineer" : "Account Executive",
+      ...(index === 0 ? { phone: "(707) 603-3027" } : {}),
+      source: { source: "csv2", row: index + 1 },
+    }));
+    const client = await makeClient({ datasetStatus: realDataset, company: { company } });
+    client.setQueryData(queryKeys.companyContacts(id, { page: 1, pageSize: 25, sort: "name", order: "asc", filters: {} }), {
+      companyId: id,
+      contacts: rows,
+      page: { page: 1, pageSize: 25, total: 30, totalIsLowerBound: false, hasMore: true },
+      datasetVersion: "v1",
+      facets: {
+        designations: [
+          { value: "Software Engineer", count: 12 },
+          { value: "Account Executive", count: 18 },
+        ],
+        departments: [],
+        seniority: [],
+        countries: [],
+        cities: [],
+        emailAvailable: 27,
+        linkedinAvailable: 30,
+      },
+    });
+    const html = renderToString(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={[`/companies/${id}`]}>
+          <Routes>
+            <Route path="/companies/:companyId" element={<CompanyDetails />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    // The card and the list description report the collection total (30), never
+    // the 9 rows on this page — the exact regression that showed "9 contacts"
+    // for a company with 30 attached records.
+    expect(html).toMatch(/Total contacts[\s\S]{0,600}?30/);
+    expect(html).toContain("30 contacts");
+    // Facets computed from the collection give the designation filter real options
+    // even though the stored company facets were empty.
+    expect(html).toContain('value="Software Engineer"');
+    expect(html).toContain('value="Account Executive"');
+    expect(html).toMatch(/Software Engineer[\s\S]{0,80}12/);
+    // Phone numbers are visible on the row itself, not hidden behind Export.
+    expect(html).toContain('href="tel:7076033027"');
+    expect(html).toContain("(707) 603-3027");
+  });
+
   test("phone and mobile render as labelled tel: links, with extensions preserved", () => {
     const html = renderToString(
       <ContactNumbers contact={{ phone: "+1 (503) 443-7070 ext. 42", mobile: "+1 (503) 555 0199" }} />,

@@ -27,6 +27,7 @@ import {
 } from "../../src/shared/api-contract";
 import { type AssociationCategory } from "../../src/shared/association";
 import { contactMatchesFilters } from "../../src/shared/contact-filter";
+import { contactFacets } from "../../src/shared/facets";
 import { extractPhoneNumbers } from "../../src/shared/phone";
 import { loadContactById, searchContacts } from "./contact-search";
 import { normalizeQuery } from "../../src/shared/normalize";
@@ -560,13 +561,18 @@ app.get("/api/companies/:id/contacts", async (c) => {
 
   const ref = await dataset.source.refForCompanyId(c.req.param("id"));
   if (ref === null) throw new HttpError(404, "not_found", `Company ${c.req.param("id")} is not in dataset ${dataset.version}.`);
-  const contacts = sortContacts(filterContacts(await dataset.store.getContactsByCompanyRef(dataset.version, ref), filters), sort, order);
+  const all = await dataset.store.getContactsByCompanyRef(dataset.version, ref);
+  // Facets come from the complete collection, never the filtered page: the
+  // filter options (and their counts) must describe everyone this company has.
+  const facets = contactFacets(all);
+  const contacts = sortContacts(filterContacts(all, filters), sort, order);
   const { slice, page: pageInfo } = paginate(contacts, page, pageSize);
   return c.json({
     companyId: c.req.param("id"),
     contacts: slice.map(withContactNumbers),
     page: pageInfo,
     datasetVersion: dataset.version,
+    facets,
   });
 });
 
@@ -698,10 +704,11 @@ app.get("/api/contacts", async (c) => {
     if (ref === null) continue;
     collected.push(...(await dataset.store.getContactsByCompanyRef(dataset.version, ref)));
   }
+  const facets = contactFacets(collected);
   const filtered = filterContacts(collected, filters);
   const sorted = sortContacts(filtered, query.sort ?? "name", query.order === "desc" ? "desc" : "asc");
   const { slice, page } = paginate(sorted, Math.max(1, Number(query.page ?? 1)), Math.min(100, Math.max(1, Number(query.pageSize ?? 25))));
-  return c.json({ companyId: null, contacts: slice.map(withContactNumbers), page, datasetVersion: dataset.version });
+  return c.json({ companyId: null, contacts: slice.map(withContactNumbers), page, datasetVersion: dataset.version, facets });
 });
 
 app.get("/api/contacts/:id", async (c) => {
@@ -776,6 +783,7 @@ app.post("/api/leads", async (c) => {
     const contact = contacts.find((item) => item.id === body.targetId);
     if (!contact) throw new HttpError(404, "not_found", "Contact record could not be read.");
     const company = await store.getCompanyByRef(dataset.version, ref);
+    const numbers = extractPhoneNumbers(contact);
     lead = {
       id,
       kind: "contact",
@@ -785,8 +793,9 @@ app.post("/api/leads", async (c) => {
       fullName: contact.fullName,
       title: contact.title,
       email: contact.email,
-      phone: extractPhoneNumbers(contact).phone ?? undefined,
-      mobile: extractPhoneNumbers(contact).mobile ?? undefined,
+      phone: numbers.phone ?? undefined,
+      mobile: numbers.mobile ?? undefined,
+      additionalPhones: numbers.additional.length ? numbers.additional : undefined,
       linkedinUrl: contact.linkedinUrl,
       status: body.status,
       tags: body.tags,
@@ -1008,6 +1017,9 @@ app.post("/api/exports", async (c) => {
         companyName: lead.kind === "company" ? lead.name : lead.companyName,
         title: lead.kind === "contact" ? lead.title : "",
         email: lead.kind === "contact" ? lead.email : "",
+        phone: lead.kind === "contact" ? lead.phone : "",
+        mobile: lead.kind === "contact" ? lead.mobile : "",
+        additionalPhones: lead.kind === "contact" ? lead.additionalPhones : "",
         linkedinUrl: lead.kind === "contact" ? lead.linkedinUrl : "",
         status: lead.status,
         tags: lead.tags.join("; "),

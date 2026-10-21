@@ -31,13 +31,25 @@ import { API_CLIENT_METHODS, apiClientMethodNames, type ApiClient, type CompanyS
 interface ViteEnv {
   VITE_API_MODE?: string;
   VITE_API_BASE_URL?: string;
+  PROD?: boolean;
 }
 
 const env = (import.meta as unknown as { env?: ViteEnv }).env ?? {};
 const configuredMode = env.VITE_API_MODE?.trim();
 const configuredBaseUrl = env.VITE_API_BASE_URL?.trim();
 
-export const apiMode: "local" | "worker" = configuredMode === "local" ? "local" : "worker";
+/**
+ * Worker in every production build, even when a stray `.env.local` asks for the
+ * sample adapter. A deploy must never show synthetic records beside real R2
+ * coverage: that is what produced the 9-contact sample Microsoft on a live
+ * deployment whose Company Search said REAL DATA. Local mode remains available
+ * for `vite dev` and tests, where `PROD` is false.
+ */
+export function resolveApiMode(mode: string | undefined, production: boolean): "local" | "worker" {
+  return mode?.trim() === "local" && !production ? "local" : "worker";
+}
+
+export const apiMode: "local" | "worker" = resolveApiMode(configuredMode, Boolean(env.PROD));
 
 export const apiBaseUrl = configuredBaseUrl ?? "";
 

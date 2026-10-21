@@ -363,6 +363,14 @@ export interface ContactPageResponse {
    * page say "of 412 contacts, 380 have verified evidence" next to the list.
    */
   associations?: AssociationCounts | null;
+  /**
+   * Facets over the company's complete contact collection (before filters).
+   *
+   * Computed from the same rows the page already reads, so a version whose stored
+   * facets have no designations still offers usable filter options — and a count
+   * can never be based on just the visible page.
+   */
+  facets?: CompanyFacets;
 }
 
 /**
@@ -614,6 +622,8 @@ export interface SavedContactLead {
   email?: string;
   phone?: string;
   mobile?: string;
+  /** Further distinct numbers from the source row, kept with the lead snapshot. */
+  additionalPhones?: string[];
   linkedinUrl?: string;
   status: LeadStatus;
   tags: string[];

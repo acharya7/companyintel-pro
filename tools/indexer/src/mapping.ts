@@ -707,7 +707,9 @@ export function contactFingerprint(contact: Contact): string | null {
 
 /** Accumulate facets for one company as contacts are added. */
 export function accumulateFacets(facets: CompanyFacets, contact: Contact): void {
-  pushBucket(facets.designations, contact.designation);
+  // Real exports often carry the role only in `person_title`; a designation
+  // filter must still have options for those records.
+  pushBucket(facets.designations, contact.designation || contact.title);
   pushBucket(facets.departments, contact.department);
   pushBucket(facets.seniority, contact.seniority);
   pushBucket(facets.countries, contact.country);

@@ -14,6 +14,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { EmptyState, PageHeader, Section } from "@/components/common";
+import { RealDataCoverageNotice } from "@/components/realdata";
 import { COMPANY_EXPORT_FIELDS, CONTACT_EXPORT_FIELDS } from "@/lib/api/types";
 import { downloadExportFile, useCreateExport, useExports, useLeads, useSavedSearches } from "@/hooks/use-api";
 import { formatBytes, formatNumber, relativeTime } from "@/lib/format";
@@ -29,14 +30,39 @@ export default function Exports() {
   const createExport = useCreateExport();
 
   const [kind, setKind] = useState<ExportRequestBody["kind"]>("leads");
-  const [columns, setColumns] = useState<string[]>(["kind", "name", "companyName", "title", "email", "status", "tags", "savedAt"]);
+  const [columns, setColumns] = useState<string[]>([
+    "kind",
+    "name",
+    "companyName",
+    "title",
+    "email",
+    "phone",
+    "mobile",
+    "status",
+    "tags",
+    "savedAt",
+  ]);
 
   const availableColumns =
     kind === "contacts"
       ? CONTACT_COLUMNS
       : kind === "companies"
         ? COMPANY_COLUMNS
-        : ["kind", "name", "companyName", "title", "email", "linkedinUrl", "status", "tags", "notes", "savedAt"];
+        : [
+            "kind",
+            "name",
+            "companyName",
+            "title",
+            "email",
+            "phone",
+            "mobile",
+            "additionalPhones",
+            "linkedinUrl",
+            "status",
+            "tags",
+            "notes",
+            "savedAt",
+          ];
 
   function toggleColumn(column: string) {
     setColumns((current) => (current.includes(column) ? current.filter((value) => value !== column) : [...current, column]));
@@ -65,6 +91,8 @@ export default function Exports() {
           </Button>
         }
       />
+
+      <RealDataCoverageNotice className="mb-4" compact />
 
       <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_360px]">
         <Section title="Export history" description="Newest first; stored under app-data/exports/ in the R2 bucket">

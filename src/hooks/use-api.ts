@@ -7,6 +7,7 @@
  * (layer 2) already happened inside the API client before the query ran.
  */
 
+import { useEffect, useRef } from "react";
 import { useMutation, useQuery, useQueryClient, keepPreviousData } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { createApiClient, apiMode, apiBaseUrl, configurePersistentCache, persistentCache, invalidateCacheForVersion } from "@/lib/api/client";
@@ -77,6 +78,30 @@ export function useDatasetMode() {
     error: status.error,
     refetch: status.refetch,
   };
+}
+
+/**
+ * Drop everything scoped to the previous dataset when the active version changes.
+ *
+ * Query keys are deliberately small (company id, search params), so a version
+ * switch in another tab or through the Dataset page could otherwise leave one
+ * screen on version A's company record while another reads version B's contact
+ * rows. The persistent cache is already version-keyed; this closes the in-memory
+ * half and is what keeps a 9-contact cached record from sitting beside a
+ * 30-contact list.
+ */
+export function useDatasetVersionSync(): void {
+  const { version } = useDatasetMode();
+  const queryClient = useQueryClient();
+  const seen = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!version) return;
+    const previous = seen.current;
+    seen.current = version;
+    if (!previous || previous === version) return;
+    void invalidateCacheForVersion(version).then(() => queryClient.invalidateQueries());
+  }, [version, queryClient]);
 }
 
 /**

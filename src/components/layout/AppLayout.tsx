@@ -31,7 +31,7 @@ import { Sheet, SheetContent, SheetTitle, SheetTrigger } from "@/components/ui/s
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { DatasetModeBanner, ErrorBlock, StatusPill } from "@/components/common";
-import { useDatasetMode, useLeads, useSavedSearches } from "@/hooks/use-api";
+import { useDatasetMode, useDatasetVersionSync, useLeads, useSavedSearches } from "@/hooks/use-api";
 import { useHydrated } from "@/hooks/use-hydrated";
 import { apiMode, relativeTime } from "@/lib/format-bridge";
 
@@ -209,7 +209,10 @@ function GlobalSearchField() {
 }
 
 export function AppLayout() {
-  const { mode, label, status: dataset, error: datasetError, refetch: refetchDataset } = useDatasetMode();
+  const { mode, label, status: dataset, error: datasetError, isLoading: datasetLoading, refetch: refetchDataset } = useDatasetMode();
+  // One place drops records from a previous dataset version, so every screen
+  // keeps reading the same active version.
+  useDatasetVersionSync();
   const [mobileOpen, setMobileOpen] = useState(false);
 
   return (
@@ -227,7 +230,9 @@ export function AppLayout() {
             <p className="mt-1 text-[11px] leading-4 text-muted-foreground">
               {apiMode === "worker"
                 ? "Cloudflare Access enforces a single approved identity on the app and every API route."
-                : "Preview: running on sample data. Production requires Cloudflare Access and a published R2 index."}
+                : mode === "demo"
+                  ? "Preview: the bundled sample dataset is serving this screen. Nothing here is read from R2."
+                  : "Preview: no R2 dataset is published, so there are no real records to search."}
             </p>
           </div>
         </div>
@@ -269,7 +274,7 @@ export function AppLayout() {
           </div>
           {datasetError && !dataset ? (
             <ErrorBlock error={datasetError as Error} onRetry={() => void refetchDataset()} />
-          ) : mode === "demo" ? (
+          ) : datasetLoading ? null : mode === "demo" ? (
             <DatasetModeBanner mode="demo" detail={dataset?.message} />
           ) : mode === "no-dataset" ? (
             <DatasetModeBanner mode="no-dataset" detail={dataset?.message} />
@@ -282,7 +287,17 @@ export function AppLayout() {
             <span aria-hidden>·</span>
             <span>Cloudflare Workers + R2</span>
             <span aria-hidden>·</span>
-            <span>{mode === "real" ? label : mode === "demo" ? "Demo mode (bundled sample data)" : "No dataset indexed"}</span>
+            <span>
+              {datasetError && !dataset
+                ? "Dataset status unavailable"
+                : datasetLoading
+                  ? "Checking dataset state…"
+                  : mode === "real"
+                    ? label
+                    : mode === "demo"
+                      ? "Demo mode (bundled sample data)"
+                      : "No dataset indexed"}
+            </span>
           </div>
         </footer>
       </div>

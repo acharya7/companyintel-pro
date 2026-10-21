@@ -46,6 +46,7 @@ import {
   StatCard,
 } from "@/components/common";
 import { ContactNumbers } from "@/components/contact-numbers";
+import { RealDataCoverageNotice } from "@/components/realdata";
 import {
   downloadExportFile,
   useCompany,
@@ -195,7 +196,10 @@ export default function CompanyDetails() {
   }
 
   const record = company.data!.company;
-  const facets = company.data!.facets;
+  // The stored facets were built when the active version was indexed; the page's
+  // own facet projection also covers records whose role lives in `title` (see
+  // src/shared/facets.ts). Prefer the complete, current projection.
+  const facets = contacts.data?.facets ?? company.data!.facets;
   const capturedAttributes = Object.entries(record.attributes ?? {});
   const rows = contacts.data?.contacts ?? [];
   const allSelected = rows.length > 0 && rows.every((contact) => selected.has(contact.id));
@@ -238,7 +242,7 @@ export default function CompanyDetails() {
     if (value) {
       activeFilters.push({
         key: field,
-        label: `${field === "country" ? "Country" : field[0].toUpperCase() + field.slice(1)}: ${value}`,
+        label: `${field === "country" ? "Country" : field[0].toUpperCase() + field.slice(1)}: ${friendly(value)}`,
         clear: () => updateFilters({ [field]: undefined } as Partial<ContactFilters>),
       });
     }
@@ -291,6 +295,8 @@ export default function CompanyDetails() {
         <span aria-hidden>·</span>
         <span className="truncate">Company ID {record.id}</span>
       </div>
+
+      <RealDataCoverageNotice className="mb-4" compact />
 
       <PageHeader
         eyebrow="Company"
@@ -444,7 +450,7 @@ export default function CompanyDetails() {
               <option value="">All designations</option>
               {facets?.designations.map((bucket) => (
                 <option key={bucket.value} value={bucket.value}>
-                  {bucket.value} ({bucket.count})
+                  {friendly(bucket.value)} ({bucket.count})
                 </option>
               ))}
             </select>
@@ -457,7 +463,7 @@ export default function CompanyDetails() {
               <option value="">All departments</option>
               {facets?.departments.map((bucket) => (
                 <option key={bucket.value} value={bucket.value}>
-                  {bucket.value} ({bucket.count})
+                  {friendly(bucket.value)} ({bucket.count})
                 </option>
               ))}
             </select>
@@ -470,7 +476,7 @@ export default function CompanyDetails() {
               <option value="">All countries</option>
               {facets?.countries.map((bucket) => (
                 <option key={bucket.value} value={bucket.value}>
-                  {bucket.value} ({bucket.count})
+                  {friendly(bucket.value)} ({bucket.count})
                 </option>
               ))}
             </select>
@@ -483,7 +489,7 @@ export default function CompanyDetails() {
               <option value="">All cities</option>
               {facets?.cities.map((bucket) => (
                 <option key={bucket.value} value={bucket.value}>
-                  {bucket.value} ({bucket.count})
+                  {friendly(bucket.value)} ({bucket.count})
                 </option>
               ))}
             </select>

@@ -7,6 +7,7 @@ import { Play, Plus, Search, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { EmptyState, PageHeader, Section } from "@/components/common";
+import { RealDataCoverageNotice } from "@/components/realdata";
 import { useDeleteSavedSearch, useMarkSavedSearchRun, useSavedSearches, useSettings } from "@/hooks/use-api";
 import { formatNumber, relativeTime } from "@/lib/format";
 import type { CompanyFilters } from "@/shared/models";
@@ -43,6 +44,8 @@ export default function SavedSearches() {
           </Button>
         }
       />
+
+      <RealDataCoverageNotice className="mb-4" compact />
 
       <Section
         title="Your saved queries"

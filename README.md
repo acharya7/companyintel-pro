@@ -68,12 +68,14 @@ bun run r2:doctor         # credentials file + endpoint + one signed LIST of the
 bun run r2:schema         # both real source files: encoding, delimiter, columns, mapping
 bun run verify:r2         # inventory, sizes, ETags, bounded body reads, dataset state
 bun run verify:r2:remote  # the same ground truth through the Worker binding (no keys, never deploys)
-bun run dev               # frontend preview (sample dataset mode unless VITE_API_MODE=worker)
+bun run dev               # frontend preview: real R2 data through the Worker API
 ```
 
-The preview ships a clearly-labelled **synthetic sample dataset** so the interface can be
-explored without R2. Production behaviour requires `VITE_API_MODE=worker` plus a deployed Worker
-(see `docs/configuration.md` and `docs/deployment.md`).
+The app talks to the Worker API by default (same-origin `/api/...`), so the deployed site and
+the preview both read the activated R2 index. The bundled synthetic sample dataset is
+available only with an explicit `VITE_API_MODE=local` in development and is labelled as demo
+data. Production builds always use the Worker API, so a leftover local env file cannot mix
+synthetic rows into a live deployment (see `docs/configuration.md` and `docs/deployment.md`).
 
 ## Indexing your data
 

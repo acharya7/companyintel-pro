@@ -17,7 +17,7 @@ read your bucket yet.
 | Where does the Worker get its configuration? | `worker/src/env.d.ts` + `wrangler.toml` | Bindings/vars/secrets only: `COMPANY_DATA`, `ASSETS`, `ENVIRONMENT`, `APP_VERSION`, `CF_ACCESS_TEAM_DOMAIN`, `CF_ACCESS_AUD`, `ALLOWED_EMAILS`, `DEV_ALLOW_UNAUTHENTICATED`, `MAX_SEARCHES_PER_MINUTE` |
 | Are R2 credentials visible to this workspace's processes? | `bun scripts/verify-raw.mjs` | **Exit 2**: "R2 credentials are not set for this terminal session" — so `R2_ACCOUNT_ID` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` are **not** present here |
 | Can this workspace make server-side R2 S3 requests? | The verification scripts run on Node/Bun and sign SigV4 themselves; exercised end to end over a stub transport (`tests/verify-raw-script.test.ts`, `tests/profile-raw-script.test.ts`) | **Yes, technically** — but see §4: it still needs credentials supplied to that process |
-| Does the preview depend on Convex? | `src/lib/api/client.ts` | **No.** With no `VITE_API_MODE` set it serves the bundled synthetic sample dataset (`local` mode) and labels every screen as sample data |
+| Does the preview depend on Convex? | `src/lib/api/client.ts` | **No.** With no `VITE_API_MODE` set it talks to the same-origin Worker API (`worker` mode); the synthetic sample dataset requires an explicit `VITE_API_MODE=local` |
 | Does the Worker ever read an S3 secret? | `tests/worker-r2-binding.test.ts` scans every `worker/**/*.ts` | **No** — no `R2_*` secret, no `cloudflarestorage.com`, no `process.env` |
 
 The Frontend tab still lists `VITE_CONVEX_URL` / `CONVEX_DEPLOYMENT` because the

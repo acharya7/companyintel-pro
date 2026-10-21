@@ -18,6 +18,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { EmptyState, PageHeader, Section, StatCard } from "@/components/common";
 import { ContactNumbers } from "@/components/contact-numbers";
+import { RealDataCoverageNotice } from "@/components/realdata";
 import { downloadExportFile, useCreateExport, useDeleteLead, useLeads, useUpdateLead } from "@/hooks/use-api";
 import { formatNumber, leadStatusLabel, relativeTime } from "@/lib/format";
 import { LEAD_STATUSES } from "@/shared/models";
@@ -95,7 +96,21 @@ export default function SavedLeads() {
                   {
                     kind: "leads",
                     leadIds: selected.size ? [...selected] : undefined,
-                    columns: ["kind", "name", "companyName", "title", "email", "linkedinUrl", "status", "tags", "notes", "savedAt"],
+                    columns: [
+                      "kind",
+                      "name",
+                      "companyName",
+                      "title",
+                      "email",
+                      "phone",
+                      "mobile",
+                      "additionalPhones",
+                      "linkedinUrl",
+                      "status",
+                      "tags",
+                      "notes",
+                      "savedAt",
+                    ],
                   },
                   { onSuccess: (job) => void downloadExportFile(job.id) },
                 )
@@ -107,6 +122,8 @@ export default function SavedLeads() {
           </>
         }
       />
+
+      <RealDataCoverageNotice className="mb-4" compact />
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard label="Saved companies" value={formatNumber(companyLeads.length)} hint="Companies in your pipeline" icon={<Building2 className="size-4" />} />
@@ -213,7 +230,7 @@ export default function SavedLeads() {
                             <div className="min-w-0">
                               <p className="font-medium">{lead.fullName}</p>
                               <p className="text-[11px] text-muted-foreground">{lead.title ?? "—"}</p>
-                              {lead.kind === "contact" && (lead.phone || lead.mobile) ? (
+                              {lead.kind === "contact" && (lead.phone || lead.mobile || lead.additionalPhones?.length) ? (
                                 <ContactNumbers contact={lead} className="mt-1" showLabels={false} />
                               ) : null}
                             </div>
@@ -270,8 +287,10 @@ export default function SavedLeads() {
                       <TableCell>
                         <div className="flex items-center justify-end gap-1">
                           {lead.kind === "contact" && lead.email ? (
-                            <Button variant="ghost" size="icon-sm" title={lead.email} onClick={() => void navigator.clipboard?.writeText(lead.email!)}>
-                              <Mail className="size-3.5" />
+                            <Button variant="ghost" size="icon-sm" asChild title={lead.email}>
+                              <a href={`mailto:${lead.email}`} aria-label={`Email ${lead.fullName}`}>
+                                <Mail className="size-3.5" />
+                              </a>
                             </Button>
                           ) : null}
                           {lead.kind === "contact" && lead.linkedinUrl ? (

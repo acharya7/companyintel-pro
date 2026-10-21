@@ -106,10 +106,20 @@ export function splitPhoneValues(value: string): string[] {
     .filter((part) => isPlausiblePhone(part));
 }
 
-/** A duplicate key that ignores formatting but keeps an extension distinct. */
+/**
+ * A duplicate key that ignores formatting but keeps an extension distinct.
+ *
+ * Real exports carry the same line twice under two source columns — the display
+ * value (`(707) 603-3027`) and a sanitized E.164 value (`+17076033027`). Stripping
+ * punctuation alone treats those as different numbers, so a record showed its
+ * phone twice. A leading NANP `1` is dropped once the national number is present,
+ * which collapses the pair without merging genuinely different international
+ * numbers.
+ */
 function numberKey(value: string): string {
   const { base, extension } = splitPhoneExtension(value);
-  const digits = phoneDigits(base).replace(/^0+/, "");
+  let digits = phoneDigits(base).replace(/^0+/, "");
+  if (digits.length === 11 && digits.startsWith("1")) digits = digits.slice(1);
   return `${digits}${extension ? `x${extension}` : ""}`;
 }
 

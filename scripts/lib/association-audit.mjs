@@ -562,7 +562,7 @@ export function auditStoredAssociations({ companies, contactsByRef, unassigned =
     if (company.facets) {
       facets.checked += 1;
       const fields = [
-        ["designation", company.facets.designations, facetCounts(contacts, (contact) => contact.designation)],
+        ["designation", company.facets.designations, facetCounts(contacts, (contact) => contact.designation || contact.title)],
         ["department", company.facets.departments, facetCounts(contacts, (contact) => contact.department)],
         ["seniority", company.facets.seniority, facetCounts(contacts, (contact) => contact.seniority)],
         ["country", company.facets.countries, facetCounts(contacts, (contact) => contact.country)],

@@ -51,11 +51,19 @@ export function contactMatchesQuery(contact: Contact, query: string | undefined 
 export function contactMatchesFilters(contact: Contact, filters?: ContactFilters): boolean {
   if (!filters) return true;
   if (!contactMatchesQuery(contact, filters.query)) return false;
-  if (filters.designation && contact.designation !== filters.designation) return false;
-  if (filters.department && contact.department !== filters.department) return false;
-  if (filters.seniority && contact.seniority !== filters.seniority) return false;
-  if (filters.country && contact.country !== filters.country) return false;
-  if (filters.city && contact.city !== filters.city) return false;
+  // Some source exports carry the role only in `title` (the active real-data
+  // index maps `person_title` there and leaves `designation` empty). Filtering by
+  // designation must still find those people, instead of returning zero because
+  // one canonical field is absent.
+  if (filters.designation) {
+    const wanted = fold(filters.designation);
+    const role = [contact.designation, contact.title].find((value) => fold(value) === wanted);
+    if (!role) return false;
+  }
+  if (filters.department && fold(contact.department) !== fold(filters.department)) return false;
+  if (filters.seniority && fold(contact.seniority) !== fold(filters.seniority)) return false;
+  if (filters.country && fold(contact.country) !== fold(filters.country)) return false;
+  if (filters.city && fold(contact.city) !== fold(filters.city)) return false;
   if (filters.hasEmail && !contact.email) return false;
   // Phone covers mobile too: both are contact numbers, and the UI labels which
   // one it is. A record with only a mobile must not be hidden by "Has phone".

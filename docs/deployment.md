@@ -104,9 +104,10 @@ page and `/indexing` reports "Cloudflare Access verification failed". The settin
 therefore a deployment requirement, not a tuning knob — `tests/worker-entry-routing.test.ts`
 fails if either Wrangler config stops routing a registered `/api` route to the Worker.
 
-If you want the deployed UI to talk to the Worker API, set `VITE_API_MODE=worker` in your
-build environment (and `VITE_API_BASE_URL` only if the API lives on another origin). Without
-it the deployed bundle falls back to the clearly-labelled synthetic sample mode.
+The deployed UI talks to the Worker API by default: a build with no `VITE_*` configuration
+uses the same origin (`/api/...`). Set `VITE_API_MODE=worker` explicitly if you prefer, and
+`VITE_API_BASE_URL` only if the API lives on another origin. `VITE_API_MODE=local` is the
+only way to serve the bundled synthetic sample dataset; it is never a production default.
 
 ## 6. Create the Cloudflare Access application (this is what makes the app private)
 

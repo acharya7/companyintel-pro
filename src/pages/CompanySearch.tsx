@@ -523,10 +523,10 @@ export default function CompanySearch() {
                           </p>
                           <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
                             {hit.email ? (
-                              <span className="inline-flex items-center gap-1.5">
-                                <Mail className="size-3" />
-                                {hit.email}
-                              </span>
+                              <a href={`mailto:${hit.email}`} className="inline-flex min-w-0 items-center gap-1.5 hover:text-primary hover:underline">
+                                <Mail className="size-3 shrink-0" />
+                                <span className="max-w-[220px] truncate">{hit.email}</span>
+                              </a>
                             ) : null}
                             <ContactNumbers contact={hit} showLabels={false} />
                             {[hit.city, hit.country].filter(Boolean).length ? (

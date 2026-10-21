@@ -5,18 +5,23 @@ hardcoded, and no secret belongs in this document, in `wrangler.toml`, or in cha
 
 ## 1. Frontend API mode
 
-The browser either talks to the deployed Worker or to the bundled **synthetic sample
-dataset** used for previewing the UI. The mode is explicit, never an accidental fallback:
+The browser talks to the deployed Worker by default. The bundled **synthetic sample
+dataset** exists only for an explicit preview, never as a silent fallback:
 
 | Variable | Value | Effect |
 | --- | --- | --- |
-| `VITE_API_MODE` | `worker` | All data comes from the Cloudflare Worker API (`/api/...`). This is production behaviour. |
-| `VITE_API_MODE` | `local` | Synthetic sample data only. Clearly labelled in the UI as sample/origin. |
+| `VITE_API_MODE` | *(unset)* | All data comes from the Cloudflare Worker API on the same origin (`/api/...`). This is production behaviour and the default. |
+| `VITE_API_MODE` | `worker` | Same as unset; kept for explicit configuration. |
+| `VITE_API_MODE` | `local` | Synthetic sample data only, for `vite dev`/tests. A production build (`PROD`) ignores it and always uses the Worker API, so a stray local `.env.local` cannot put synthetic rows beside real R2 coverage. |
 | `VITE_API_BASE_URL` | e.g. `https://companyintel.example.workers.dev` | Origin of the Worker API. Only needed when the frontend is served from a different origin. |
 
-If neither is set, the app runs in `local` mode and every screen shows a *sample data* origin
-badge — it never pretends to be connected to R2. Set these in your host's environment/Keys
-panel; the repository's `.env` files are managed outside the code.
+Cloudflare Workers Builds sets none of these, so a deployed build uses the Worker API. The
+UI derives its status from `/api/dataset/status` and `/api/realdata/coverage`: an activated
+version is labelled **REAL DATA — PARTIAL COVERAGE** (or COMPLETE COVERAGE), while **Demo
+data** can only appear when the sample adapter itself reports `dataOrigin: "sample"`. A
+failed status request is shown as an error with a retry — it never switches to demo mode.
+Set these in your host's environment/Keys panel; the repository's `.env` files are managed
+outside the code.
 
 ## 2. Worker configuration (`wrangler.toml`)
 
