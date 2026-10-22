@@ -41,6 +41,7 @@ import { scanBlock } from "./blocks";
 import { forecast, type BenchmarkMeasurement } from "./cost";
 import { cloudSourcesFromConfig, runPass1, syncStateFromCheckpoints, verifyRun } from "./pass1";
 import { runRange } from "./range";
+import { runPartitionTask } from "./partition";
 import { runCloudPass2 } from "./pass2";
 import { R2BlobStore } from "./store";
 import { runScan } from "../realdata/scan";
@@ -743,6 +744,45 @@ async function rangeCommand(store: R2BlobStore): Promise<void> {
   console.log(JSON.stringify(result));
 }
 
+/**
+ * Merge ONE spool partition into its own ref space (parallel merge).
+ *
+ * Writes projection/detail objects plus partition-tagged posting parts and a durable
+ * `partitions/<n>.json` result. Never writes a final index shard and never activates.
+ */
+async function mergePartitionCommand(store: R2BlobStore): Promise<void> {
+  const { config } = loadConfig();
+  const id = version();
+  const partition = num("partition");
+  if (partition === null || partition < 0) throw new Error("--partition <n> is required.");
+  const refBase = num("ref-base");
+  if (refBase === null || refBase < 0) throw new Error("--ref-base <n> is required (from planRefBases).");
+  const partitions = num("partitions") ?? config.partitions;
+  const workDir =
+    typeof flag("work-dir") === "string" ? resolve(root, String(flag("work-dir"))) : join(tmpdir(), `companyintel-merge-${id}-p${partition}`);
+
+  console.log(`\nParallel partition merge — ${id} partition ${partition}`);
+  console.log(`  ref base               ${refBase.toLocaleString()}`);
+  console.log(`  partitions             ${partitions}`);
+  console.log(`  scratch                ${workDir} (one partition at a time)`);
+
+  const result = await runPartitionTask({
+    store,
+    version: id,
+    config: { ...config, partitions, datasetVersion: id },
+    partition,
+    refBase,
+    workDir,
+    onLog: (line) => console.log(`  ${line}`),
+  });
+  console.log(
+    `\npartition ${partition}: ${result.companies.toLocaleString()} companies, ${result.contacts.toLocaleString()} contacts, ` +
+      `${result.objects.length.toLocaleString()} object(s), ${result.shardParts.toLocaleString()} shard part(s), ` +
+      `refs [${result.refBase.toLocaleString()}, ${result.nextRef.toLocaleString()})`,
+  );
+  console.log(JSON.stringify(result));
+}
+
 async function main(): Promise<void> {
   const command = process.argv[2];
   if (!command || command === "--help" || command === "help") {
@@ -765,6 +805,7 @@ async function main(): Promise<void> {
         "Swarm tasks (one block or one byte range; leased by the indexing coordinator):",
         "  blocks    --version <id> --source <sourceId> --block <n> [--block-mb 64]",
         "  range     --version <id> --source <sourceId> --range <n> --start <bytes> --end <bytes> --base-line <n> [--partitions 256] [--no-verify]",
+        "  merge-partition --version <id> --partition <n> --ref-base <n> [--partitions 256] [--work-dir <dir>]",
         "",
         "Sources must be r2://<bucket>/<key>; the bucket comes from the credentials.",
       ].join("\n"),
@@ -782,6 +823,7 @@ async function main(): Promise<void> {
   if (command === "scan") return scan(store);
   if (command === "blocks") return blocksCommand(store);
   if (command === "range") return rangeCommand(store);
+  if (command === "merge-partition") return mergePartitionCommand(store);
   if (command === "pass2") return pass2(store);
   if (command === "interrupt") return interrupt(store);
   if (command === "pause" || command === "resume" || command === "abort" || command === "approve") return control(store, command);

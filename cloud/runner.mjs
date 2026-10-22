@@ -75,6 +75,8 @@ const ALLOWED_COMMANDS = new Set([
   // they never touch the single-job state (`/task` below, not `/job`).
   "blocks",
   "range",
+  // Parallel merge pipeline: one shard partition per task, then one shard.
+  "merge-partition",
 ]);
 
 /** The CLI is present only when the image was copied correctly. */

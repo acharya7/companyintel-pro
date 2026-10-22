@@ -33,7 +33,14 @@ import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, rm
 import { join, resolve } from "node:path";
 import { gzipSync, gunzipSync } from "node:zlib";
 
-import { identityFor, runIndex, type CloudMergeResume, type IndexerConfig, type ProgressEvent } from "../indexer/src/build";
+import {
+  MergeOnlyComplete,
+  identityFor,
+  runIndex,
+  type CloudMergeResume,
+  type IndexerConfig,
+  type ProgressEvent,
+} from "../indexer/src/build";
 import type { SpoolManifest } from "../indexer/src/spool";
 import { spoolV2SidecarName, type SpoolFrameEntry, type SpoolSchema } from "../indexer/src/spool-v2";
 import {
@@ -59,6 +66,8 @@ export interface CloudPass2Result {
   indexBytes: number;
   shardParts: number;
   elapsedMs: number;
+  /** Present on a parallel merge-only run: everything finalize/shard assembly needs. */
+  mergeOnly?: CloudMergeResume;
 }
 
 /** Thrown between partitions when the operator asked the job to stop. */
@@ -93,6 +102,18 @@ export interface RunCloudPass2Options {
    * prefix, but only for a job already marked `mode: "benchmark"`.
    */
   allowBounded?: boolean;
+  /**
+   * Parallel merge: merge ONLY this spool partition, at `refBase`, and stop before
+   * FINALIZE (see `tools/cloud/partition.ts`).
+   *
+   * `onlyPartition` selects the work, `refBase` gives it a non-overlapping ref space,
+   * and `mergeOnly` guarantees the task cannot write the shared index shard objects.
+   * Posting parts then go to a partition-tagged key so shard assembly can read one
+   * partition's parts.
+   */
+  onlyPartition?: number;
+  refBase?: number;
+  mergeOnly?: boolean;
   /**
    * Proof of life for the two phases after the merge.
    *
@@ -389,6 +410,9 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
       diskFloorBytes: options.diskFloorBytes ?? 64 * 1024 * 1024,
       onProgress: options.onProgress,
       ...(resumeState ? { cloudResume: resumeState } : {}),
+      ...(options.mergeOnly ? { mergeOnly: true } : {}),
+      ...(options.refBase !== undefined ? { refBase: options.refBase } : {}),
+      ...(options.onlyPartition !== undefined ? { mergePartitions: [options.onlyPartition] } : {}),
       cloud: {
         onMergeComplete: async (snapshot) => {
           mergeSnapshot = snapshot;
@@ -604,7 +628,16 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
         },
 
         writeShardPart: async (batch, kind, shard, body) => {
-          const key = `${cloudKeys.jobRoot(version)}/pass2/shards/${kind}/${String(shard).padStart(4, "0")}/${String(batch).padStart(6, "0")}.lines.gz`;
+          /*
+           * Sequential runs keep the batch-only key (shard assembly reads it directly).
+           * A parallel partition task tags the key with its partition: 256 containers
+           * write the same shard for different partitions, and an untagged key would
+           * have them overwrite each other's postings.
+           */
+          const key =
+            options.onlyPartition === undefined
+              ? `${cloudKeys.jobRoot(version)}/pass2/shards/${kind}/${String(shard).padStart(4, "0")}/${String(batch).padStart(6, "0")}.lines.gz`
+              : `${cloudKeys.jobRoot(version)}/pass2/parts/${kind}/${String(shard).padStart(4, "0")}/p-${String(options.onlyPartition).padStart(3, "0")}-${String(batch).padStart(6, "0")}.lines.gz`;
           // No `content-encoding` on intermediate parts: it would make every ranged
           // GET an HTTP-level decompression of a byte range (which is not a gzip
           // stream) and the read-back fails with a ZlibError. The driver gunzips
@@ -644,6 +677,30 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
       },
     });
   } catch (error) {
+    /*
+     * A merge-only partition task ends here, by design.
+     *
+     * It has written its projection/detail objects and its partition-tagged posting
+     * parts; it must NOT reach finalize (shared index shards), must not write
+     * `state.json` (the coordinator owns the run) and must not run validation. The
+     * snapshot it returns is what the coordinator aggregates and what the finalize
+     * task consumes.
+     */
+    if (error instanceof MergeOnlyComplete) {
+      return {
+        state,
+        stopped: "complete",
+        partitions: 1,
+        rows: error.snapshot.counters.rowsRead,
+        companies: error.snapshot.counters.uniqueCompanies,
+        contacts: error.snapshot.counters.uniqueContacts,
+        indexObjects: 0,
+        indexBytes: 0,
+        shardParts,
+        elapsedMs: now() - startedMs,
+        mergeOnly: error.snapshot,
+      };
+    }
     if (error instanceof CloudStop) {
       stopped = error.kind;
       const current = (await store.getJson<CloudJobState>(cloudKeys.state(version))) ?? state;
