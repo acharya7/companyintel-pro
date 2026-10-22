@@ -73,7 +73,7 @@ function runStatus(version: string, overrides: Record<string, unknown> = {}) {
 
 interface JobsBody {
   jobs: {
-    state: { version: string; stage: string };
+    state: { version: string; stage: string; mode?: string; totals?: unknown };
     run: { outcome: string; reason?: string } | null;
     warning: { kind: string; reason: string; since: string } | null;
   }[];
@@ -209,6 +209,37 @@ describe("cloud job listing", () => {
     const { body } = await getJobs(env(bucket));
     expect(body.jobs[0]!.run?.outcome).toBe("failed");
     expect(body.jobs[0]!.run?.reason).toContain("simulated R2 outage");
+  });
+
+  test("a direct-scan record is listed untouched: no rewrite, no delete, no invented totals", async () => {
+    // `tools/realdata/scan.ts` writes a state.json with `mode: "scan"` and a
+    // `progress` block — no `totals`. The listing must keep serving it verbatim so
+    // history is preserved; the panel is what tolerates the missing metrics.
+    const version = "scan-2026-10-22";
+    const bucket = bucketWith({
+      [`cloud/jobs/${version}/state.json`]: {
+        version,
+        mode: "scan",
+        stage: "pass1-complete",
+        startedAt: "2026-10-22T08:00:00.000Z",
+        updatedAt: new Date().toISOString(),
+        note: 'Direct R2 scan for "acme"',
+        config: { query: "acme", kind: "companies", maxMbPerSource: 64, limit: 50 },
+        progress: { bytesScanned: 1024, bytesTotal: 2048, coveragePercent: 50 },
+        accounting: { estimatedUsd: null, containerUsd: null },
+      },
+    });
+    bucket.resetCounters();
+
+    const { status, body } = await getJobs(env(bucket));
+
+    expect(status).toBe(200);
+    expect(body.jobs).toHaveLength(1);
+    expect(body.jobs[0]!.state).toMatchObject({ version, mode: "scan", stage: "pass1-complete" });
+    expect(body.jobs[0]!.state).not.toHaveProperty("totals");
+    // Reading the listing never writes: history is not repaired by a GET.
+    expect(bucket.counters.puts).toBe(0);
+    expect(bucket.counters.readKeys.every((key) => key.endsWith("/state.json"))).toBe(true);
   });
 
   test("more job directories than one page are reported as truncated, newest first", async () => {

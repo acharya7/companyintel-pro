@@ -13,69 +13,23 @@
  *     owns execution, so the browser may be closed.
  *
  * Neither path bypasses Access, the admin allowlist or the budget gates.
+ *
+ * The listing is normalised before it is rendered (`normalizeJobsResponse`): a
+ * historical record can be a scan (no `totals`) or an older partial state, and
+ * missing metrics must render as "—" rather than crash the page — and must never
+ * hide the launch control.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Activity, AlertTriangle, Cloud, Database, Gauge, HardDrive, Layers, Pause, Play, RefreshCw, ShieldCheck, Square, Timer } from "lucide-react";
+import { AlertTriangle, Cloud, Play, RefreshCw, ShieldCheck } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { EmptyState, PageHeader, Section, StatCard, StatusPill } from "@/components/common";
+import { EmptyState, PageHeader, Section } from "@/components/common";
+import { JobDetail, type JobAction } from "@/components/indexing-job";
 import { SwarmLaunch } from "@/components/swarm-launch";
-import type { CloudControl, CloudJobState, CloudRunStatus } from "@/shared/cloud/types";
-
-/** Mirrors `JobListing` in `worker/src/indexer-admin.ts`. */
-type JobWarning = { kind: "failed" | "interrupted" | "terminated" | "stale"; since: string; reason: string };
-type JobListing = { state: CloudJobState; control: CloudControl | null; run: CloudRunStatus | null; warning: JobWarning | null };
-type JobsResponse = { jobs: JobListing[]; containerBound?: boolean; staging?: boolean; truncated?: boolean };
-
-const WARNING_LABEL: Record<JobWarning["kind"], string> = {
-  failed: "Pass stopped with an error",
-  interrupted: "Run interrupted",
-  terminated: "Run terminated by the platform",
-  stale: "Run is not advancing",
-};
-
-/** A control-plane failure keeps its HTTP status: 401/403 means "not an administrator". */
-class AdminError extends Error {
-  status: number;
-
-  constructor(message: string, status: number) {
-    super(message);
-    this.name = "AdminError";
-    this.status = status;
-  }
-}
-
-async function admin<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    headers: {
-      "content-type": "application/json",
-      "x-companyintel-cloud-admin": "dev",
-      ...(init?.headers ?? {}),
-    },
-  });
-  const body = (await response.json()) as T & { error?: { message?: string } };
-  if (!response.ok) throw new AdminError(body?.error?.message ?? `Request failed (${response.status})`, response.status);
-  return body;
-}
-
-function formatBytes(bytes: number | null | undefined): string {
-  if (bytes === null || bytes === undefined) return "—";
-  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(2)} GB`;
-  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
-  if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(1)} KB`;
-  return `${bytes} B`;
-}
-
-function formatDuration(seconds: number | null | undefined): string {
-  if (!seconds || !Number.isFinite(seconds) || seconds <= 0) return "—";
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.round((seconds % 3600) / 60);
-  return hours ? `${hours}h ${minutes}m` : `${minutes}m`;
-}
+import { admin, loadJobs } from "@/lib/api/cloud-admin";
+import type { CloudJobListingView } from "@/shared/cloud/job-view";
 
 const STAGE_TONE: Record<string, string> = {
   complete: "border-chart-2/40 bg-chart-2/10 text-chart-2",
@@ -86,10 +40,12 @@ const STAGE_TONE: Record<string, string> = {
 };
 
 export default function IndexingControl() {
-  const [jobs, setJobs] = useState<JobListing[]>([]);
+  const [jobs, setJobs] = useState<CloudJobListingView[]>([]);
   const [truncated, setTruncated] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** Non-fatal listing problems: one unreadable record never hides the rest. */
+  const [diagnostics, setDiagnostics] = useState<string[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [verifyOutput, setVerifyOutput] = useState<string | null>(null);
@@ -105,27 +61,34 @@ export default function IndexingControl() {
   const [benchPartitions, setBenchPartitions] = useState("16");
 
   const refresh = useCallback(async () => {
-    try {
-      const data = await admin<JobsResponse>("/api/cloud/jobs");
-      setJobs(data.jobs);
-      setTruncated(Boolean(data.truncated));
-      setSelected((current) => current ?? data.jobs[0]?.state.version ?? null);
-      setStaging(Boolean(data.staging));
-      setContainerBound(Boolean(data.containerBound));
-      setAuthorized(true);
-      // A staging deployment only accepts `stg-` version ids; default the benchmark
-      // field to one so the first attempt is not a 400.
-      if (data.staging && !stagingPrefixApplied.current) {
-        stagingPrefixApplied.current = true;
-        setBenchVersion((current) => (current.startsWith("stg-") ? current : `stg-${current}`));
-      }
-      setError(null);
-    } catch (caught) {
+    const result = await loadJobs();
+    if (result.kind === "denied") {
       // A 401/403 is an authorisation answer, not a transport failure: hide the
       // launch control instead of offering a button that can never succeed.
-      if (caught instanceof AdminError && (caught.status === 401 || caught.status === 403)) setAuthorized(false);
-      setError(caught instanceof Error ? caught.message : String(caught));
+      setAuthorized(false);
+      setError(result.message);
+      return;
     }
+    if (result.kind === "error") {
+      // The last authorised view stays on screen; only the failure is reported.
+      setError(result.message);
+      return;
+    }
+    const view = result.view;
+    setJobs(view.jobs);
+    setDiagnostics(view.issues);
+    setTruncated(view.truncated);
+    setSelected((current) => current ?? view.jobs[0]?.job.version ?? null);
+    setStaging(view.staging);
+    setContainerBound(view.containerBound);
+    setAuthorized(true);
+    // A staging deployment only accepts `stg-` version ids; default the benchmark
+    // field to one so the first attempt is not a 400.
+    if (view.staging && !stagingPrefixApplied.current) {
+      stagingPrefixApplied.current = true;
+      setBenchVersion((current) => (current.startsWith("stg-") ? current : `stg-${current}`));
+    }
+    setError(null);
   }, []);
 
   useEffect(() => {
@@ -140,18 +103,18 @@ export default function IndexingControl() {
   }, [refresh]);
 
   const current = useMemo(() => {
-    const matched = jobs.find((job) => job.state.version === selected);
+    const matched = jobs.find((entry) => entry.job.version === selected);
     return matched ?? jobs[0] ?? null;
   }, [jobs, selected]);
 
-  const state = current?.state ?? null;
+  const job = current?.job ?? null;
   const control = current?.control ?? null;
   const warning = current?.warning ?? null;
   const run = current?.run ?? null;
 
-  const act = async (action: "pause" | "resume" | "abort" | "approve") => {
-    if (!state) return;
-    if (action === "approve" && !window.confirm(`Record approval for a full-corpus run of ${state.version}? This is the gate that allows Pass 1 to read all 64 GB.`)) return;
+  const act = async (action: JobAction) => {
+    if (!job) return;
+    if (action === "approve" && !window.confirm(`Record approval for a full-corpus run of ${job.version}? This is the gate that allows Pass 1 to read all 64 GB.`)) return;
     setBusy(action);
     setNotice(null);
     setError(null);
@@ -167,7 +130,7 @@ export default function IndexingControl() {
         partitions?: number;
         maxSourceMb?: number;
         message?: string;
-      }>(`/api/cloud/jobs/${encodeURIComponent(state.version)}/control`, {
+      }>(`/api/cloud/jobs/${encodeURIComponent(job.version)}/control`, {
         method: "POST",
         body: JSON.stringify({ action }),
       });
@@ -175,8 +138,8 @@ export default function IndexingControl() {
         setNotice(
           result.message ??
             (result.started
-              ? `Resumed ${state.version} at the ${result.stage} stage.`
-              : `Nothing was started for ${state.version}: no execution is pending.`),
+              ? `Resumed ${job.version} at the ${result.stage} stage.`
+              : `Nothing was started for ${job.version}: no execution is pending.`),
         );
       } else {
         setNotice(
@@ -194,11 +157,11 @@ export default function IndexingControl() {
   };
 
   const verify = async () => {
-    if (!state) return;
+    if (!job) return;
     setBusy("verify");
     setVerifyOutput(null);
     try {
-      const result = await admin<{ ok: boolean; output: string }>(`/api/cloud/jobs/${encodeURIComponent(state.version)}/verify`, {
+      const result = await admin<{ ok: boolean; output: string }>(`/api/cloud/jobs/${encodeURIComponent(job.version)}/verify`, {
         method: "POST",
         body: "{}",
       });
@@ -224,16 +187,16 @@ export default function IndexingControl() {
   };
 
   const startFull = async () => {
-    if (!state) return;
-    if (!window.confirm(`Start FULL Pass 1 for ${state.version}? It reads all 64.26 GB from R2 and can run for hours.`)) return;
+    if (!job) return;
+    if (!window.confirm(`Start FULL Pass 1 for ${job.version}? It reads all 64.26 GB from R2 and can run for hours.`)) return;
     setBusy("start-full");
     setNotice(null);
     try {
-      const result = await admin<{ started: boolean }>(`/api/cloud/jobs/${encodeURIComponent(state.version)}/start`, {
+      const result = await admin<{ started: boolean }>(`/api/cloud/jobs/${encodeURIComponent(job.version)}/start`, {
         method: "POST",
         body: JSON.stringify({ confirm: "START", stage: "pass1" }),
       });
-      setNotice(result.started ? `Full Pass 1 started for ${state.version}. Progress is durable in R2.` : "The job was not started.");
+      setNotice(result.started ? `Full Pass 1 started for ${job.version}. Progress is durable in R2.` : "The job was not started.");
       await refresh();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -243,16 +206,16 @@ export default function IndexingControl() {
   };
 
   const startPass2 = async () => {
-    if (!state) return;
-    if (!window.confirm(`Merge ${state.version} from its verified R2 segments into the index? No source object is modified.`)) return;
+    if (!job) return;
+    if (!window.confirm(`Merge ${job.version} from its verified R2 segments into the index? No source object is modified.`)) return;
     setBusy("pass2");
     setNotice(null);
     try {
       const result = await admin<{ started: boolean; partitions: number; message?: string }>(
-        `/api/cloud/jobs/${encodeURIComponent(state.version)}/pass2`,
+        `/api/cloud/jobs/${encodeURIComponent(job.version)}/pass2`,
         {
           method: "POST",
-          body: JSON.stringify({ confirm: "PASS2", partitions: state.partitions }),
+          body: JSON.stringify({ confirm: "PASS2", partitions: job.partitions ?? undefined }),
         },
       );
       setNotice(
@@ -269,14 +232,14 @@ export default function IndexingControl() {
   };
 
   const activate = async () => {
-    if (!state) return;
-    if (!window.confirm(`Activate ${state.version} for the application? The previous version stays in R2 as the rollback target.`)) return;
+    if (!job) return;
+    if (!window.confirm(`Activate ${job.version} for the application? The previous version stays in R2 as the rollback target.`)) return;
     setBusy("activate");
     setNotice(null);
     try {
-      const result = await admin<{ ok: boolean; output: string }>(`/api/cloud/jobs/${encodeURIComponent(state.version)}/activate`, {
+      const result = await admin<{ ok: boolean; output: string }>(`/api/cloud/jobs/${encodeURIComponent(job.version)}/activate`, {
         method: "POST",
-        body: JSON.stringify({ confirm: state.version }),
+        body: JSON.stringify({ confirm: job.version }),
       });
       setVerifyOutput(result.output || (result.ok ? "Activated." : "Activation failed."));
       await refresh();
@@ -343,6 +306,15 @@ export default function IndexingControl() {
           <span>{error}</span>
         </div>
       ) : null}
+      {diagnostics.length ? (
+        <div className="mb-4 flex items-start gap-2 rounded-lg border border-chart-3/40 bg-chart-3/10 p-3 text-xs text-chart-3">
+          <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+          <span>
+            <strong>Some job records could not be read.</strong> {diagnostics.join(" ")} The rest of the panel and the launch control are
+            unaffected.
+          </span>
+        </div>
+      ) : null}
       {notice ? (
         <div className="mb-4 flex items-start gap-2 rounded-lg border border-chart-2/30 bg-chart-2/5 p-3 text-xs text-chart-2">
           <ShieldCheck className="mt-0.5 size-4 shrink-0" />
@@ -353,7 +325,8 @@ export default function IndexingControl() {
       {/*
        * The one-click full-corpus launch. It sits outside the job listing because a
        * swarm run is coordinated by its own durable object, not by `cloud/jobs`
-       * state — so it must be reachable on a deployment that has never run a job.
+       * state — so it must be reachable on a deployment that has never run a job,
+       * and on one whose newest job record is incomplete.
        */}
       <SwarmLaunch authorized={authorized} staging={staging} />
 
@@ -371,21 +344,24 @@ export default function IndexingControl() {
             </label>
             <select
               id="job-select"
-              value={state?.version ?? ""}
+              value={job?.version ?? ""}
               onChange={(event) => setSelected(event.target.value)}
               className="h-8 rounded-md border border-border bg-background px-2 text-xs"
             >
-              {jobs.map((job) => (
-                <option key={job.state.version} value={job.state.version}>
-                  {job.state.version} · {job.state.stage}
+              {jobs.map((entry) => (
+                <option key={entry.job.version} value={entry.job.version}>
+                  {entry.job.version} · {entry.job.stage}
                 </option>
               ))}
             </select>
-            {state ? (
-              <span className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-medium ${STAGE_TONE[state.stage] ?? "border-border bg-muted/40 text-muted-foreground"}`}>
-                {state.stage}
-                {state.stage === "pass2" && state.pass2?.phase ? ` · ${state.pass2.phase}` : ""}
+            {job ? (
+              <span className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-medium ${STAGE_TONE[job.stage] ?? "border-border bg-muted/40 text-muted-foreground"}`}>
+                {job.stage}
+                {job.stage === "pass2" && job.pass2?.phase ? ` · ${job.pass2.phase}` : ""}
               </span>
+            ) : null}
+            {job && job.mode !== "full" && job.mode !== "benchmark" ? (
+              <span className="text-xs text-muted-foreground">record type {job.mode}</span>
             ) : null}
             {control ? (
               <span className="text-xs text-muted-foreground">
@@ -395,259 +371,21 @@ export default function IndexingControl() {
             {truncated ? <span className="text-xs text-chart-3">showing the newest jobs only</span> : null}
           </div>
 
-          {/*
-           * A detached run leaves no open request behind, so "the job is not moving"
-           * has to be stated from the durable heartbeat. Without this banner a stopped
-           * Pass 1 looks exactly like a slow one.
-           */}
-          {warning ? (
-            <div className="mb-4 flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-xs text-destructive">
-              <AlertTriangle className="mt-0.5 size-4 shrink-0" />
-              <span>
-                <strong>{WARNING_LABEL[warning.kind]}</strong> — {warning.reason}
-                <span className="text-muted-foreground"> · {new Date(warning.since).toLocaleString()}</span>
-              </span>
-            </div>
-          ) : run && run.outcome === "running" ? (
-            <div className="mb-4 flex items-start gap-2 rounded-lg border border-chart-2/30 bg-chart-2/5 p-3 text-xs text-chart-2">
-              <Activity className="mt-0.5 size-4 shrink-0" />
-              <span>
-                Run {run.attempt} is alive · stage {run.stage} · last heartbeat {new Date(run.heartbeatAt).toLocaleTimeString()}
-                {run.pid ? ` · pid ${run.pid}` : ""}
-              </span>
-            </div>
-          ) : run && run.outcome !== "completed" && (run.reason ?? state?.interruption?.reason) ? (
-            /*
-             * A terminal failure on a job whose stage is no longer in flight (failed,
-             * paused after a stop) still needs its reason in the most visible place: the
-             * stage pill alone does not say why it stopped.
-             */
-            <div className="mb-4 flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 p-3 text-xs text-destructive">
-              <AlertTriangle className="mt-0.5 size-4 shrink-0" />
-              <span>
-                <strong>{WARNING_LABEL[run.outcome as JobWarning["kind"]] ?? "Run stopped"}</strong> — {run.reason ?? state?.interruption?.reason}
-                <span className="text-muted-foreground"> · {new Date(run.heartbeatAt).toLocaleString()}</span>
-              </span>
-            </div>
-          ) : null}
-
-          {state ? (
-            <>
-              <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-                <StatCard label="Rows read" value={state.totals.rowsRead.toLocaleString()} hint={`${state.totals.rowsRejected.toLocaleString()} rejected`} icon={<Activity className="size-4" />} />
-                <StatCard
-                  label="Segments"
-                  value={state.totals.segments.toLocaleString()}
-                  hint={`${formatBytes(state.totals.segmentBytes)} spool · ${state.totals.sourceBytesRead ? `${((state.totals.segmentBytes / state.totals.sourceBytesRead) * 100).toFixed(1)}% of source` : "—"}`}
-                  icon={<HardDrive className="size-4" />}
-                />
-                <StatCard
-                  label="Throughput"
-                  value={state.rate.rowsPerSecond ? `${Math.round(state.rate.rowsPerSecond).toLocaleString()} rows/s` : "—"}
-                  hint={`ETA ${formatDuration(state.rate.etaSeconds)}`}
-                  icon={<Gauge className="size-4" />}
-                />
-                <StatCard
-                  label="Estimated cost"
-                  value={`$${state.accounting.estimatedUsd.toFixed(3)}`}
-                  hint={`${state.accounting.classA.toLocaleString()} Class A · ${state.accounting.classB.toLocaleString()} Class B`}
-                  icon={<Timer className="size-4" />}
-                />
-              </div>
-
-              <Section
-                title="Sources"
-                description="Byte offsets are record boundaries; a restart resumes at the last verified chunk."
-                className="mt-6"
-              >
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>Source</TableHead>
-                      <TableHead>State</TableHead>
-                      <TableHead className="text-right">Rows</TableHead>
-                      <TableHead className="text-right">Rejected</TableHead>
-                      <TableHead className="text-right">Chunks</TableHead>
-                      <TableHead className="text-right">Read</TableHead>
-                      <TableHead className="text-right">Segments</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {state.sources.map((source) => (
-                      <TableRow key={source.id}>
-                        <TableCell className="font-medium">{source.id}</TableCell>
-                        <TableCell>
-                          <StatusPill ok={source.complete} label={source.complete ? "complete" : "in progress"} />
-                        </TableCell>
-                        <TableCell className="text-right tabular">{source.rows.toLocaleString()}</TableCell>
-                        <TableCell className="text-right tabular">{source.rejected.toLocaleString()}</TableCell>
-                        <TableCell className="text-right tabular">{source.chunks}</TableCell>
-                        <TableCell className="text-right tabular">
-                          {formatBytes(source.sourceBytes)} / {formatBytes(source.size)}
-                        </TableCell>
-                        <TableCell className="text-right tabular">{source.segments.toLocaleString()}</TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </Section>
-
-              <Section
-                title="Controls"
-                description="Pause takes effect after the chunk currently being written. No control deletes anything."
-                className="mt-6"
-              >
-                <div className="flex flex-wrap gap-2">
-                  <Button variant="outline" className="gap-2" disabled={busy !== null} onClick={() => void preflight()}>
-                    <Cloud className="size-4" /> {busy === "preflight" ? "Checking…" : "Run preflight"}
-                  </Button>
-                  <Button variant="outline" className="gap-2" disabled={!state || busy !== null} onClick={() => void act("pause")}>
-                    <Pause className="size-4" /> Pause
-                  </Button>
-                  <Button variant="outline" className="gap-2" disabled={!state || busy !== null} onClick={() => void act("resume")}>
-                    <Play className="size-4" /> Resume
-                  </Button>
-                  <Button variant="outline" className="gap-2 text-destructive" disabled={!state || busy !== null} onClick={() => void act("abort")}>
-                    <Square className="size-4" /> Stop
-                  </Button>
-                  <Button variant="outline" className="gap-2" disabled={!state || busy !== null} onClick={() => void verify()}>
-                    <ShieldCheck className="size-4" /> {busy === "verify" ? "Verifying…" : "Verify segments"}
-                  </Button>
-                  <Button
-                    variant="outline"
-                    className="gap-2"
-                    disabled={!state || busy !== null || Boolean(control?.approvedFullRun)}
-                    onClick={() => void act("approve")}
-                  >
-                    <ShieldCheck className="size-4" /> {control?.approvedFullRun ? "Full run approved" : "Approve full run"}
-                  </Button>
-                  <Button
-                    variant="outline"
-                    className="gap-2"
-                    disabled={!state || busy !== null || !control?.approvedFullRun || !["pass1", "failed"].includes(state.stage)}
-                    onClick={() => void startFull()}
-                  >
-                    <Play className="size-4" /> {busy === "start-full" ? "Starting…" : "Start full Pass 1"}
-                  </Button>
-                </div>
-                {verifyOutput ? (
-                  <pre className="mt-3 max-h-56 overflow-auto rounded-md border border-border bg-muted/30 p-3 text-[11px] leading-5">{verifyOutput}</pre>
-                ) : null}
-                <p className="mt-3 text-xs text-muted-foreground">
-                  Last checkpoint: {state.checkpoint ? new Date(state.checkpoint.at).toLocaleString() : "none yet"} · full-run
-                  execution is disabled here and requires an approved forecast.
-                </p>
-                {state.errors.length ? (
-                  <div className="mt-3 space-y-1 text-xs text-destructive">
-                    {state.errors.slice(-3).map((entry, index) => (
-                      <p key={`${entry.at}-${index}`}>
-                        {entry.stage}: {entry.message}
-                      </p>
-                    ))}
-                  </div>
-                ) : null}
-              </Section>
-
-              <Section
-                title="Cloud Pass 2 and activation"
-                description="Merges the verified segments directly from R2, one partition at a time. The whole spool and the whole index are never on local disk, and the source objects are read-only."
-                className="mt-6"
-              >
-                {(() => {
-                  /*
-                   * A job used to sit at `stage: pass2` with the merge's last ETA for the
-                   * entire finalize and validation tail, so a healthy upload looked
-                   * stuck. The phase and its object counters are written by the engine;
-                   * they are rendered here as the progress they are, and no ETA is shown
-                   * for work that is request-bound rather than row-bound.
-                   */
-                  const pass2 = state.pass2;
-                  const phase = pass2?.phase ?? (pass2 ? "merge" : null);
-                  const merging = phase === "merge";
-                  return (
-                    <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-                      <StatCard
-                        label="Pass 2 merge"
-                        value={pass2 ? `${pass2.partitionsDone.toLocaleString()} / ${pass2.partitionsTotal.toLocaleString()}` : "—"}
-                        hint={
-                          !pass2
-                            ? "not started"
-                            : merging
-                              ? `${(state.rate.rowsPerSecond ?? 0).toLocaleString()} rows/s · ETA ${formatDuration(state.rate.etaSeconds)}`
-                              : "merge complete — not repeated on resume"
-                        }
-                        icon={<Layers className="size-4" />}
-                      />
-                      <StatCard
-                        label={phase === "validate" ? "Validation" : "Finalize"}
-                        value={
-                          phase === "finalize"
-                            ? `${(pass2?.finalizeDone ?? 0).toLocaleString()} / ${(pass2?.finalizeTotal ?? 0).toLocaleString()}`
-                            : phase === "validate" || phase === "complete"
-                              ? "done"
-                              : "—"
-                        }
-                        hint={
-                          phase === "validate"
-                            ? `${(pass2?.validationDone ?? 0).toLocaleString()} / ${(pass2?.validationTotal ?? 0).toLocaleString()} objects read back and checksummed`
-                            : phase === "finalize"
-                              ? "shards processed and written to R2 (empty shards write no object)"
-                              : phase === "complete"
-                                ? "manifest and validation report published"
-                                : "starts after the merge"
-                        }
-                        icon={<ShieldCheck className="size-4" />}
-                      />
-                      <StatCard
-                        label="Index in R2"
-                        value={formatBytes(pass2?.indexBytes)}
-                        hint={`${(pass2?.indexObjects ?? 0).toLocaleString()} objects · ${(pass2?.shardParts ?? 0).toLocaleString()} shard parts`}
-                        icon={<Database className="size-4" />}
-                      />
-                      <StatCard
-                        label="Estimated spend"
-                        value={`$${(state.accounting.estimatedUsd + state.accounting.containerUsd).toFixed(3)}`}
-                        hint={`R2 requests + container time · ${state.accounting.budgetUsd ? `budget $${state.accounting.budgetUsd} for the whole job · ` : ""}not a billing cap`}
-                        icon={<Timer className="size-4" />}
-                      />
-                    </div>
-                  );
-                })()}
-
-                <div className="mt-4 flex flex-wrap gap-2">
-                  <Button
-                    className="gap-2"
-                    disabled={busy !== null || !["pass1-complete", "pass2", "paused"].includes(state.stage)}
-                    onClick={() => void startPass2()}
-                  >
-                    <Cloud className="size-4" /> {busy === "pass2" ? "Starting…" : "Start / resume Cloud Pass 2"}
-                  </Button>
-                  <Button
-                    variant="outline"
-                    className="gap-2"
-                    disabled={busy !== null || state.stage !== "complete" || state.mode !== "full"}
-                    onClick={() => void activate()}
-                  >
-                    <ShieldCheck className="size-4" /> {busy === "activate" ? "Activating…" : "Activate completed version"}
-                  </Button>
-                </div>
-                <p className="mt-3 text-xs text-muted-foreground">
-                  {state.mode !== "full"
-                    ? "This job is a bounded benchmark: it can build and verify an index, but activation is refused."
-                    : "Activation re-checks the uploaded manifest and validation report in R2. A Pass 2 resumed after its merge continues at finalization: the 16 partition merge is not repeated, and every output is written idempotently, so nothing is duplicated."}
-                </p>
-                {state.errors.length ? (
-                  <div className="mt-3 space-y-1 text-xs text-destructive">
-                    {state.errors.slice(-3).map((entry, index) => (
-                      <p key={`p2-${entry.at}-${index}`}>
-                        {entry.stage}: {entry.message}
-                      </p>
-                    ))}
-                  </div>
-                ) : null}
-              </Section>
-
-            </>
+          {job ? (
+            <JobDetail
+              job={job}
+              control={control}
+              run={run}
+              warning={warning}
+              busy={busy}
+              verifyOutput={verifyOutput}
+              onAction={(action) => void act(action)}
+              onVerify={() => void verify()}
+              onPreflight={() => void preflight()}
+              onStartFull={() => void startFull()}
+              onStartPass2={() => void startPass2()}
+              onActivate={() => void activate()}
+            />
           ) : null}
         </>
       )}
