@@ -78,7 +78,9 @@ describe("staging Worker configuration", () => {
 
 describe("the combined job budget is wired through every layer", () => {
   test("one variable name, no per-stage allowance left behind", () => {
-    expect(production).toContain('CLOUD_JOB_BUDGET_USD = "30"');
+    // The operator's $50 objective: the swarm's hard gate pauses at $50, so the
+    // single-job budget must not be lower (or higher) than the same number.
+    expect(production).toContain('CLOUD_JOB_BUDGET_USD = "50"');
     expect(production).not.toMatch(/^\s*CLOUD_BUDGET_USD\s*=/m);
     expect(staging).not.toMatch(/^\s*CLOUD_BUDGET_USD\s*=/m);
     expect(envTypes).toMatch(/CLOUD_JOB_BUDGET_USD\?: string/);

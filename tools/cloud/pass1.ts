@@ -594,7 +594,14 @@ function progressOf(checkpoint: SourceCheckpoint): Pick<
   };
 }
 
-async function ensureSchema(store: BlobStore, version: string, sources: Pass1SourceSpec[]): Promise<SpoolSchema> {
+/**
+ * Build (or read) the spool schema for a version.
+ *
+ * Exported because the swarm's range tasks need the identical schema: the spool
+ * format is positional (`schema.sources[i]` belongs to `sources[i]`), so a range
+ * task that invented its own mapping would write rows Pass 2 cannot merge.
+ */
+export async function ensureSchema(store: BlobStore, version: string, sources: Pass1SourceSpec[]): Promise<SpoolSchema> {
   const existing = await store.getJson<SpoolSchema>(cloudKeys.schema(version));
   if (existing) return existing;
   const schema: SpoolSchema = { format: SPOOL_FORMAT_VERSION, sources: [] };

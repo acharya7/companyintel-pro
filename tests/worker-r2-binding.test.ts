@@ -36,15 +36,19 @@ const envTypes = readFileSync(join(root, "worker/src/env.d.ts"), "utf8");
 const workerFiles = walk(join(root, "worker")).filter((path) => path.endsWith(".ts"));
 const workerSource = workerFiles.map((path) => readFileSync(path, "utf8")).join("\n");
 /**
- * The container DO is the one deliberate exception: a Cloudflare Container has no R2
- * binding, so it receives the S3 credentials through `container.start({ env })`.
- * Everything else in `worker/` must stay free of them — asserted below.
+ * The two container bridges are the deliberate exception: a Cloudflare Container has
+ * no R2 binding, so it receives the S3 credentials through `container.start({ env })`.
+ * `indexer-container.ts` owns the single-job container and the direct R2 scan;
+ * `indexer-worker.ts` owns one swarm worker container. Everything else in `worker/`
+ * must stay free of them — asserted below.
  */
 const containerBridge = readFileSync(join(root, "worker/src/indexer-container.ts"), "utf8");
+const workerBridge = readFileSync(join(root, "worker/src/indexer-worker.ts"), "utf8");
+const BRIDGE_FILES = ["indexer-container.ts", "indexer-worker.ts"];
 const workerSourceExceptContainer = workerFiles
   // `env.d.ts` only declares the container-only secret names; runtime source is
   // what must never read them.
-  .filter((path) => !path.endsWith("indexer-container.ts") && !path.endsWith("env.d.ts"))
+  .filter((path) => !BRIDGE_FILES.some((name) => path.endsWith(name)) && !path.endsWith("env.d.ts"))
   .map((path) => readFileSync(path, "utf8"))
   .join("\n");
 
@@ -71,16 +75,18 @@ describe("the Worker code never uses S3 credentials", () => {
     expect(workerSourceExceptContainer).not.toContain("cloudflarestorage.com");
   });
 
-  test("the container bridge forwards credentials but never reads or exposes them", () => {
+  test("both container bridges forward credentials but never read or expose them", () => {
     // The names may appear only as `env.X = this.env.X` on the start call.
-    expect(containerBridge).not.toContain("cloudflarestorage.com");
-    expect(containerBridge).not.toContain("R2Client");
-    expect(containerBridge).not.toContain("console.log");
-    for (const name of ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]) {
-      const occurrences = containerBridge.split(name).length - 1;
-      expect(occurrences).toBe(3); // `if (this.env.X) env.X = this.env.X;`
+    for (const bridge of [containerBridge, workerBridge]) {
+      expect(bridge).not.toContain("cloudflarestorage.com");
+      expect(bridge).not.toContain("R2Client");
+      expect(bridge).not.toContain("console.log");
+      for (const name of ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]) {
+        const occurrences = bridge.split(name).length - 1;
+        expect(occurrences).toBe(3); // `if (this.env.X) env.X = this.env.X;`
+      }
+      expect(bridge).toContain("container.start({ enableInternet: true, env");
     }
-    expect(containerBridge).toContain("container.start({ enableInternet: true, env");
   });
 
   test("the Worker uses the binding and declares it in its Env type", () => {

@@ -33,11 +33,22 @@
 import { app } from "./app";
 import { indexingAdmin } from "./indexer-admin";
 import { IndexerContainer, type EnvWithContainer } from "./indexer-container";
+import { IndexerWorker, type WorkerEnv } from "./indexer-worker";
+import { IndexingCoordinator } from "./indexing-coordinator";
 
-export { IndexerContainer };
+/*
+ * Durable Object classes must be exported by the Worker that declares them.
+ *
+ *   IndexerContainer    the single-job container (legacy path and direct R2 scans)
+ *   IndexerWorker       one container per swarm worker (16 identities)
+ *   IndexingCoordinator the swarm's task table, leases, phases and budget
+ */
+export { IndexerContainer, IndexerWorker, IndexingCoordinator };
+
+type AppEnv = EnvWithContainer & WorkerEnv;
 
 export default {
-  fetch(request: Request, env: EnvWithContainer, ctx: ExecutionContext): Response | Promise<Response> {
+  fetch(request: Request, env: AppEnv, ctx: ExecutionContext): Response | Promise<Response> {
     const path = new URL(request.url).pathname;
     // The indexing control plane (mounted with basePath `/api/cloud`).
     if (path === "/api/cloud" || path.startsWith("/api/cloud/")) {
@@ -48,4 +59,4 @@ export default {
     // to the SPA shell for non-API paths.
     return app.fetch(request, env, ctx);
   },
-} satisfies ExportedHandler<EnvWithContainer>;
+} satisfies ExportedHandler<AppEnv>;

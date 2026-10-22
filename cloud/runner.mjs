@@ -70,6 +70,11 @@ const ALLOWED_COMMANDS = new Set([
   // Bounded direct R2 search (REAL DATA level 3). The command is resumable and
   // writes the same `cloud/jobs/<id>/` heartbeat the keep-alive alarm inspects.
   "scan",
+  // Swarm tasks. These process ONE block or ONE byte range of one source, so a
+  // container's whole job is a few minutes of work that the coordinator leases out;
+  // they never touch the single-job state (`/task` below, not `/job`).
+  "blocks",
+  "range",
 ]);
 
 /** The CLI is present only when the image was copied correctly. */
@@ -84,6 +89,9 @@ function cliPresent() {
 /** In-flight or last finished detached job, for readiness/diagnostics. */
 let active = null;
 let lastJob = null;
+/** In-flight or last finished SWARM task (`/task`), kept apart from the single job. */
+let taskActive = null;
+let taskLast = null;
 /** True while a detached start is inside its settle window (before `active` exists). */
 let starting = false;
 /** Set by the first stop signal; a second one exits immediately. */
@@ -363,6 +371,75 @@ const server = createServer(async (request, response) => {
     // handler below forwards the signal so the CLI exits at a chunk boundary instead
     // of being killed mid-write.
     return;
+  }
+
+  /*
+   * Swarm task routes.
+   *
+   * A swarm worker asks for one block scan or one byte range at a time. These are
+   * kept apart from `/job` on purpose: `/job` owns the single-container job record
+   * (state.json, run.json, the keep-alive alarm), and a range task must not be able
+   * to relabel the whole job as failed. The runner only reports process facts here —
+   * rows and checksums are read from R2 by the Durable Object that owns the task.
+   */
+  if (url.pathname === "/task" && request.method === "POST") {
+    let body;
+    try {
+      body = await readBody(request);
+    } catch {
+      return json(response, 400, { error: "invalid JSON body" });
+    }
+    const args = Array.isArray(body.args) ? body.args.map(String) : [];
+    if (!ALLOWED_COMMANDS.has(args[0])) {
+      return json(response, 400, { error: `args[0] must be one of ${[...ALLOWED_COMMANDS].join(", ")}` });
+    }
+    if (!cliPresent()) {
+      return json(response, 503, {
+        error: { code: "cli_missing", message: `The indexing CLI is missing at ${cliPath} (root ${root}).` },
+        root,
+        cli: cliPath,
+      });
+    }
+    if (active || starting || taskActive) {
+      return json(response, 409, {
+        error: { code: "task_already_running", message: "This container is already running a task." },
+        task: taskActive ?? { args: ["(starting)"] },
+      });
+    }
+
+    const running = spawnCli(args);
+    starting = true;
+    let outcome;
+    try {
+      outcome = await settle(running);
+    } finally {
+      starting = false;
+    }
+    if (outcome.kind === "running") {
+      const task = { pid: running.child.pid ?? null, args, startedAt: new Date().toISOString(), running: true, exitCode: null, signal: null, stderr: "" };
+      taskActive = task;
+      running.child.once("exit", (code, signal) => {
+        taskActive = null;
+        taskLast = { ...task, running: false, exitCode: code, signal, stderr: running.tail.text.slice(-1500) };
+        console.log(`[task] exited code ${code ?? "null"} signal ${signal ?? "none"} after ${args.slice(0, 3).join(" ")}`);
+      });
+      return json(response, 202, { started: true, pid: task.pid, args, root });
+    }
+    if (outcome.kind === "exited" && outcome.code === 0) {
+      taskLast = { pid: running.child.pid ?? null, args, startedAt: new Date().toISOString(), running: false, exitCode: 0, signal: null, stderr: outcome.stderr ?? "" };
+      return json(response, 200, { started: false, completed: true, exitCode: 0, args });
+    }
+    const detail = outcome.kind === "spawn-error" ? outcome.message : `exit code ${outcome.code ?? "null"}`;
+    const stderr = (outcome.stderr ?? "").trim().slice(-1000);
+    taskLast = { pid: null, args, startedAt: new Date().toISOString(), running: false, exitCode: outcome.code ?? null, signal: outcome.signal ?? null, stderr };
+    return json(response, 500, {
+      error: { code: "task_failed_to_start", message: `The task ${args.join(" ")} failed to start: ${detail}.`, detail: stderr || undefined },
+      args,
+    });
+  }
+
+  if (url.pathname === "/task" && request.method === "GET") {
+    return json(response, 200, { task: taskActive ?? taskLast });
   }
 
   json(response, 404, { error: "not found" });

@@ -41,6 +41,7 @@ import {
 import { verifyAccess, AccessError } from "./access";
 import type { AccessIdentity } from "./env";
 import type { EnvWithContainer } from "./indexer-container";
+import { swarmRoutes } from "./swarm-admin";
 
 type AdminContext = Context<{ Bindings: EnvWithContainer; Variables: { identity: AccessIdentity } }>;
 
@@ -77,6 +78,13 @@ indexingAdmin.use("*", async (c, next) => {
   c.set("identity", identity);
   await next();
 });
+
+/**
+ * Parallel indexing (16 containers). Mounted here so it inherits this router's
+ * Access verification and admin allowlist — a separate Hono app would need a second
+ * copy of the authorisation code, and a second copy is a second place to get it wrong.
+ */
+indexingAdmin.route("/swarm", swarmRoutes);
 
 /**
  * Unmatched `/api/cloud/…` paths are JSON errors too.

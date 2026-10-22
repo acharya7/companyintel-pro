@@ -145,8 +145,16 @@ describe("Static-asset routing configuration", () => {
       }
       expect(source).toMatch(/binding\s*=\s*"COMPANY_DATA"/);
       expect(source).toMatch(/bucket_name\s*=\s*"company-intel-data"/);
+      // Production declares the 16-worker swarm container AND keeps the single-job
+      // container; staging keeps only the latter, at one instance.
+      if (file === "wrangler.toml") {
+        expect(source).toMatch(/class_name\s*=\s*"IndexerWorker"/);
+        expect(source).toMatch(/instance_type\s*=\s*"standard-2"/);
+        expect(source).toMatch(/max_instances\s*=\s*16/);
+      } else {
+        expect(source).toMatch(/max_instances\s*=\s*1/);
+      }
       expect(source).toMatch(/class_name\s*=\s*"IndexerContainer"/);
-      expect(source).toMatch(/max_instances\s*=\s*1/);
       expect(source).toMatch(/^CLOUD_JOB_BUDGET_USD\s*=\s*"\d+"$/m);
       // And the Worker still gates every API route on the Access JWT.
       expect(readFileSync(join(root, "worker/src/app.ts"), "utf8")).toContain('app.use("/api/*"');

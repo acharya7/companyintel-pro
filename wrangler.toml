@@ -53,16 +53,49 @@ binding = "COMPANY_DATA"
 bucket_name = "company-intel-data"
 
 # ---------------------------------------------------------------------------
-# Indexing container (Cloudflare Containers + its Durable Object).
+# Parallel indexing: 16 × standard-2 containers.
+#
+# `standard-2` = 1 vCPU, 6 GiB RAM, 12 GB ephemeral disk. 16 of them give 16 vCPU,
+# 96 GiB RAM and 192 GB of provisioned disk, which is the authorised ceiling for the
+# full 64.26 GB corpus. Do not raise `max_instances` or the instance class without a
+# separate decision — that is the operator's spending gate, not a tuning knob.
+#
+# IMPORTANT: `max_instances` is only an UPPER BOUND. It does not create instances, and
+# a namespace addressed by one name (`idFromName("indexer")`) still yields exactly one
+# container. The 16 concurrent containers come from 16 distinct Durable Object
+# identities — `indexer-worker-00` … `indexer-worker-15` — each of which is this
+# `IndexerWorker` class (see worker/src/indexer-worker.ts). Getting this wrong is the
+# difference between 16 workers and one worker that appears 16 times in a config.
 #
 # `wrangler deploy` builds ./Dockerfile with Docker and pushes it to Cloudflare's
-# managed registry; Docker (or a compatible CLI) must be running. The container has
-# no public route: the Worker reaches it only through the `INDEXER_CONTAINER`
-# Durable Object binding, and every admin request is checked by Cloudflare Access.
+# managed registry, so a deploy needs Docker or Workers Builds. Containers have no
+# public route: the Worker reaches them only through their Durable Object, and every
+# control-plane request is verified by Cloudflare Access.
+# ---------------------------------------------------------------------------
+[[containers]]
+class_name = "IndexerWorker"
+image = "./Dockerfile"
+instance_type = "standard-2"
+max_instances = 16
+
+[[durable_objects.bindings]]
+name = "INDEXER_WORKER"
+class_name = "IndexerWorker"
+
+# The durable swarm coordinator. One instance (`idFromName("swarm")`) holds the task
+# table for the whole run: block scans, ranges, the merge task, leases and budget.
+[[durable_objects.bindings]]
+name = "INDEXING_COORDINATOR"
+class_name = "IndexingCoordinator"
+
+# ---------------------------------------------------------------------------
+# Single-job container (legacy path + bounded direct R2 scans).
 #
 # `standard-1` = 0.5 vCPU, 4 GiB RAM, 8 GB ephemeral disk. That is enough because
 # Cloud Pass 2 materialises ONE partition (tens of MB with 256 partitions) and
 # streams it back to R2; the ~23 GB spool and ~20 GB index never touch this disk.
+# Kept so the existing `/indexing` job controls and the REAL DATA source scan keep
+# working unchanged while the swarm handles full-corpus indexing.
 # ---------------------------------------------------------------------------
 [[containers]]
 class_name = "IndexerContainer"
@@ -78,16 +111,21 @@ class_name = "IndexerContainer"
 tag = "v1-indexer-container"
 new_sqlite_classes = ["IndexerContainer"]
 
+[[migrations]]
+tag = "v2-swarm"
+new_sqlite_classes = ["IndexerWorker", "IndexingCoordinator"]
+
 [vars]
 ENVIRONMENT = "production"
 APP_VERSION = "0.1.0"
 # Per-identity API rate limit (requests per minute per route group).
 MAX_SEARCHES_PER_MINUTE = "180"
-# ONE budget for the whole indexing job, Pass 1 and Pass 2 together. Either stage
-# pauses at its next durable boundary (chunk / partition batch) when the combined
-# running estimate reaches it. It is not a hard billing cap (storage and
-# post-snapshot requests are excluded); pause/abort remain authoritative.
-CLOUD_JOB_BUDGET_USD = "30"
+# ONE budget for the whole indexing job and for the 16-worker swarm. Either stage
+# pauses at its next durable boundary (chunk / partition batch / range) when the
+# combined running estimate reaches it. The swarm applies the operator's gates on
+# top: warn at $40, no new claims at $45, pause at $50. It is not a hard billing cap
+# (storage and post-snapshot requests are excluded); pause/abort remain authoritative.
+CLOUD_JOB_BUDGET_USD = "50"
 
 # Search hydration dial: company profile partitions read per search. Each read
 # costs ~25 KB, so this is the query's byte ceiling (see docs/architecture.md).

@@ -37,8 +37,10 @@ import {
 } from "../../src/shared/cloud/types";
 
 import { assembleRun } from "./assemble";
+import { scanBlock } from "./blocks";
 import { forecast, type BenchmarkMeasurement } from "./cost";
 import { cloudSourcesFromConfig, runPass1, syncStateFromCheckpoints, verifyRun } from "./pass1";
+import { runRange } from "./range";
 import { runCloudPass2 } from "./pass2";
 import { R2BlobStore } from "./store";
 import { runScan } from "../realdata/scan";
@@ -671,6 +673,76 @@ async function scan(store: R2BlobStore): Promise<void> {
   if (!result.status.complete) process.exitCode = 2;
 }
 
+/**
+ * Scan one alignment block and print its descriptor.
+ *
+ * The coordinator needs nothing from stdout — it reads the descriptor object this
+ * command writes — but the container log is the only place an operator can see why a
+ * block was slow, so the summary is printed too.
+ */
+async function blocksCommand(store: R2BlobStore): Promise<void> {
+  const { config } = loadConfig();
+  const id = version();
+  const sources = cloudSourcesFromConfig(config);
+  const sourceId = flag("source");
+  if (typeof sourceId !== "string") throw new Error("--source <sourceId> is required.");
+  const source = sources.find((entry) => entry.id === sourceId);
+  if (!source) throw new Error(`No source ${sourceId} in the config (have ${sources.map((entry) => entry.id).join(", ")}).`);
+  const index = num("block");
+  if (index === null || index < 0) throw new Error("--block <n> is required.");
+  const blockMb = num("block-mb") ?? 64;
+
+  const head = await store.head(source.key);
+  if (!head.exists || head.size === null) throw new Error(`Source ${source.id} is missing at ${source.key}.`);
+  const descriptor = await scanBlock({
+    store,
+    version: id,
+    sourceId: source.id,
+    key: source.key,
+    size: head.size,
+    index,
+    blockBytes: Math.round(blockMb * 1024 * 1024),
+  });
+  console.log(JSON.stringify({ sourceId: source.id, ...descriptor }));
+}
+
+/**
+ * Process one byte range into Pass 1 compatible segment objects.
+ *
+ * `--start` and `--end` are record boundaries picked by the coordinator. Passing
+ * them explicitly (rather than a range ordinal) means a retried task is identical
+ * to the first attempt: the same keys are overwritten with the same bytes.
+ */
+async function rangeCommand(store: R2BlobStore): Promise<void> {
+  const { config } = loadConfig();
+  const id = version();
+  const sources = cloudSourcesFromConfig(config);
+  const sourceId = flag("source");
+  if (typeof sourceId !== "string") throw new Error("--source <sourceId> is required.");
+  const index = num("range");
+  if (index === null || index < 0) throw new Error("--range <n> is required.");
+  const start = num("start");
+  const end = num("end");
+  if (start === null || end === null) throw new Error("--start <bytes> and --end <bytes> are required.");
+  const partitions = num("partitions") ?? 256;
+  const baseLine = num("base-line") ?? 1;
+
+  const result = await runRange({
+    store,
+    version: id,
+    sources,
+    sourceId,
+    partitions,
+    index,
+    start,
+    end,
+    baseLine,
+    verifySegments: flag("no-verify") !== true,
+    onLog: (line) => console.log(`  ${line}`),
+  });
+  console.log(JSON.stringify(result));
+}
+
 async function main(): Promise<void> {
   const command = process.argv[2];
   if (!command || command === "--help" || command === "help") {
@@ -690,6 +762,10 @@ async function main(): Promise<void> {
         "  assemble  --version <id> [--work-dir <dir>] [--partitions <n>]",
         "  scan      --version scan-<id> --query <text> [--kind companies|contacts|both] [--max-mb 48] [--max-seconds 180] [--limit 50] [--dataset-version <id>]",
         "",
+        "Swarm tasks (one block or one byte range; leased by the indexing coordinator):",
+        "  blocks    --version <id> --source <sourceId> --block <n> [--block-mb 64]",
+        "  range     --version <id> --source <sourceId> --range <n> --start <bytes> --end <bytes> --base-line <n> [--partitions 256] [--no-verify]",
+        "",
         "Sources must be r2://<bucket>/<key>; the bucket comes from the credentials.",
       ].join("\n"),
     );
@@ -704,6 +780,8 @@ async function main(): Promise<void> {
   if (command === "verify") return verify(store);
   if (command === "assemble") return assemble(store);
   if (command === "scan") return scan(store);
+  if (command === "blocks") return blocksCommand(store);
+  if (command === "range") return rangeCommand(store);
   if (command === "pass2") return pass2(store);
   if (command === "interrupt") return interrupt(store);
   if (command === "pause" || command === "resume" || command === "abort" || command === "approve") return control(store, command);

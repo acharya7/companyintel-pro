@@ -30,8 +30,16 @@ const dockerfile = readFileSync(join(root, "Dockerfile"), "utf8");
 const cloudDockerfile = readFileSync(join(root, "cloud", "Dockerfile"), "utf8");
 
 describe("Cloudflare Containers deployment config", () => {
-  test("declares the container, its Durable Object and the migration", () => {
+  test("declares the 16-worker swarm container, its Durable Objects and the migrations", () => {
     expect(config).toContain("[[containers]]");
+    // The swarm: 16 × standard-2, reached through 16 distinct DO identities.
+    expect(config).toMatch(/class_name\s*=\s*"IndexerWorker"/);
+    expect(config).toMatch(/instance_type\s*=\s*"standard-2"/);
+    expect(config).toMatch(/max_instances\s*=\s*16/);
+    expect(config).toMatch(/name\s*=\s*"INDEXER_WORKER"/);
+    expect(config).toMatch(/name\s*=\s*"INDEXING_COORDINATOR"/);
+    expect(config).toMatch(/new_sqlite_classes\s*=\s*\["IndexerWorker", "IndexingCoordinator"\]/);
+    // The single-job container is preserved for the legacy path and R2 scans.
     expect(config).toMatch(/class_name\s*=\s*"IndexerContainer"/);
     expect(config).toMatch(/image\s*=\s*"\.\/Dockerfile"/);
     expect(config).toMatch(/instance_type\s*=\s*"standard-1"/);
@@ -40,8 +48,8 @@ describe("Cloudflare Containers deployment config", () => {
     expect(config).toMatch(/new_sqlite_classes\s*=\s*\["IndexerContainer"\]/);
   });
 
-  test("the Worker exports the container class and routes the admin API", () => {
-    expect(entry).toContain("export { IndexerContainer }");
+  test("the Worker exports the container classes and routes the admin API", () => {
+    expect(entry).toContain("export { IndexerContainer, IndexerWorker, IndexingCoordinator }");
     expect(entry).toContain('path.startsWith("/api/cloud/")');
     expect(entry).toContain("indexingAdmin.fetch");
     expect(container).toContain("implements DurableObject");

@@ -46,8 +46,17 @@ export interface Env {
    * empty, `ALLOWED_EMAILS` is used, because Access is already the outer gate.
    */
   INDEXING_ADMIN_EMAILS?: string;
-  /** Durable Object namespace that owns the indexing container (see wrangler.toml). */
+  /** Durable Object namespace that owns the single-job indexing container (see wrangler.toml). */
   INDEXER_CONTAINER?: DurableObjectNamespace;
+  /**
+   * Parallel indexing: one Container-backed Durable Object per worker
+   * (`indexer-worker-00` … `indexer-worker-15`, 16 distinct `idFromName` identities).
+   * 16 concurrent containers come from these identities, NOT from `max_instances`
+   * alone — that number is only an upper bound.
+   */
+  INDEXER_WORKER?: DurableObjectNamespace;
+  /** The durable swarm coordinator: task table, leases, phases, budget. */
+  INDEXING_COORDINATOR?: DurableObjectNamespace;
   /**
    * R2 S3 credentials FOR THE CONTAINER ONLY (set with `wrangler secret put`).
    *
