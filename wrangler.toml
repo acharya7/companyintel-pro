@@ -125,12 +125,15 @@ ENVIRONMENT = "production"
 APP_VERSION = "0.1.0"
 # Per-identity API rate limit (requests per minute per route group).
 MAX_SEARCHES_PER_MINUTE = "180"
-# ONE budget for the whole indexing job and for the 16-worker swarm. Either stage
-# pauses at its next durable boundary (chunk / partition batch / range) when the
-# combined running estimate reaches it. The swarm applies the operator's gates on
-# top: warn at $40, no new claims at $45, pause at $50. It is not a hard billing cap
-# (storage and post-snapshot requests are excluded); pause/abort remain authoritative.
-CLOUD_JOB_BUDGET_USD = "50"
+# ONE budget ceiling for the whole indexing job and for the swarm, and the ONLY place
+# the spending gates are configured. The swarm derives warn/soft/hard from it as
+# 80% / 90% / 100% ($400 / $450 / $500 here) and the coordinator reads it live, so a
+# value change lifts the gates of an already-planned run without re-planning it.
+# Either stage pauses at its next durable boundary (chunk / partition batch / range)
+# when the combined running estimate reaches the ceiling. It is not a hard billing
+# cap (storage and post-snapshot requests are excluded); pause/abort remain
+# authoritative, and platform billing safeguards are untouched.
+CLOUD_JOB_BUDGET_USD = "500"
 
 # Search hydration dial: company profile partitions read per search. Each read
 # costs ~25 KB, so this is the query's byte ceiling (see docs/architecture.md).
@@ -142,6 +145,18 @@ SEARCH_MAX_HYDRATE = "16"
 # scan. A request can lower it, never raise it. 48 MiB is a few seconds of ranged
 # reads and a fraction of a cent; increase deliberately, never automatically.
 REALDATA_SCAN_MAX_MB = "48"
+
+# ---------------------------------------------------------------------------
+# Swarm maintenance cron.
+#
+# A full-corpus run lasts hours. Every other minute this re-pumps the authorised
+# fleet (so a fleet the platform reclaimed comes back) and requeues tasks parked by
+# an ENVIRONMENTAL failure only — an R2 502, "no container instance", a ready
+# timeout. Deterministic failures are never retried by the cron; the attempt budget
+# and the operator's pause/abort stay authoritative.
+# ---------------------------------------------------------------------------
+[triggers]
+crons = ["*/2 * * * *"]
 
 # ---------------------------------------------------------------------------
 # Observability: keep logs; no payload logging of private contact data.

@@ -46,6 +46,8 @@ export interface AccessClaims {
   email?: string;
   sub?: string;
   type?: string;
+  /** Present on service-token assertions instead of `email`. */
+  common_name?: string;
 }
 
 export class AccessError extends Error {
@@ -257,6 +259,23 @@ export async function verifyAccess(request: Request, env: Env): Promise<AccessId
       jwks = await loadJwks(teamDomain, true);
       const claims = await verifyAccessToken({ token, jwks, audience, issuer: issuerFor(teamDomain), allowedEmails });
       return { email: (claims.email ?? "").toLowerCase(), sub: claims.sub ?? "unknown", source: "access" };
+    }
+    // Access SERVICE TOKENS are issued to an application, not a person, so they carry
+    // no `email` claim (type "app"). They are still fully signature/issuer/audience
+    // verified above and can only be minted by an Access policy that lists them, so
+    // they authenticate as `service-token:<common_name>` — never as a person.
+    if (error instanceof AccessError && error.message.includes("no email claim")) {
+      const claims = await verifyAccessToken({
+        token,
+        jwks,
+        audience,
+        issuer: issuerFor(teamDomain),
+        allowedEmails,
+        requireEmail: false,
+      });
+      if (claims.type !== "app") throw error;
+      const name = (claims as AccessClaims & { common_name?: string }).common_name?.trim() || "unnamed";
+      return { email: `service-token:${name}`.toLowerCase(), sub: claims.sub ?? name, source: "access" };
     }
     throw error;
   }

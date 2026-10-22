@@ -1,0 +1,27 @@
+# TEMPORARY headless control channel (see ops/worker.ts). Deployed only while the
+# production swarm is being driven from a machine that cannot complete a Cloudflare
+# Access login, and deleted immediately afterwards.
+name = "companyintel-ops"
+main = "worker.ts"
+compatibility_date = "2025-09-01"
+workers_dev = true
+
+# Cross-script bindings to the production Durable Objects: the pipeline lives in
+# `companyintel`; this script only forwards control calls to it.
+[[durable_objects.bindings]]
+name = "COORD"
+class_name = "IndexingCoordinator"
+script_name = "companyintel"
+
+[[durable_objects.bindings]]
+name = "WORKER"
+class_name = "IndexerWorker"
+script_name = "companyintel"
+
+[vars]
+OPS_SECRET = "b8c0d1e2f3a4958671b2c3d4e5f60718a9b0c1d2e3f405162738495a6b7c8d9e"
+
+[[durable_objects.bindings]]
+name = "LEGACY"
+class_name = "IndexerContainer"
+script_name = "companyintel"

@@ -40,6 +40,8 @@ import {
   SWARM_WORKER_DEFAULT,
   budgetLevel,
   planSourceRanges,
+  isTransientTaskError,
+  swarmBudgetCeiling,
   swarmCost,
   swarmShardTasks,
   swarmTaskId,
@@ -63,6 +65,15 @@ import { planRefBases, type RefAllocation } from "../../src/shared/cloud/ref-spa
 
 export interface CoordinatorEnv {
   COMPANY_DATA: R2Bucket;
+  /** Forwarded to every container this coordinator's workers start. */
+  R2_ACCOUNT_ID?: string;
+  R2_ACCESS_KEY_ID?: string;
+  R2_SECRET_ACCESS_KEY?: string;
+  /**
+   * The authorised spend ceiling for this run (USD). The deployment sets it, so the
+   * warn/soft/hard gates scale with it instead of being compiled in at $40/$45/$50.
+   */
+  CLOUD_JOB_BUDGET_USD?: string;
 }
 
 interface Counters {
@@ -171,6 +182,19 @@ export class IndexingCoordinator implements DurableObject {
           return json(await this.control("aborted", "aborted by operator"));
         case "POST /workers":
           return json(await this.setWorkers(await readBody(request)));
+        case "POST /retry-parked":
+          return json(await this.retryParked(await readBody(request)));
+        case "GET /diagnostics":
+          // Presence only — never a value. A container that reports "credentials must be
+          // set together" needs the operator to know WHICH binding is missing.
+          return json({
+            r2AccountId: Boolean(this.env.R2_ACCOUNT_ID),
+            r2AccessKeyId: Boolean(this.env.R2_ACCESS_KEY_ID),
+            r2SecretAccessKey: Boolean(this.env.R2_SECRET_ACCESS_KEY),
+            r2AccessKeyIdLength: this.env.R2_ACCESS_KEY_ID?.length ?? 0,
+            r2SecretAccessKeyLength: this.env.R2_SECRET_ACCESS_KEY?.length ?? 0,
+            budgetUsd: this.env.CLOUD_JOB_BUDGET_USD ?? null,
+          });
         case "GET /status":
           return json(await this.status());
         case "GET /ranges":
@@ -527,6 +551,65 @@ export class IndexingCoordinator implements DurableObject {
       );
     }
     return reclaimed;
+  }
+
+  /**
+   * Put PARKED tasks back on the queue, with a full retry budget.
+   *
+   * Parking is terminal on purpose: a task whose lease expired SWARM.maxAttempts
+   * times is not retried forever. But parking must not be the last word when the
+   * cause was environmental — a container that could not reach R2 fails every task it
+   * claims within a second, and those tasks were never given a fair attempt. This is
+   * the operator's "fix the cause, then retry the work" control: it resets attempts
+   * and re-enqueues only tasks that are currently parked, so completed work is
+   * untouched and nothing already in flight is claimed twice.
+   */
+  private async retryParked(body: {
+    kind?: SwarmTaskKind;
+    limit?: number;
+    transientOnly?: boolean;
+  }): Promise<{ kinds: SwarmTaskKind[]; requeued: number; parkedRemaining: number }> {
+    const plan = await this.requirePlan();
+    const counters = await this.counters();
+    const all: SwarmTaskKind[] = ["block", "range", "merge_partition", "assemble_shard", "finalize", "merge"];
+    const kinds = body.kind ? [body.kind] : all;
+    const limit = Number.isFinite(body.limit) ? Math.max(1, Math.min(4096, Number(body.limit))) : 4096;
+    let requeued = 0;
+    let unparked = 0;
+
+    for (const kind of kinds) {
+      if (requeued >= limit) break;
+      const ids = await this.taskIdsForKind(kind, plan, counters);
+      for (let offset = 0; offset < ids.length && requeued < limit; offset += 128) {
+        const slice = ids.slice(offset, offset + 128);
+        const batch = await this.state.storage.get<SwarmTask>(slice.map((id) => KEYS.task(id)));
+        for (const id of slice) {
+          const task = batch.get(KEYS.task(id));
+          if (!task || task.state !== "parked") continue;
+          if (body.transientOnly && !isTransientTaskError(task.error)) continue;
+          await this.state.storage.put(KEYS.task(id), {
+            ...task,
+            state: "pending",
+            attempts: 0,
+            leaseOwner: undefined,
+            leaseUntil: undefined,
+            error: undefined,
+          } satisfies SwarmTask);
+          await this.enqueue(id, kind);
+          requeued += 1;
+          unparked += 1;
+          if (requeued >= limit) break;
+        }
+      }
+    }
+
+    if (unparked) {
+      await this.state.storage.put(KEYS.counters, {
+        ...(await this.counters()),
+        parked: Math.max(0, (await this.counters()).parked - unparked),
+      });
+    }
+    return { kinds, requeued, parkedRemaining: (await this.counters()).parked };
   }
 
   /** Is there anything left of this kind for the current plan? */
@@ -1244,6 +1327,9 @@ export class IndexingCoordinator implements DurableObject {
       classB: raw.classB,
       bytesWritten: raw.bytesWritten,
     });
+    // The deployment's ceiling wins over the plan's: raising CLOUD_JOB_BUDGET_USD lifts
+    // the gates of a run that was planned at a lower ceiling, without re-planning it.
+    const ceiling = swarmBudgetCeiling(this.env.CLOUD_JOB_BUDGET_USD, plan.budgetUsd);
     return {
       containerSeconds: Math.round(raw.containerSeconds),
       containerUsd: round(cost.containerUsd),
@@ -1253,24 +1339,24 @@ export class IndexingCoordinator implements DurableObject {
       bytesWritten: raw.bytesWritten,
       r2Usd: round(cost.r2Usd),
       estimatedUsd: round(cost.estimatedUsd),
-      budgetUsd: plan.budgetUsd,
-      level: budgetLevel(cost.estimatedUsd, plan.budgetUsd),
+      budgetUsd: ceiling,
+      level: budgetLevel(cost.estimatedUsd, ceiling),
     };
   }
 
   /** The stop signal a caller should honour, or null when work may proceed. */
   private async stopFor(stage: SwarmStage, plan: SwarmPlan): Promise<string | null> {
     if (stage === "paused" || stage === "aborted" || stage === "complete" || stage === "failed") return stage;
-    const level = (await this.accounting(plan)).level;
-    if (level === "hard") {
+    const accounting = await this.accounting(plan);
+    if (accounting.level === "hard") {
       await this.state.storage.put(KEYS.stage, "paused" satisfies SwarmStage);
       await this.state.storage.put(
         KEYS.stopReason,
-        `budget gate: estimated $${(await this.accounting(plan)).estimatedUsd.toFixed(2)} reached the $${SWARM_BUDGET.hardUsd} pause threshold`,
+        `budget gate: estimated $${accounting.estimatedUsd.toFixed(2)} reached the $${(accounting.budgetUsd ?? SWARM_BUDGET.hardUsd).toFixed(0)} pause threshold`,
       );
       return "budget";
     }
-    if (level === "soft") return "budget_soft";
+    if (accounting.level === "soft") return "budget_soft";
     return null;
   }
 

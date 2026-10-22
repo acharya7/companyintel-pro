@@ -35,6 +35,7 @@ import { indexingAdmin } from "./indexer-admin";
 import { IndexerContainer, type EnvWithContainer } from "./indexer-container";
 import { IndexerWorker, type WorkerEnv } from "./indexer-worker";
 import { IndexingCoordinator } from "./indexing-coordinator";
+import { swarmActiveWorkerIds } from "../../src/shared/cloud/swarm";
 
 /*
  * Durable Object classes must be exported by the Worker that declares them.
@@ -58,5 +59,57 @@ export default {
     // Hono app, which answers unknown API paths with JSON 404 and only falls back
     // to the SPA shell for non-API paths.
     return app.fetch(request, env, ctx);
+  },
+
+  /**
+   * Swarm maintenance (cron).
+   *
+   * A full-corpus run lasts hours, and two things silently end it: every container
+   * in the fleet is gone (so nothing claims the next task), and tasks parked by an
+   * environmental failure (R2 502, "no container instance", a ready timeout) are
+   * terminal even though the work was never given a fair attempt. This pass fixes
+   * both, without touching paused/aborted/finished runs and without retrying a
+   * task whose error is deterministic.
+   */
+  async scheduled(_controller: ScheduledController, env: AppEnv, ctx: ExecutionContext): Promise<void> {
+    const namespace = env.INDEXING_COORDINATOR;
+    if (!namespace) return;
+    const coordinator = namespace.get(namespace.idFromName("swarm"));
+    ctx.waitUntil(
+      (async () => {
+        const statusResponse = await coordinator.fetch("https://coordinator/status", { method: "GET" });
+        if (!statusResponse.ok) return;
+        const status = (await statusResponse.json()) as {
+          stage?: string;
+          workersAuthorised?: number;
+          tasks?: { failed?: number };
+        };
+        if (!status.stage || ["paused", "aborted", "complete", "failed", "planned"].includes(status.stage)) return;
+
+        await coordinator
+          .fetch("https://coordinator/retry-parked", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ limit: 32, transientOnly: true }),
+          })
+          .catch(() => null);
+
+        const workers = env.INDEXER_WORKER;
+        if (!workers) return;
+        const ids = swarmActiveWorkerIds(status.workersAuthorised ?? 1);
+        await Promise.all(
+          ids.map((workerId: string) =>
+            workers
+              .get(workers.idFromName(workerId))
+              .fetch("https://worker/pump", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ workerId }),
+              })
+              .catch(() => null),
+          ),
+        );
+      })(),
+    );
   },
 } satisfies ExportedHandler<AppEnv>;

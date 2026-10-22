@@ -536,10 +536,17 @@ export class IndexerWorker implements DurableObject {
         body: JSON.stringify({ args }),
       });
       const payload = (await response.json().catch(() => null)) as
-        | { started?: boolean; completed?: boolean; error?: { message?: string } }
+        | { started?: boolean; completed?: boolean; error?: { message?: string; detail?: string } }
         | null;
       if (!response.ok) {
-        return { ok: false, error: payload?.error?.message ?? `container rejected the task (HTTP ${response.status})` };
+        // The runner returns the CLI's own stderr as `detail`. Dropping it turned every
+        // start failure into the same opaque "exit code 1" and hid the real cause
+        // (missing R2 credentials, a bad flag) from the operator.
+        const detail = payload?.error?.detail ? ` — ${String(payload.error.detail).trim().slice(0, 400)}` : "";
+        return {
+          ok: false,
+          error: (payload?.error?.message ?? `container rejected the task (HTTP ${response.status})`) + detail,
+        };
       }
       if (payload?.started === false && payload.completed) {
         return { ok: false, error: "the task finished before it could be observed; the lease will be reclaimed" };

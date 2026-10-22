@@ -136,17 +136,29 @@ export const SWARM_R2_PRICES = {
 } as const;
 
 /**
- * The operator's spending gates.
+ * The operator's spending gates, expressed at the default $50 ceiling.
  *
  * `warn`: status reports a warning; `soft`: no new tasks are claimed (in-flight
  * ranges finish and commit); `hard`: the run pauses at the next boundary. These are
  * application guards over an estimate — not a Cloudflare billing cap.
+ *
+ * The marks are RATIOS of the ceiling (80% / 90% / 100%), so the ceiling itself is
+ * the only thing a deployment has to configure: `CLOUD_JOB_BUDGET_USD=500` moves all
+ * three gates to $400 / $450 / $500 instead of leaving a run to pause at $50. These
+ * constants stay as the ratio source and the fallback when nothing is configured.
  */
 export const SWARM_BUDGET = {
   warnUsd: 40,
   softUsd: 45,
   hardUsd: 50,
 } as const;
+
+/** The ceiling a run should honour: the deployment's configuration wins over the plan. */
+export function swarmBudgetCeiling(configured: string | undefined, planned: number | null): number | null {
+  const value = Number(configured);
+  if (Number.isFinite(value) && value > 0) return value;
+  return planned !== null && Number.isFinite(planned) && planned > 0 ? planned : null;
+}
 
 /**
  * The phase pipeline: BLOCKS → INGEST → MERGE_PARTITIONS → ASSEMBLE_SHARDS →
@@ -409,7 +421,7 @@ export interface SwarmAccounting {
   /** Container + R2 estimate compared against `budgetUsd`. */
   estimatedUsd: number;
   budgetUsd: number | null;
-  /** `ok` below $40, `warn` from $40, `soft` from $45, `hard` from $50. */
+  /** `ok`, `warn` at 80% of the ceiling, `soft` at 90%, `hard` at the ceiling. */
   level: "ok" | "warn" | "soft" | "hard";
 }
 
@@ -647,11 +659,34 @@ export function swarmCost(input: {
   return { containerUsd, r2Usd, estimatedUsd: containerUsd + r2Usd };
 }
 
-/** The budget level for an estimate, given the operator's gates. */
+/**
+ * Errors that mean "the environment was against us", not "the work is wrong".
+ *
+ * A task whose lease expired because R2 returned 502, or because the account had no
+ * container instance to give, was never given a fair attempt. Parking it forever
+ * would silently strand a phase; retrying it forever would spend money on a bug. The
+ * maintenance pass requeues only these, and every task still carries its normal
+ * attempt budget for the next genuine failure.
+ */
+export function isTransientTaskError(message: string | undefined): boolean {
+  if (!message) return false;
+  return /HTTP 5\d\d|no container instance|did not become ready|connection (lost|reset|refused)|network error|timed? ?out|ECONNRESET|socket hang up|lease expired/i.test(
+    message,
+  );
+}
+
+/**
+ * The budget level for an estimate, given the ceiling in force.
+ *
+ * The three marks scale with the ceiling so a larger authorised budget does not keep
+ * the old $40/$45/$50 boundaries — a $500 run warns at $400, stops claiming at $450
+ * and pauses only at $500. With the default $50 ceiling the marks are unchanged.
+ */
 export function budgetLevel(estimatedUsd: number, budgetUsd: number | null): SwarmAccounting["level"] {
-  if (estimatedUsd >= SWARM_BUDGET.hardUsd) return "hard";
-  if (estimatedUsd >= SWARM_BUDGET.softUsd) return "soft";
-  if (estimatedUsd >= SWARM_BUDGET.warnUsd) return "warn";
-  if (budgetUsd !== null && estimatedUsd >= budgetUsd) return "hard";
+  const ceiling =
+    budgetUsd !== null && Number.isFinite(budgetUsd) && budgetUsd > 0 ? budgetUsd : SWARM_BUDGET.hardUsd;
+  if (estimatedUsd >= ceiling) return "hard";
+  if (estimatedUsd >= ceiling * (SWARM_BUDGET.softUsd / SWARM_BUDGET.hardUsd)) return "soft";
+  if (estimatedUsd >= ceiling * (SWARM_BUDGET.warnUsd / SWARM_BUDGET.hardUsd)) return "warn";
   return "ok";
 }
