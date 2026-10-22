@@ -199,6 +199,19 @@ export class IndexerWorker implements DurableObject {
         await this.state.storage.delete(KEYS.current);
       }
 
+      /*
+       * 1b. A container can still be running a task this DO no longer tracks: the
+       * lease was released by a pause, the record was cleared after a failed start, or
+       * a redeploy dropped the in-memory `current`. Claiming a second task in that
+       * state fails with "This container is already running a task" and spends one
+       * attempt of the NEW task for nothing — the failure storm that parked hundreds
+       * of merge tasks. The untracked work has no lease, so it can never be reported:
+       * stop the container and let the coordinator requeue the task instead.
+       */
+      if (await this.containerHasUntrackedTask()) {
+        await this.container()?.destroy().catch(() => undefined);
+      }
+
       // 2. Claim and start as many tasks as the pump budget allows.
       while (Date.now() - startedAt < PUMP_BUDGET_MS) {
         const claim = (await this.coordinator("/claim", { workerId })) as {
@@ -242,6 +255,19 @@ export class IndexerWorker implements DurableObject {
       return { ...outcome, pumpBudgetExhausted: true };
     } finally {
       this.pumping = false;
+    }
+  }
+
+  /** True when the container is busy, and this DO holds no in-flight record for it. */
+  private async containerHasUntrackedTask(): Promise<boolean> {
+    const container = this.container();
+    if (!container || !container.running) return false;
+    try {
+      const response = await container.getTcpPort(CONTAINER_PORT).fetch("http://container/task");
+      const status = (await response.json()) as { task?: { running?: boolean } | null };
+      return status?.task?.running === true;
+    } catch {
+      return false;
     }
   }
 
