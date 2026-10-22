@@ -16,7 +16,7 @@
 import { describe, expect, test } from "bun:test";
 import { renderToString } from "react-dom/server";
 
-import { SwarmConfirmFacts, SwarmLaunch } from "../src/components/swarm-launch";
+import { ShutdownReport, SwarmConfirmFacts, SwarmLaunch } from "../src/components/swarm-launch";
 
 describe("full-corpus launch control", () => {
   test("renders the start control for an authorised administrator", () => {
@@ -56,6 +56,47 @@ describe("full-corpus launch control", () => {
     expect(html).toContain("automatic budget pause stops the swarm");
     // The version being approved is on the screen, not implied.
     expect(html).toContain("prod-real-2026-10-22");
+  });
+
+  test("the shutdown report states what each container actually did", () => {
+    const html = renderToString(
+      <ShutdownReport
+        summary={{
+          requested: 2,
+          stopped: 1,
+          failed: 1,
+          results: [
+            {
+              workerId: "indexer-worker-06",
+              ok: true,
+              containerRunningBefore: true,
+              containerDestroyed: true,
+              releasedTaskId: "range:csv1:000006",
+              releaseConfirmed: true,
+              alarmCleared: true,
+            },
+            {
+              workerId: "indexer-worker-07",
+              ok: false,
+              containerRunningBefore: true,
+              containerDestroyed: false,
+              releasedTaskId: null,
+              releaseConfirmed: true,
+              alarmCleared: false,
+              error: "container destroy failed: platform error",
+            },
+          ],
+        }}
+      />,
+    );
+    // Server rendering splits text nodes, so the fragments are asserted.
+    expect(html).toContain("Container shutdown:");
+    expect(html).toContain("1 failed");
+    expect(html).toContain("indexer-worker-06");
+    expect(html).toContain("released range:csv1:000006");
+    expect(html).toContain("indexer-worker-07");
+    // A failure is shown with its reason, not as a green light.
+    expect(html).toContain("container destroy failed: platform error");
   });
 
   test("a staging run never exposes the confirmation either", () => {

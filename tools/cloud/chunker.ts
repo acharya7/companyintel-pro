@@ -52,19 +52,33 @@ export interface ReadChunkOptions {
   sliceBytes?: number;
   delimiter?: string;
   quote?: string;
+  /**
+   * Largest single record to buffer (default 128 MiB).
+   *
+   * A quoted field can contain newlines, so the parser cannot stop at one; a corrupt
+   * or pathological record can therefore grow the parser's buffers without bound until
+   * the container is killed. A limit turns that into one failed task with the exact
+   * offset in its message, which is diagnosable — and a legitimate business record is
+   * orders of magnitude smaller than this.
+   */
+  maxRecordBytes?: number;
 }
 
 const DEFAULT_SLICE_BYTES = 4 << 20;
+const DEFAULT_MAX_RECORD_BYTES = 128 << 20;
 
 export async function readChunk(options: ReadChunkOptions): Promise<ChunkResult> {
   // Never fetch much more than the chunk itself: with a 4 MiB slice and a 1 MiB
   // chunk the first record would immediately end the chunk.
   const sliceBytes = Math.min(options.sliceBytes ?? DEFAULT_SLICE_BYTES, Math.max(64 << 10, options.chunkBytes));
+  const maxRecordBytes = options.maxRecordBytes ?? DEFAULT_MAX_RECORD_BYTES;
   const parser = new CsvParser({ delimiter: options.delimiter, quote: options.quote });
   const decoder = new TextDecoder("utf-8");
   const records: ChunkRecord[] = [];
   let offset = options.startOffset;
   let eof = false;
+  /** Parser-relative byte at which the last yielded record ended. */
+  let lastRecordByte = 0;
 
   while (offset < options.size) {
     const length = Math.min(sliceBytes, options.size - offset);
@@ -78,6 +92,7 @@ export async function readChunk(options: ReadChunkOptions): Promise<ChunkResult>
 
     let cut = false;
     for (const record of parser.push(text)) {
+      lastRecordByte = parser.bytesConsumed;
       const chunkRecord = toChunkRecord(record, options.startOffset, options.baseLine);
       records.push(chunkRecord);
       if (chunkRecord.endByte - options.startOffset >= options.chunkBytes) {
@@ -89,6 +104,13 @@ export async function readChunk(options: ReadChunkOptions): Promise<ChunkResult>
       }
     }
     if (cut) break;
+    if (parser.bytesConsumed - lastRecordByte > maxRecordBytes) {
+      throw new Error(
+        `A single CSV record starting near byte ${options.startOffset + lastRecordByte} has grown past ` +
+          `${Math.round(maxRecordBytes / (1024 * 1024))} MB without ending. Refusing to buffer it: this is a ` +
+          "malformed or pathological record, not a row this job can index.",
+      );
+    }
     if (buffer.length < length) {
       eof = true;
       break;

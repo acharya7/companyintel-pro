@@ -106,21 +106,39 @@ now on 16 vCPUs instead of one.
 
 ## 4. Recovery
 
-* **Leases.** A claim sets `leaseUntil = now + 15 min` and increments `attempts`. Any
-  heartbeat or claim first reclaims expired leases (`reclaimExpired`), so a container that
-  was stopped mid-range leaves a task that another worker picks up.
-* **Attempts.** After 4 failures a task is `parked` with its error in `status.errors` and
-  is not retried automatically — an operator sees the reason instead of an endless loop.
+* **Leases.** A claim writes the task's lease into a small `leases` index as well as the
+  task record. Every claim first reclaims expired leases from that index, and when a
+  phase's queue is empty it also scans the PLAN's own task ids (`sweepStranded`). The
+  index is what stops the old failure mode: a lease whose worker record had been cleared
+  was in no queue and named by nobody, so the phase could never finish and no status
+  field said why. The plan sweep also finds leases written by the previous coordinator,
+  which kept no index — recovery needs no reset and no migration.
+* **Pause is a drain.** `POST /swarm/pause` pauses the coordinator first (preventing new
+  claims), releases every in-flight lease as `pending`, and only then stops the
+  containers. An interrupted task is never counted as failed and never parked: its
+  attempt is handed back and its `interruptReason` records the stop. The same version and
+  coordinator resume later, with the committed R2 objects untouched.
+* **Attempts.** After 4 real failures a task is `parked` with its error in
+  `status.errors` and is not retried automatically — an operator sees the reason instead
+  of an endless loop. Operator stops do not consume attempts.
 * **Duplicates.** `complete` is idempotent: a second completion of the same task returns
-  `duplicate: true` and does not double-count rows.
+  `duplicate: true` and does not double-count rows. A range completion also carries the
+  byte span its chunk manifest actually covered; the coordinator refuses a span that
+  differs from the lease, so a partial range can never be counted as done.
+* **Committed work is kept.** A range whose container vanished is completed from its
+  chunk manifest (the range result object is only a convenience copy), and a container
+  lost after the manifest is not re-read. A range whose manifest is missing or short is
+  failed and retried, never reported as complete.
 * **Restarts.** Tasks, leases, per-source progress and the budget live in Durable Object
   storage; the plan is mirrored to `cloud/jobs/<version>/swarm/plan.json`. A redeploy of
   the Worker changes nothing an operator sees.
 * **No laptop required.** Workers advance themselves on Durable Object alarms. Closing the
   browser, or switching the machine off, does not stop a run.
-* **Auto-shutdown.** When the coordinator answers `complete`, `paused`, `aborted` or
-  `budget`, each worker destroys its container. `idle` and `budget_soft` re-arm a 30 s
-  alarm instead, because more work may appear.
+* **Auto-shutdown.** Before a worker polls its container it asks the coordinator whether
+  work may happen at all, so a pause reaches the container on the next alarm instead of
+  waiting for a range to end. On `complete`, `paused`, `aborted`, `budget` or `retired`
+  the worker releases its lease, destroys its container and arms nothing. `idle` and
+  `budget_soft` re-arm a 30 s alarm instead, because more work may appear.
 
 ## 5. Budget
 
@@ -186,13 +204,38 @@ curl -X POST "$APP/api/cloud/swarm/launch" -H 'content-type: application/json' -
 curl "$APP/api/cloud/swarm/status"
 
 # 5. Controls
-curl -X POST "$APP/api/cloud/swarm/pause"
-curl -X POST "$APP/api/cloud/swarm/resume"
-curl -X POST "$APP/api/cloud/swarm/abort"    # also destroys every container
+curl -X POST "$APP/api/cloud/swarm/pause"       # pause + release leases + stop every container
+curl -X POST "$APP/api/cloud/swarm/stop"        # the same stop, without resuming anything
+curl -X POST "$APP/api/cloud/swarm/stop" \
+  -H 'content-type: application/json' -d '{"workers":["indexer-worker-07"]}'
+curl -X POST "$APP/api/cloud/swarm/scale" \
+  -H 'content-type: application/json' -d '{"workers":4}'   # stops 04…15, keeps the run
+curl -X POST "$APP/api/cloud/swarm/resume" \
+  -H 'content-type: application/json' -d '{"workers":4}'   # resume the SAME version with four
+curl "$APP/api/cloud/swarm/ranges?state=leased"           # ids, byte spans, attempts, leases
+curl -X POST "$APP/api/cloud/swarm/abort"       # also destroys every container; not a pause
 
 # 6. After the merge reports complete, activate the generation explicitly
 curl -X POST "$APP/api/cloud/jobs/prod-real-2026-10-22/activate"
 ```
+
+Every control that stops a container answers with a per-worker report:
+`{ shutdown: { requested, stopped, failed, results: [{ workerId, ok, containerDestroyed,
+releasedTaskId, releaseConfirmed, error? }] } }`. A shutdown that half-worked is visible
+instead of being swallowed, and `releaseConfirmed: false` means that task will be
+recovered by lease expiry rather than having been handed back cleanly.
+
+A worker count is a SET, not a hint: `launch`, `resume` and `scale` stop every id above
+the selected count (with the same lease hand-back) before they pump anything, and the
+coordinator records the active count so a retired worker's next claim answers `retired`.
+
+`GET /swarm/ranges` is the recovery audit. It reads the coordinator's own task records
+and reports every range's id, source, ordinal, start/end, byte size, state, attempts,
+lease owner/expiry and last error, plus totals over the whole plan (`bytesPlanned`,
+`bytesDone`, `bytesOutstanding`) and how many ranges exceed
+`SWARM.oversizedRangeBytes` (512 MiB). A range can legitimately be that large — a cut is
+only legal at a record boundary, so a long run of blocks without one makes the cut jump
+forward — which is why it is reported rather than assumed.
 
 The status object reports the numbers an operator actually needs: stage, active workers,
 tasks pending/done/parked, rows and bytes covered per source, coverage percentage,
@@ -220,6 +263,9 @@ exactly what `docs/verification.md` forbids.
 | `tests/swarm-plan.test.ts` | cuts land only after a newline (byte-compared, so non-ASCII is handled), ranges are disjoint and exhaustive, and the swarm's per-partition spool is **byte-identical** to Cloud Pass 1's |
 | `tests/swarm-coordinator.test.ts` | one worker per task, expired leases reclaimed, aggregate Pass 1 objects writable and verifiable, idempotent completion, $45/$50 budget gates |
 | `tests/swarm-worker.test.ts` | 16 distinct identities, real CLI arguments (`--base-line`, `--partitions`, offsets) sent to the container, result read back from R2, container destroyed on completion |
+| `tests/swarm-pause-drain.test.ts` | pause releases leases without failing/parking, a lease with no worker record is still recovered, `maxAttempts` parks, a worker above the active count is retired, a mismatched coverage is refused, the audit reports sizes/attempts, and the worker releases-then-destroys (never restarts under a pause) |
+| `tests/swarm-scale.test.ts` | the routes: pause is ordered and reports all 16 answers, launch/resume/scale stop every id above the selected count, a named worker can be stopped, and nothing aborts or re-plans |
+| `tests/swarm-range-memory.test.ts` | a 1 KiB parse window produces byte-identical spool to one window and to Pass 1, temp spools are cleaned up, a short range writes no manifest, and a pathological record is refused with its offset |
 | `tests/cloud-admin-deploy.test.ts`, `tests/worker-entry-routing.test.ts` | production config: `IndexerWorker`, `standard-2`, `max_instances = 16`, both migrations, Access untouched; staging stays at one instance |
 | `tests/staging-config.test.ts`, `tests/staging-isolation.test.ts` | staging isolation unchanged |
 

@@ -22,12 +22,14 @@
  *   work may appear (a phase boundary, or an operator raising the budget).
  */
 
+import { cloudKeys, type CloudChunkManifest } from "../../src/shared/cloud/types";
 import {
   SWARM,
   swarmKeys,
   type SwarmBlockDescriptor,
   type SwarmTask,
   type SwarmTaskResult,
+  type SwarmWorkerStopResult,
 } from "../../src/shared/cloud/swarm";
 import type { EnvWithContainer } from "./indexer-container";
 
@@ -53,6 +55,9 @@ interface InFlight {
   kind: SwarmTask["kind"];
   args: string[];
   startedAt: number;
+  /** The leased task's own byte span, so a result can be checked against it. */
+  start?: number;
+  end?: number;
 }
 
 /** What a claim teaches the worker about the run (enough to build its CLI command). */
@@ -64,7 +69,15 @@ interface ClaimedPlan {
 
 type PollOutcome = "running" | "done" | "failed" | "gone";
 
-const KEYS = { workerId: "workerId", current: "current", plan: "plan" } as const;
+const KEYS = { workerId: "workerId", current: "current", plan: "plan", held: "held" } as const;
+
+/**
+ * Stop signals that mean "release your task, destroy your container, arm nothing".
+ *
+ * `budget_soft` is deliberately absent: it means no NEW task, while the in-flight one
+ * is allowed to finish and commit.
+ */
+const STOP_SIGNALS = new Set<string>(["paused", "aborted", "complete", "budget", "retired"]);
 
 export class IndexerWorker implements DurableObject {
   /** In-memory guard: a DO is single-instance, so this is enough to serialise pumps. */
@@ -89,14 +102,31 @@ export class IndexerWorker implements DurableObject {
         return json(await this.pump());
       }
       if (url.pathname === "/stop" && request.method === "POST") {
-        await this.shutdown();
-        return json({ ok: true, stopped: true });
+        /*
+         * An administrative stop. It ALWAYS hands the lease back before it destroys
+         * the container, and it always reports what actually happened: the previous
+         * version answered `{ ok: true }` after swallowing both the destroy failure and
+         * the fact that it had just dropped a live task on the floor.
+         */
+        const body = (await request.json().catch(() => ({}))) as { reason?: string; workerId?: string };
+        if (!(await this.state.storage.get<string>(KEYS.workerId)) && typeof body.workerId === "string") {
+          await this.state.storage.put(KEYS.workerId, body.workerId);
+        }
+        const workerId = (await this.state.storage.get<string>(KEYS.workerId)) ?? "unknown";
+        const result = await this.drain(workerId, body.reason ?? "stopped by operator");
+        return json(result, result.ok ? 200 : 500);
       }
       if (url.pathname === "/state" && request.method === "GET") {
         const workerId = await this.state.storage.get<string>(KEYS.workerId);
         const current = await this.state.storage.get<InFlight>(KEYS.current);
+        const held = await this.state.storage.get<string>(KEYS.held);
         const container = this.container();
-        return json({ workerId: workerId ?? null, current: current ?? null, containerRunning: container?.running ?? false });
+        return json({
+          workerId: workerId ?? null,
+          current: current ?? null,
+          containerRunning: container?.running ?? false,
+          held: held ?? null,
+        });
       }
       return json({ error: { code: "not_found", message: `No worker route for ${request.method} ${url.pathname}` } }, 404);
     } catch (error) {
@@ -125,6 +155,23 @@ export class IndexerWorker implements DurableObject {
       const startedAt = Date.now();
       const outcome: { completed?: string; failed?: string; stop?: string; started?: string } = {};
 
+      /*
+       * 0. Ask the coordinator whether work may happen AT ALL, before looking at the
+       *    in-flight task.
+       *
+       * This is the pause bug: the old pump polled the container first, so a paused run
+       * kept every container alive — and kept billing — until its range happened to
+       * end, which for a range stuck in a memory-thrashing container was never. Pausing
+       * now reaches the container on the next alarm (10 s), releases the lease, and
+       * arms nothing.
+       */
+      const control = await this.controlCheck(workerId);
+      if (control.stop && STOP_SIGNALS.has(control.stop)) {
+        const stopped = await this.drain(workerId, control.stop);
+        return { ...outcome, ...stopped, stop: control.stop, stage: control.stage ?? null };
+      }
+      await this.state.storage.delete(KEYS.held);
+
       // 1. Finish whatever is in flight before claiming anything new.
       const current = await this.state.storage.get<InFlight>(KEYS.current);
       if (current) {
@@ -134,9 +181,15 @@ export class IndexerWorker implements DurableObject {
           return { running: current.id };
         }
         if (state === "gone") {
-          // The container vanished (platform stop, redeploy). Leave the lease to
-          // expire rather than burning one of the task's attempts: the same work is
-          // safe to redo, and another worker will pick it up.
+          // The container vanished (platform stop, redeploy) without committing. Hand
+          // the lease back explicitly so the work returns to the queue now instead of
+          // waiting out a 15-minute lease — an interruption, never a failed attempt.
+          try {
+            await this.coordinator("/release", { workerId, taskId: current.id, reason: "container disappeared mid-task" });
+          } catch {
+            // The lease expiry (and the coordinator's stranded-task sweep) is the
+            // fallback; neither can lose the task.
+          }
           await this.state.storage.delete(KEYS.current);
           await this.state.storage.setAlarm(Date.now() + SWARM.pollMs);
           return { containerGone: current.id };
@@ -155,9 +208,11 @@ export class IndexerWorker implements DurableObject {
         };
         if (claim?.stop) {
           outcome.stop = claim.stop;
-          if (claim.stop === "complete" || claim.stop === "paused" || claim.stop === "aborted" || claim.stop === "budget") {
-            await this.shutdown();
-            return outcome;
+          // `retired` is a scale-down: this worker id is above the operator's active
+          // count, so it must stop rather than idle and be mistaken for running.
+          if (STOP_SIGNALS.has(claim.stop)) {
+            const stopped = await this.drain(workerId, claim.stop);
+            return { ...outcome, ...stopped };
           }
           await this.state.storage.setAlarm(Date.now() + SWARM.idleMs);
           return outcome;
@@ -174,6 +229,8 @@ export class IndexerWorker implements DurableObject {
             kind: claim.task.kind,
             args: started.args,
             startedAt: Date.now(),
+            start: claim.task.start,
+            end: claim.task.end,
           } satisfies InFlight);
           await this.state.storage.setAlarm(Date.now() + SWARM.pollMs);
           return { ...outcome, started: claim.task.id };
@@ -191,7 +248,16 @@ export class IndexerWorker implements DurableObject {
   /** Ask the container how the running task is doing; report it when it ended. */
   private async pollTask(current: InFlight, workerId: string): Promise<PollOutcome> {
     const container = this.container();
-    if (!container || !container.running) return "gone";
+    if (!container || !container.running) {
+      /*
+       * The container is gone (platform eviction, redeploy, a stop). Before treating
+       * the task as abandoned, look for its committed evidence: a range can have
+       * written every segment and its manifest before the platform took the container
+       * away, and re-reading a gigabyte because nobody looked is pure waste.
+       */
+      if (await this.recoverCommitted(current, workerId)) return "done";
+      return "gone";
+    }
 
     let status: { task?: { running?: boolean; exitCode?: number | null; signal?: string | null; stderr?: string } | null };
     try {
@@ -218,6 +284,42 @@ export class IndexerWorker implements DurableObject {
     }
     const reported = await this.report(current, workerId);
     return reported ? "done" : "failed";
+  }
+
+  /**
+   * Report a range whose container vanished, if and only if it committed its whole span.
+   *
+   * Silence on any doubt: a missing or short manifest means the work is still to be
+   * done, and the lease expiry (or the coordinator's stranded-task sweep) returns it to
+   * the queue without spending an attempt.
+   */
+  private async recoverCommitted(current: InFlight, workerId: string): Promise<boolean> {
+    if (current.kind !== "range") return false;
+    const plan = await this.state.storage.get<ClaimedPlan>(KEYS.plan);
+    if (!plan) return false;
+    const [, sourceId, ordinal] = current.id.split(":");
+    const index = Number(ordinal);
+    try {
+      const manifest = await readJson<CloudChunkManifest>(
+        this.env.COMPANY_DATA,
+        cloudKeys.chunkManifest(plan.version, sourceId ?? "", index),
+      );
+      if (!manifest || manifest.complete !== true) return false;
+      if (current.start !== undefined && manifest.range.start !== current.start) return false;
+      if (current.end !== undefined && manifest.range.end !== current.end) return false;
+      const result =
+        (await readJson<SwarmTaskResult>(this.env.COMPANY_DATA, swarmKeys.rangeResult(plan.version, sourceId ?? "", index))) ??
+        resultFromManifest(manifest);
+      await this.coordinator("/complete", {
+        workerId,
+        taskId: current.id,
+        result,
+        coverage: manifest.range,
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -252,15 +354,51 @@ export class IndexerWorker implements DurableObject {
     }
 
     if (current.kind === "range") {
-      const result = await readJson<SwarmTaskResult>(
+      /*
+       * A range's evidence is its CHUNK MANIFEST, not its result object.
+       *
+       * The manifest is written after every segment object and carries the byte range
+       * it actually covered; the small result object is written last. A container that
+       * was killed between those two writes used to be reported as a FAILED range —
+       * discarding a gigabyte of committed spool and spending one of four attempts on
+       * work that was already done. The manifest also lets this check the thing that
+       * matters: the range must have covered exactly the bytes it leased. A manifest
+       * that ends early is a partial range, and a partial range is never complete.
+       */
+      const manifest = await readJson<CloudChunkManifest>(
         this.env.COMPANY_DATA,
-        swarmKeys.rangeResult(plan.version, sourceId ?? "", index),
+        cloudKeys.chunkManifest(plan.version, sourceId ?? "", index),
       );
-      if (!result) {
-        await this.coordinator("/fail", { workerId, taskId: current.id, error: "range result object was not written" });
+      if (!manifest || manifest.complete !== true) {
+        await this.coordinator("/fail", {
+          workerId,
+          taskId: current.id,
+          error: `range ${current.id} did not write a complete chunk manifest; its spool was not committed`,
+        });
         return false;
       }
-      await this.coordinator("/complete", { workerId, taskId: current.id, result });
+      const expectedStart = current.start ?? manifest.range.start;
+      const expectedEnd = current.end ?? manifest.range.end;
+      if (manifest.range.start !== expectedStart || manifest.range.end !== expectedEnd) {
+        await this.coordinator("/fail", {
+          workerId,
+          taskId: current.id,
+          error:
+            `range ${current.id} covered ${manifest.range.start}..${manifest.range.end}, ` +
+            `but the task is ${expectedStart}..${expectedEnd}; refusing to count a partial range as complete`,
+        });
+        return false;
+      }
+      const result =
+        (await readJson<SwarmTaskResult>(this.env.COMPANY_DATA, swarmKeys.rangeResult(plan.version, sourceId ?? "", index))) ??
+        resultFromManifest(manifest);
+      await this.coordinator("/complete", {
+        workerId,
+        taskId: current.id,
+        result,
+        // The coordinator refuses a completion whose coverage differs from the lease.
+        coverage: manifest.range,
+      });
       return true;
     }
 
@@ -461,15 +599,88 @@ export class IndexerWorker implements DurableObject {
     return `container did not become ready within ${Math.round(timeoutMs / 1000)}s (${detail})`;
   }
 
-  private async shutdown(): Promise<void> {
-    const container = this.container();
+  /**
+   * Ask the coordinator whether this worker may work, without touching the container.
+   *
+   * A failure to reach the coordinator is NOT treated as a stop: the lease is what
+   * makes concurrent work safe, so a running range continues and the next alarm asks
+   * again. Erring the other way would destroy a healthy container because one DO call
+   * timed out.
+   */
+  private async controlCheck(workerId: string): Promise<{ stage?: string; stop?: string }> {
     try {
-      if (container) await container.destroy();
+      const answer = (await this.coordinator("/heartbeat", { workerId })) as { stage?: string; stop?: string | null } | null;
+      return {
+        ...(answer?.stage ? { stage: answer.stage } : {}),
+        ...(answer?.stop ? { stop: String(answer.stop) } : {}),
+      };
     } catch {
-      // Already gone: nothing to stop.
+      return {};
     }
+  }
+
+  /**
+   * Release the lease, then destroy the container — and say what happened for each.
+   *
+   * The order matters. Releasing first means an interrupted range goes back to the
+   * queue as `pending` (with its attempt given back) instead of being left `leased`
+   * against a container that no longer exists. Destroying first would be faster by a
+   * few milliseconds and would strand the task, which is exactly how a paused run used
+   * to end up with ranges that nobody could see and nobody would retry.
+   */
+  private async drain(workerId: string, reason: string): Promise<SwarmWorkerStopResult> {
+    const current = await this.state.storage.get<InFlight>(KEYS.current);
+    let releaseConfirmed = !current;
+    let releaseError: string | undefined;
+    if (current) {
+      try {
+        const answer = (await this.coordinator("/release", {
+          workerId,
+          taskId: current.id,
+          reason: `worker stopped: ${reason}`,
+        })) as { ok?: boolean } | null;
+        // `ok: false` means the coordinator did not find the lease (already expired or
+        // already completed). That is not a lost task, but it IS worth reporting: the
+        // lease expiry is what recovers it, not this call.
+        releaseConfirmed = answer?.ok !== false;
+      } catch (error) {
+        releaseError = `release failed: ${error instanceof Error ? error.message : String(error)}`;
+        releaseConfirmed = false;
+      }
+    }
+
+    const container = this.container();
+    const containerRunningBefore = container?.running ?? false;
+    let containerDestroyed = false;
+    let destroyError: string | undefined;
+    if (container) {
+      try {
+        await container.destroy();
+      } catch (error) {
+        destroyError = `container destroy failed: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      containerDestroyed = !(container.running ?? false);
+    } else {
+      containerDestroyed = true;
+    }
+
     await this.state.storage.delete(KEYS.current);
     await this.state.storage.deleteAlarm();
+    await this.state.storage.put(KEYS.held, reason);
+
+    const error = [destroyError, releaseError].filter(Boolean).join("; ");
+    return {
+      workerId,
+      // A worker that had no container running is a success; a green light while the
+      // container is still up, or while its task was silently abandoned, is not.
+      ok: !destroyError && releaseConfirmed,
+      containerRunningBefore,
+      containerDestroyed,
+      releasedTaskId: current?.id ?? null,
+      releaseConfirmed,
+      alarmCleared: true,
+      ...(error ? { error } : {}),
+    };
   }
 
   private container(): Container | null {
@@ -561,6 +772,29 @@ function taskArgs(task: SwarmTask, plan: ClaimedPlan): { args: string[] } | { er
       "--partitions",
       String(plan.partitions),
     ],
+  };
+}
+
+/**
+ * Rebuild a range's counters from its chunk manifest.
+ *
+ * `classA` is the manifest write plus one segment per partition; the rejected object
+ * is written only when there were rejected rows, and it is included when the manifest
+ * names it. The result object itself is the one write that is missing, and `classA`
+ * counts R2 operations for a cost ESTIMATE, so being one operation low on a recovered
+ * range is preferable to re-reading its whole span.
+ */
+function resultFromManifest(manifest: CloudChunkManifest): SwarmTaskResult {
+  const segmentBytes = (manifest.segments ?? []).reduce((total, segment) => total + segment.bytes, 0);
+  return {
+    rows: manifest.rows ?? 0,
+    rejected: manifest.rejected ?? 0,
+    segments: (manifest.segments ?? []).length,
+    segmentBytes,
+    bytesRead: manifest.range.end - manifest.range.start,
+    classA: (manifest.segments ?? []).length + (manifest.rejectedKey ? 2 : 1),
+    classB: 0,
+    note: "recovered from the chunk manifest: the range result object was missing, the committed spool was kept",
   };
 }
 

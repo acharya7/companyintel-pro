@@ -65,6 +65,29 @@ export const SWARM = {
   rangeBlocks: 2,
   /** Bytes fetched per R2 request while scanning or reading a range. */
   sliceBytes: 4 << 20,
+  /**
+   * Bytes parsed per inner step inside one range task.
+   *
+   * A range is an ATOMIC unit of the plan — it is written as one chunk manifest — but
+   * nothing requires it to be parsed in one buffer. A range task therefore reads its
+   * bytes in fixed windows of this size, spools each partition's rows to disk and only
+   * then streams the per-partition segment objects. Peak heap is a property of this
+   * constant, not of the range's (data-dependent) length, which is what makes an
+   * unusually large range survive a 6 GiB container instead of being SIGKILLed.
+   */
+  rangeChunkBytes: 8 << 20,
+  /**
+   * A range larger than this is reported as oversized by the audit endpoint.
+   *
+   * It is a diagnostic, never a cap: a cut is only legal at a record boundary, so a
+   * range can legitimately be bigger than `blockBytes * rangeBlocks` when the source
+   * has a very long run of blocks without one.
+   */
+  oversizedRangeBytes: 512 << 20,
+  /** Server-side spool budget for one range task (container disk is 12 GB). */
+  maxRangeSpoolBytes: 8 * 1024 ** 3,
+  /** Reject a single CSV record larger than this instead of buffering it to OOM. */
+  maxRecordBytes: 128 * 1024 ** 2,
   /** How long a claim is exclusive before another worker may take the task over. */
   leaseMs: 15 * 60 * 1000,
   /** Poll interval while a task runs inside a container. */
@@ -154,6 +177,91 @@ export const SWARM_SHARDS = {
 } as const;
 
 export type SwarmTaskState = "pending" | "leased" | "done" | "failed" | "parked";
+
+/**
+ * Why a worker was told to stop working.
+ *
+ * Only `idle` and `budget_soft` mean "keep the worker alive but claim nothing"; every
+ * other signal means "release your lease and destroy your container". `retired` is a
+ * worker id above the operator's current active count, so scaling down to four stops
+ * 04…15 instead of only refusing to relaunch them.
+ */
+export type SwarmStopSignal = "paused" | "aborted" | "complete" | "budget" | "budget_soft" | "idle" | "retired";
+
+/** One worker's answer to an administrative stop request. */
+export interface SwarmWorkerStopResult {
+  workerId: string;
+  /** True when the container is not running afterwards and nothing failed silently. */
+  ok: boolean;
+  containerRunningBefore: boolean;
+  containerDestroyed: boolean;
+  /** The task the worker was holding, if any. */
+  releasedTaskId: string | null;
+  /** The coordinator confirmed the lease was handed back (interrupted, not failed). */
+  releaseConfirmed: boolean;
+  alarmCleared: boolean;
+  error?: string;
+}
+
+/** The aggregate of a stop request, so a caller can show what actually happened. */
+export interface SwarmStopSummary {
+  requested: number;
+  stopped: number;
+  failed: number;
+  results: SwarmWorkerStopResult[];
+  error?: string;
+}
+
+/** One range task as reported by the audit endpoint (never derived from guesses). */
+export interface SwarmRangeAuditEntry {
+  id: string;
+  sourceId: string;
+  index: number;
+  start: number;
+  end: number;
+  bytes: number;
+  state: SwarmTaskState;
+  attempts: number;
+  baseLine?: number;
+  leaseOwner?: string;
+  leaseUntil?: number;
+  claimedAt?: string;
+  completedAt?: string;
+  error?: string;
+  rows?: number;
+  oversized: boolean;
+}
+
+/**
+ * The answer to "which ranges are still outstanding, how big are they, and why?".
+ *
+ * The coordinator owns the plan, so this is read from its task records — not from a
+ * status estimate — which is the only way to tell a stuck lease from a range that is
+ * genuinely still being read.
+ */
+export interface SwarmRangeAudit {
+  version: string;
+  sourceId: string | null;
+  state: SwarmTaskState | null;
+  planned: number;
+  counts: Record<SwarmTaskState, number>;
+  totals: {
+    bytesPlanned: number;
+    bytesDone: number;
+    bytesOutstanding: number;
+    oversized: number;
+  };
+  ranges: SwarmRangeAuditEntry[];
+}
+
+/** A swarm worker's own view, used by the panel and the scale controls. */
+export interface SwarmWorkerSnapshot {
+  workerId: string | null;
+  current: { id: string; kind: string; startedAt: number } | null;
+  containerRunning: boolean;
+  /** Set when the worker released its task and destroyed its container. */
+  held: string | null;
+}
 
 export interface SwarmSourcePlan {
   id: string;
@@ -250,6 +358,12 @@ export interface SwarmTask {
   completedAt?: string;
   result?: SwarmTaskResult;
   error?: string;
+  /** Set when an operator stop handed the lease back; the task was never failed. */
+  interruptedAt?: string;
+  /** How many operator stops have interrupted this task (an audit trail only). */
+  interruptions?: number;
+  /** Why the last interruption happened ("paused by operator", "worker stopped: …"). */
+  interruptReason?: string;
 }
 
 export interface SwarmWorkerState {
@@ -479,6 +593,22 @@ export function planSourceRanges(
 export function clampWorkerCount(requested: number | undefined): number {
   if (requested === undefined || !Number.isFinite(requested)) return SWARM_WORKER_COUNT;
   return Math.max(1, Math.min(SWARM_WORKER_COUNT, Math.floor(requested)));
+}
+
+/**
+ * Worker ids a selected workforce owns — and, by complement, the ids a scale-down
+ * must stop.
+ *
+ * A count is a SET of identities, not a hint: "use four workers" means containers
+ * 04…15 are stopped, otherwise the operator would be paying for sixteen while
+ * believing four are running.
+ */
+export function swarmActiveWorkerIds(count: number): string[] {
+  return swarmWorkerIds().slice(0, clampWorkerCount(count));
+}
+
+export function swarmRetiredWorkerIds(count: number): string[] {
+  return swarmWorkerIds().slice(clampWorkerCount(count));
 }
 
 /** Price a task result's R2 operations and container time for the running estimate. */

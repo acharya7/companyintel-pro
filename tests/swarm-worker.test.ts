@@ -10,6 +10,7 @@
 
 import { describe, expect, test } from "bun:test";
 
+import { cloudKeys } from "../src/shared/cloud/types";
 import { SWARM_WORKER_COUNT, swarmKeys, swarmWorkerId, swarmWorkerIds } from "../src/shared/cloud/swarm";
 import { IndexerWorker } from "../worker/src/indexer-worker";
 import { fakeDoState } from "./helpers/fake-do";
@@ -122,6 +123,22 @@ describe("swarm worker pump", () => {
   test("starts a claimed range in its own container with the full argument set", async () => {
     const bucket = new FakeR2Bucket();
     bucket.putBytes(swarmKeys.rangeResult(VERSION, "csv1", 2), Buffer.from(JSON.stringify(RANGE_RESULT), "utf8"));
+    // The chunk manifest is the range's evidence: a result object alone is not proof
+    // that the bytes were parsed and the spool committed.
+    bucket.putBytes(
+      cloudKeys.chunkManifest(VERSION, "csv1", 2),
+      Buffer.from(
+        JSON.stringify({
+          complete: true,
+          range: { start: RANGE_TASK.start, end: RANGE_TASK.end },
+          rows: RANGE_RESULT.rows,
+          rejected: RANGE_RESULT.rejected,
+          segments: [{ partition: 1, key: "k", bytes: 4096, rows: 12, sha256: "x" }],
+          rejectedKey: "r",
+        }),
+        "utf8",
+      ),
+    );
     const { container, calls: containerCalls } = fakeContainer({ running: true, health: 200 });
     const completed: unknown[] = [];
     const { namespace, calls } = fakeCoordinator({

@@ -164,7 +164,7 @@ describe("swarm coordinator", () => {
     const seen: number[] = [];
     let lastRefBase = -1;
     for (let partition = 0; partition < PLAN.partitions; partition += 1) {
-      const claim = (await call(coordinator, "/claim", { workerId: "indexer-worker-05" })) as { stage: string; task: SwarmTask };
+      const claim = (await call(coordinator, "/claim", { workerId: "indexer-worker-01" })) as { stage: string; task: SwarmTask };
       expect(claim.stage).toBe("merge_partitions");
       expect(claim.task.kind).toBe("merge_partition");
       seen.push(claim.task.partition!);
@@ -173,7 +173,7 @@ describe("swarm coordinator", () => {
       expect(claim.task.refCapacity).toBeGreaterThan(0);
       lastRefBase = claim.task.refBase!;
       await call(coordinator, "/complete", {
-        workerId: "indexer-worker-05",
+        workerId: "indexer-worker-01",
         taskId: claim.task.id,
         result: { rows: 0, rejected: 0, segments: 2, segmentBytes: 1024, bytesRead: 0, classA: 0, classB: 0 },
       });
@@ -206,16 +206,16 @@ describe("swarm coordinator", () => {
     ]);
 
     // FINALIZE: a single owner, then the run completes.
-    const finalClaim = (await call(coordinator, "/claim", { workerId: "indexer-worker-05" })) as { stage: string; task: SwarmTask };
+    const finalClaim = (await call(coordinator, "/claim", { workerId: "indexer-worker-01" })) as { stage: string; task: SwarmTask };
     expect(finalClaim.stage).toBe("finalize");
     expect(finalClaim.task.kind).toBe("finalize");
     await call(coordinator, "/complete", {
-      workerId: "indexer-worker-05",
+      workerId: "indexer-worker-01",
       taskId: finalClaim.task.id,
       result: { rows: 30, rejected: 0, segments: 0, segmentBytes: 0, bytesRead: 0, classA: 0, classB: 0 },
       searchable: { rows: 30 },
     });
-    const done = (await call(coordinator, "/claim", { workerId: "indexer-worker-05" })) as { stop?: string; stage?: string };
+    const done = (await call(coordinator, "/claim", { workerId: "indexer-worker-01" })) as { stop?: string; stage?: string };
     expect(done.stop).toBe("complete");
     expect(done.stage).toBe("complete");
   });

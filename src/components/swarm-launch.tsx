@@ -21,14 +21,14 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Activity, AlertTriangle, Cloud, Gauge, Pause, Play, RefreshCw, Rocket, ShieldCheck, Square, Timer } from "lucide-react";
+import { Activity, AlertTriangle, Cloud, Gauge, Pause, Play, Power, RefreshCw, Rocket, ShieldCheck, Square, Timer, Users } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Section, StatCard } from "@/components/common";
-import type { SwarmStatus } from "@/shared/cloud/swarm";
+import type { SwarmStatus, SwarmStopSummary } from "@/shared/cloud/swarm";
 
 const SOURCE_FACTS = [
   { id: "csv1", key: "raw/file1.csv", size: "10.22 GB" },
@@ -36,6 +36,17 @@ const SOURCE_FACTS = [
 ];
 
 const TERMINAL = new Set(["complete", "aborted", "failed"]);
+const WORKER_CHOICES = [1, 2, 4, 6, 8, 12, 16];
+
+/** What every swarm control answers with, including what the containers really did. */
+interface SwarmControlResponse {
+  ok?: boolean;
+  status?: SwarmStatus | null;
+  released?: string[];
+  workers?: number;
+  retired?: string[];
+  shutdown?: SwarmStopSummary;
+}
 
 async function admin<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -100,6 +111,11 @@ export function SwarmLaunch({ authorized, staging }: { authorized: boolean; stag
   const [status, setStatus] = useState<SwarmStatus | null>(null);
   /** A 502 "no swarm plan" is the normal empty state, not an error worth showing. */
   const [statusKnown, setStatusKnown] = useState(false);
+  /** The operator's chosen workforce; `null` means "whatever the coordinator reports". */
+  const [workerChoice, setWorkerChoice] = useState<number | null>(null);
+  /** The last stop's per-worker outcome, shown until the next control is used. */
+  const [shutdown, setShutdown] = useState<SwarmStopSummary | null>(null);
+  const workers = workerChoice ?? status?.workersAuthorised ?? 16;
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -180,8 +196,12 @@ export function SwarmLaunch({ authorized, staging }: { authorized: boolean; stag
       });
 
       if (existing?.version === id && existing.stage === "paused") {
-        await admin("/api/cloud/swarm/resume", { method: "POST", body: "{}" });
-        setNotice(`Resumed ${id} from its durable plan; the workers will pick up where they stopped.`);
+        const resumed = await admin<SwarmControlResponse>("/api/cloud/swarm/resume", {
+          method: "POST",
+          body: JSON.stringify({ workers }),
+        });
+        setShutdown(resumed.shutdown ?? null);
+        setNotice(`Resumed ${id} with ${workers} worker(s) from its durable plan; the workers pick up where they stopped.`);
       } else if (!(existing?.version === id && !TERMINAL.has(existing.stage))) {
         await admin("/api/cloud/swarm/plan", {
           method: "POST",
@@ -194,7 +214,7 @@ export function SwarmLaunch({ authorized, staging }: { authorized: boolean; stag
 
       const launched = await admin<{ launched: number }>("/api/cloud/swarm/launch", {
         method: "POST",
-        body: JSON.stringify({ workers: 16 }),
+        body: JSON.stringify({ workers }),
       });
       await refreshStatus();
       setNotice((current) => `${current ?? ""} ${launched.launched} worker(s) pumped; the coordinator runs the phases.`.trim());
@@ -206,15 +226,22 @@ export function SwarmLaunch({ authorized, staging }: { authorized: boolean; stag
     }
   };
 
-  const control = async (action: "pause" | "resume" | "abort") => {
+  /**
+   * Every control reports what the CONTAINERS did, not just what the coordinator was
+   * told. A pause that is recorded while nine containers keep running is the failure
+   * this panel exists to make visible.
+   */
+  const runControl = async (action: string, path: string, body: Record<string, unknown>, message: string) => {
     setBusy(action);
     setError(null);
     try {
-      await admin(`/api/cloud/swarm/${action}`, { method: "POST", body: "{}" });
+      const result = await admin<SwarmControlResponse>(path, { method: "POST", body: JSON.stringify(body) });
+      setShutdown(result.shutdown ?? null);
+      if (result.status) setStatus(result.status);
       setNotice(
-        action === "abort"
-          ? "Stop recorded: the coordinator is aborted and every container is being destroyed."
-          : `${action === "pause" ? "Pause" : "Resume"} recorded for the swarm.`,
+        result.shutdown && result.shutdown.failed > 0
+          ? `${message} ${result.shutdown.stopped} container(s) stopped, ${result.shutdown.failed} did not — see the per-worker report.`
+          : message,
       );
       await refreshStatus();
     } catch (caught) {
@@ -223,6 +250,41 @@ export function SwarmLaunch({ authorized, staging }: { authorized: boolean; stag
       setBusy(null);
     }
   };
+
+  const pauseAndDrain = () =>
+    runControl(
+      "pause",
+      "/api/cloud/swarm/pause",
+      {},
+      "Paused: the coordinator released every in-flight lease, so the containers were stopped without failing or parking a task.",
+    );
+
+  const resume = () =>
+    runControl(
+      "resume",
+      "/api/cloud/swarm/resume",
+      { workers },
+      `Resumed with ${workers} worker(s); workers above that count were stopped and their leases handed back.`,
+    );
+
+  const stopContainers = () =>
+    runControl(
+      "stop",
+      "/api/cloud/swarm/stop",
+      {},
+      "Stop requested: the coordinator is paused and every container was asked to stop. The job itself is untouched and can be resumed.",
+    );
+
+  const scale = () =>
+    runControl(
+      "scale",
+      "/api/cloud/swarm/scale",
+      { workers },
+      `Workforce limited to ${workers}; workers above that count were stopped and their leases returned to the queue.`,
+    );
+
+  const abort = () =>
+    runControl("abort", "/api/cloud/swarm/abort", {}, "Aborted: every container was asked to stop.");
 
   // Authorisation is enforced by the API; the control is not even rendered for an
   // identity the admin read did not accept, and staging never starts a full run.
@@ -304,19 +366,43 @@ export function SwarmLaunch({ authorized, staging }: { authorized: boolean; stag
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
-              <Button variant="outline" className="gap-2" onClick={() => void control("pause")} disabled={busy !== null || !running}>
-                <Pause className="size-4" /> Pause
+              <Button variant="outline" className="gap-2" onClick={() => void pauseAndDrain()} disabled={busy !== null || !running}>
+                <Pause className="size-4" /> {busy === "pause" ? "Pausing…" : "Pause & drain"}
               </Button>
-              <Button variant="outline" className="gap-2" onClick={() => void control("resume")} disabled={busy !== null || !status || status.stage !== "paused"}>
-                <Play className="size-4" /> Resume
+              <Button variant="outline" className="gap-2" onClick={() => void resume()} disabled={busy !== null || !status || status.stage !== "paused"}>
+                <Play className="size-4" /> {busy === "resume" ? "Resuming…" : `Resume with ${workers}`}
               </Button>
-              <Button variant="outline" className="gap-2 text-destructive" onClick={() => void control("abort")} disabled={busy !== null || TERMINAL.has(status.stage)}>
-                <Square className="size-4" /> Stop
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                <Users className="size-4" />
+                <select
+                  aria-label="Workers"
+                  className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+                  value={workers}
+                  onChange={(event) => setWorkerChoice(Number(event.target.value))}
+                  disabled={busy !== null}
+                >
+                  {WORKER_CHOICES.map((count) => (
+                    <option key={count} value={count}>
+                      {count} worker{count === 1 ? "" : "s"}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <Button variant="outline" className="gap-2" onClick={() => void scale()} disabled={busy !== null || !running || workers === status.workersAuthorised}>
+                <Users className="size-4" /> Apply workforce
+              </Button>
+              <Button variant="outline" className="gap-2" onClick={() => void stopContainers()} disabled={busy !== null || TERMINAL.has(status.stage)}>
+                <Power className="size-4" /> Stop containers
+              </Button>
+              <Button variant="outline" className="gap-2 text-destructive" onClick={() => void abort()} disabled={busy !== null || TERMINAL.has(status.stage)}>
+                <Square className="size-4" /> Abort job
               </Button>
               <span className="text-xs text-muted-foreground">
                 Budget gates: $40 warning · $45 no new tasks · $50 pause. These are application guards over an estimate, not a Cloudflare billing cap.
               </span>
             </div>
+
+            {shutdown ? <ShutdownReport summary={shutdown} /> : null}
 
             {status.errors.length ? (
               <ul className="space-y-1 rounded-lg border border-destructive/20 bg-destructive/5 p-3 text-xs text-destructive">
@@ -356,6 +442,40 @@ export function SwarmLaunch({ authorized, staging }: { authorized: boolean; stag
         </DialogContent>
       </Dialog>
     </Section>
+  );
+}
+
+/**
+ * The real answer to a stop request, worker by worker.
+ *
+ * The previous control could only say "pause recorded". This says which containers are
+ * actually down, which refused, and whether the task each was holding went back to the
+ * queue instead of being stranded on a container that no longer exists.
+ */
+export function ShutdownReport({ summary }: { summary: SwarmStopSummary }) {
+  return (
+    <div className="rounded-lg border bg-muted/30 p-3 text-xs">
+      <p className="font-medium">
+        Container shutdown: {summary.stopped} of {summary.requested} succeeded
+        {summary.failed ? ` · ${summary.failed} failed` : ""}
+      </p>
+      {summary.error ? <p className="mt-1 text-destructive">{summary.error}</p> : null}
+      {summary.results.length ? (
+        <ul className="mt-2 grid gap-1 sm:grid-cols-2 lg:grid-cols-4">
+          {summary.results.map((result) => (
+            <li key={result.workerId} className={result.ok ? "text-muted-foreground" : "text-destructive"}>
+              <span className="font-mono">{result.workerId}</span>{" "}
+              {result.ok ? "stopped" : (result.error ?? "failed")}
+              {result.releasedTaskId
+                ? result.releaseConfirmed
+                  ? ` · released ${result.releasedTaskId}`
+                  : ` · ${result.releasedTaskId} left to lease expiry`
+                : " · idle"}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
   );
 }
 

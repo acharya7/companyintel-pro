@@ -36,21 +36,26 @@
 import {
   SWARM,
   SWARM_BUDGET,
+  SWARM_WORKER_COUNT,
   budgetLevel,
   planSourceRanges,
   swarmCost,
   swarmShardTasks,
   swarmTaskId,
+  swarmWorkerIndex,
   type SwarmAccounting,
   type SwarmBlockDescriptor,
   type SwarmPlan,
   type SwarmRange,
+  type SwarmRangeAudit,
+  type SwarmRangeAuditEntry,
   type SwarmSourceProgress,
   type SwarmStage,
   type SwarmStatus,
   type SwarmTask,
   type SwarmTaskKind,
   type SwarmTaskResult,
+  type SwarmTaskState,
   type SwarmWorkerState,
 } from "../../src/shared/cloud/swarm";
 import { planRefBases, type RefAllocation } from "../../src/shared/cloud/ref-space";
@@ -109,7 +114,31 @@ const KEYS = {
   windowStart: "windowStart",
   rowsAtWindowStart: "rowsAtWindowStart",
   searchable: "searchable",
+  /**
+   * The operator's CURRENT workforce size (1…16), separate from `plan.workers`.
+   *
+   * The plan records what the run was authorised with; this records what is running
+   * now, so scaling down is a durable decision the coordinator enforces on the next
+   * claim instead of a client-side convention.
+   */
+  activeWorkers: "activeWorkers",
+  /** When the run was paused, and how many leases the pause handed back. */
+  pausedAt: "pausedAt",
+  /**
+   * The leases currently out, keyed by task id.
+   *
+   * Checking this (a handful of entries) is cheap enough to do on every claim, so an
+   * expired lease is recovered BEFORE new work is handed out. The full plan scan
+   * (`sweepStranded`) stays as the level-triggered fallback for leases written by the
+   * previous version, which kept no such index.
+   */
+  leases: "leases",
 } as const;
+
+interface LeaseEntry {
+  workerId: string;
+  until: number;
+}
 
 export class IndexingCoordinator implements DurableObject {
   constructor(
@@ -131,14 +160,20 @@ export class IndexingCoordinator implements DurableObject {
           return json(await this.complete(await readBody(request)));
         case "POST /fail":
           return json(await this.fail(await readBody(request)));
+        case "POST /release":
+          return json(await this.release(await readBody(request)));
         case "POST /pause":
-          return json(await this.control("paused", "paused by operator"));
+          return json(await this.pause(await readBody(request)));
         case "POST /resume":
           return json(await this.resume());
         case "POST /abort":
           return json(await this.control("aborted", "aborted by operator"));
+        case "POST /workers":
+          return json(await this.setWorkers(await readBody(request)));
         case "GET /status":
           return json(await this.status());
+        case "GET /ranges":
+          return json(await this.rangeAudit(url));
         default:
           return json({ error: { code: "not_found", message: `No coordinator route for ${request.method} ${url.pathname}` } }, 404);
       }
@@ -160,6 +195,7 @@ export class IndexingCoordinator implements DurableObject {
     if (!plan.sources.length) throw new Error("A swarm plan needs at least one source.");
 
     await this.state.storage.put(KEYS.plan, plan);
+    await this.state.storage.put(KEYS.activeWorkers, clampActive(plan.workers));
     await this.state.storage.put(KEYS.stage, "blocks" satisfies SwarmStage);
     await this.state.storage.put(KEYS.perSource, Object.fromEntries(plan.sources.map((source) => [source.id, emptyProgress()])));
     await this.state.storage.put(KEYS.counters, {
@@ -210,7 +246,16 @@ export class IndexingCoordinator implements DurableObject {
     // A task whose lease expired belongs back in the queue before anything is handed
     // out: otherwise a worker that died mid-range would strand that range forever.
     await this.reclaimExpired();
+    await this.reclaimIndexed();
     const stage = (await this.state.storage.get<SwarmStage>(KEYS.stage)) ?? "planned";
+    // A worker id above the operator's active workforce is RETIRED, not merely
+    // unlucky: it is told to stop so "use four workers" cannot leave 04…15 running.
+    const active = await this.activeWorkers(plan);
+    const index = swarmWorkerIndex(workerId);
+    if (index !== null && index >= active) {
+      await this.touchWorker(workerId, null);
+      return { task: null, stage, stop: "retired", workersAuthorised: active };
+    }
     const stop = await this.stopFor(stage, plan);
     if (stop) {
       await this.touchWorker(workerId, null);
@@ -220,13 +265,27 @@ export class IndexingCoordinator implements DurableObject {
     const kind = kindForStage(stage);
     let task = await this.takePending(kind, workerId);
     if (!task) {
+      /*
+       * Nothing was queued. Before concluding the phase is finished, look for tasks
+       * that are leased but whose lease can no longer be renewed — the exact state a
+       * coordinator is left in when a worker dies (or is destroyed) after its lease
+       * was written but before it reported anything. Without this sweep such a range
+       * is invisible forever: it is in no queue, and a worker record that was cleared
+       * no longer names it, so the phase can neither progress nor be diagnosed.
+       */
+      const swept = await this.sweepStranded(kind);
+      if (swept) task = await this.takePending(kind, workerId);
+    }
+    if (!task) {
       // The queue is empty: the phase may have completed. Advance and try once more.
       const advanced = await this.advance(plan, stage);
       if (advanced) {
         const nextStage = (await this.state.storage.get<SwarmStage>(KEYS.stage)) ?? stage;
         const nextStop = await this.stopFor(nextStage, plan);
         if (nextStop) return { task: null, stage: nextStage, stop: nextStop };
-        task = await this.takePending(kindForStage(nextStage), workerId);
+        const nextKind = kindForStage(nextStage);
+        task = await this.takePending(nextKind, workerId);
+        if (!task && (await this.sweepStranded(nextKind))) task = await this.takePending(nextKind, workerId);
       }
     }
     if (!task) {
@@ -263,6 +322,7 @@ export class IndexingCoordinator implements DurableObject {
         claimedAt: new Date(now).toISOString(),
       };
       await this.state.storage.put(KEYS.task(id), leased);
+      await this.setLease(id, workerId, now + SWARM.leaseMs);
       await this.touchWorker(workerId, id);
       return leased;
     }
@@ -285,6 +345,7 @@ export class IndexingCoordinator implements DurableObject {
       const task = await this.state.storage.get<SwarmTask>(KEYS.task(worker.taskId));
       if (!task || task.state !== "leased") continue;
       if ((task.leaseUntil ?? 0) > now) continue;
+      await this.dropLease(task.id);
       const parked = task.attempts >= SWARM.maxAttempts;
       await this.state.storage.put(KEYS.task(task.id), {
         ...task,
@@ -305,6 +366,359 @@ export class IndexingCoordinator implements DurableObject {
       reclaimed += 1;
     }
     return reclaimed;
+  }
+
+  /* -------------------------------- leases --------------------------------- */
+
+  private async leaseIndex(): Promise<Record<string, LeaseEntry>> {
+    return (await this.state.storage.get<Record<string, LeaseEntry>>(KEYS.leases)) ?? {};
+  }
+
+  private async setLease(taskId: string, workerId: string, until: number): Promise<void> {
+    const leases = await this.leaseIndex();
+    leases[taskId] = { workerId, until };
+    await this.state.storage.put(KEYS.leases, leases);
+  }
+
+  private async dropLease(taskId: string): Promise<void> {
+    const leases = await this.leaseIndex();
+    if (!(taskId in leases)) return;
+    delete leases[taskId];
+    await this.state.storage.put(KEYS.leases, leases);
+  }
+
+  /**
+   * Requeue every indexed lease that has expired — before new work is handed out.
+   *
+   * The old coordinator reclaimed expired leases only through a worker record, so the
+   * sequence "container disappears → the worker's next idle claim clears its taskId"
+   * erased the only pointer to a live lease. The range stayed `leased` forever, absent
+   * from every queue, and the run could never finish. This index is written by the
+   * claim itself, so no worker bookkeeping can make a lease disappear again.
+   */
+  private async reclaimIndexed(): Promise<number> {
+    const leases = await this.leaseIndex();
+    const now = Date.now();
+    let reclaimed = 0;
+    for (const [taskId, lease] of Object.entries(leases)) {
+      if (lease.until > now) continue;
+      const task = await this.state.storage.get<SwarmTask>(KEYS.task(taskId));
+      if (task && task.state === "leased") {
+        const parked = task.attempts >= SWARM.maxAttempts;
+        await this.state.storage.put(KEYS.task(task.id), {
+          ...task,
+          state: parked ? "parked" : "pending",
+          leaseOwner: undefined,
+          leaseUntil: undefined,
+          error: parked ? `lease expired ${task.attempts} time(s)` : task.error,
+        } satisfies SwarmTask);
+        if (parked) await this.bumpCounter("parked");
+        else await this.enqueue(task.id, task.kind);
+        reclaimed += 1;
+      }
+      await this.dropLease(taskId);
+    }
+    return reclaimed;
+  }
+
+  /**
+   * Hand a leased task back to its queue because an OPERATOR stopped its worker.
+   *
+   * This is the difference between a pause and a failure:
+   *
+   *   - the task is NOT counted as failed and never parked, so a stop cannot consume
+   *     one of its `maxAttempts` retries;
+   *   - the attempt that was in flight is given back, so a run paused and resumed
+   *     repeatedly still has its full retry budget;
+   *   - nothing about the plan, the counters, the committed objects or the version is
+   *     touched, so the same coordinator resumes the same job.
+   *
+   * A range that was interrupted mid-flight is simply redone later: its `runRange`
+   * writes deterministic keys and only writes its chunk manifest once it has covered
+   * the whole range, so a redo overwrites its own partial output and can never be
+   * counted twice.
+   */
+  private async releaseTask(task: SwarmTask, reason: string): Promise<boolean> {
+    const now = Date.now();
+    await this.dropLease(task.id);
+    await this.state.storage.put(KEYS.task(task.id), {
+      ...task,
+      state: "pending",
+      leaseOwner: undefined,
+      leaseUntil: undefined,
+      attempts: Math.max(0, task.attempts - 1),
+      interruptedAt: new Date(now).toISOString(),
+      interruptions: (task.interruptions ?? 0) + 1,
+      interruptReason: reason.slice(0, 200),
+    } satisfies SwarmTask);
+    await this.enqueue(task.id, task.kind);
+    return true;
+  }
+
+  /** Put an id at the FRONT of its queue, once. */
+  private async enqueue(taskId: string, kind: SwarmTaskKind): Promise<void> {
+    const queueKey = KEYS.queue(kind);
+    const queue = (await this.state.storage.get<string[]>(queueKey)) ?? [];
+    if (queue.includes(taskId)) return;
+    queue.unshift(taskId);
+    await this.state.storage.put(queueKey, queue);
+  }
+
+  /**
+   * Recover every task that is leased but can no longer be renewed.
+   *
+   * This is the stall fix. The previous coordinator only looked for stranded tasks
+   * through a worker record, so a task whose worker record had been cleared (an idle
+   * claim after a container disappeared does exactly that) was in no queue, named by
+   * nobody, and invisible forever — the run could never finish and no status field
+   * said why. The sweep derives candidate ids from the PLAN instead, so it finds them
+   * regardless of what the worker records say, and works on coordinator state written
+   * by the previous version too (no migration, no reset).
+   */
+  private async sweepStranded(kind: SwarmTaskKind, options: { force?: boolean } = {}): Promise<number> {
+    const plan = await this.requirePlan();
+    const counters = await this.counters();
+    if (!(await this.outstanding(kind, counters))) return 0;
+    const ids = await this.taskIdsForKind(kind, plan, counters);
+    const now = Date.now();
+    let reclaimed = 0;
+    for (let offset = 0; offset < ids.length; offset += 128) {
+      const slice = ids.slice(offset, offset + 128);
+      // Storage keys, not task ids: `t:<id>` is the durable key of a task record.
+      const batch = await this.state.storage.get<SwarmTask>(slice.map((id) => KEYS.task(id)));
+      for (const id of slice) {
+        const task = batch.get(KEYS.task(id));
+        if (!task || task.state !== "leased") continue;
+        if (!options.force && (task.leaseUntil ?? 0) > now) continue;
+        if (options.force) {
+          // An operator stop is an interruption, not a failed attempt.
+          await this.releaseTask(task, "released by operator");
+        } else {
+          await this.dropLease(task.id);
+          const parked = task.attempts >= SWARM.maxAttempts;
+          await this.state.storage.put(KEYS.task(task.id), {
+            ...task,
+            state: parked ? "parked" : "pending",
+            leaseOwner: undefined,
+            leaseUntil: undefined,
+            error: parked ? `lease expired ${task.attempts} time(s)` : task.error,
+          } satisfies SwarmTask);
+          if (parked) await this.bumpCounter("parked");
+          else await this.enqueue(task.id, task.kind);
+        }
+        reclaimed += 1;
+      }
+    }
+    if (reclaimed) {
+      const errors = (await this.state.storage.get<{ at: string; taskId: string; message: string }[]>(KEYS.errors)) ?? [];
+      await this.state.storage.put(
+        KEYS.errors,
+        [
+          ...errors,
+          {
+            at: new Date().toISOString(),
+            taskId: `${kind}:*`,
+            message: options.force
+              ? `released ${reclaimed} interrupted ${kind} task(s); they will be retried, not failed`
+              : `reclaimed ${reclaimed} ${kind} task(s) whose lease had expired`,
+          },
+        ].slice(-10),
+      );
+    }
+    return reclaimed;
+  }
+
+  /** Is there anything left of this kind for the current plan? */
+  private async outstanding(kind: SwarmTaskKind, counters: Counters): Promise<boolean> {
+    if (kind === "block") return counters.blocksDone < counters.blocksTotal;
+    if (kind === "range") return counters.rangesTotal === 0 || counters.rangesDone < counters.rangesTotal;
+    if (kind === "merge_partition") return counters.mergesDone < counters.mergesTotal;
+    if (kind === "assemble_shard") return counters.shardsDone < counters.shardsTotal;
+    // Single-owner tasks: always worth one read.
+    return true;
+  }
+
+  /** Every task id the plan says belongs to a kind — independent of any worker record. */
+  private async taskIdsForKind(kind: SwarmTaskKind, plan: SwarmPlan, counters: Counters): Promise<string[]> {
+    const ids: string[] = [];
+    if (kind === "block") {
+      for (const source of plan.sources) {
+        for (let index = 0; index < source.blocks; index += 1) ids.push(swarmTaskId("block", source.id, index));
+      }
+      return ids;
+    }
+    if (kind === "range") {
+      for (const source of plan.sources) {
+        const ranges = (await this.state.storage.get<SwarmRange[]>(KEYS.ranges(source.id))) ?? [];
+        for (const range of ranges) ids.push(swarmTaskId("range", source.id, range.index));
+      }
+      return ids;
+    }
+    if (kind === "merge_partition") {
+      for (let partition = 0; partition < counters.mergesTotal; partition += 1) ids.push(swarmTaskId("merge_partition", "all", partition));
+      return ids;
+    }
+    if (kind === "assemble_shard") {
+      if (!plan.shards) return ids;
+      for (const task of swarmShardTasks(plan.shards)) ids.push(swarmTaskId("assemble_shard", task.kind, task.shard));
+      return ids;
+    }
+    if (kind === "finalize") return [swarmTaskId("finalize", "all", 0)];
+    return [swarmTaskId("merge", "all", 0)];
+  }
+
+  /**
+   * Pause the run AND hand back every in-flight lease.
+   *
+   * The old pause only set the stage. Because a worker polls its in-flight task
+   * before it asks the coordinator anything, that left every container running (and
+   * billing) until its range happened to end — and stopped nothing if the range never
+   * ended. Pausing now releases the leases first, so the stop that follows cannot
+   * fail a task, park it, or lose the work it had not committed.
+   */
+  private async pause(body: { by?: string; reason?: string; release?: boolean }): Promise<SwarmStatus & { released: string[] }> {
+    const reason = typeof body.reason === "string" && body.reason.trim() ? body.reason.trim().slice(0, 300) : "paused by operator";
+    await this.control("paused", reason);
+    const released = body.release === false ? [] : await this.releaseAll(reason);
+    await this.state.storage.put(KEYS.pausedAt, {
+      at: new Date().toISOString(),
+      by: typeof body.by === "string" ? body.by : null,
+      released: released.length,
+    });
+    return { ...(await this.status()), released };
+  }
+
+  /** Release every in-flight task, across every phase. */
+  private async releaseAll(reason: string): Promise<string[]> {
+    const plan = await this.requirePlan();
+    const counters = await this.counters();
+    const released: string[] = [];
+    for (const kind of ["block", "range", "merge_partition", "assemble_shard", "finalize", "merge"] as const) {
+      const ids = await this.taskIdsForKind(kind, plan, counters);
+      for (let offset = 0; offset < ids.length; offset += 128) {
+        const slice = ids.slice(offset, offset + 128);
+        const batch = await this.state.storage.get<SwarmTask>(slice.map((id) => KEYS.task(id)));
+        for (const id of slice) {
+          const task = batch.get(KEYS.task(id));
+          if (!task || task.state !== "leased") continue;
+          await this.releaseTask(task, reason);
+          released.push(task.id);
+        }
+      }
+    }
+    if (released.length) {
+      const workers = (await this.state.storage.get<Record<string, SwarmWorkerState>>(KEYS.workers)) ?? {};
+      const now = Date.now();
+      for (const worker of Object.values(workers)) {
+        if (!worker.taskId || !released.includes(worker.taskId)) continue;
+        await this.setWorker(worker.id, (entry) => ({ ...entry, taskId: null, taskStartedAt: null, lastSeen: now }));
+      }
+    }
+    return released;
+  }
+
+  /** Worker → coordinator: "I am stopping; take my task back, do not call it a failure". */
+  private async release(body: { workerId?: string; taskId?: string; reason?: string }): Promise<unknown> {
+    if (!body.taskId) throw new Error("taskId is required");
+    const task = await this.state.storage.get<SwarmTask>(KEYS.task(body.taskId));
+    if (!task) return { ok: false, taskId: body.taskId, reason: "unknown_task" };
+    if (task.state !== "leased") {
+      return { ok: true, taskId: task.id, state: task.state, requeued: false, note: "the task is no longer leased" };
+    }
+    const reason = typeof body.reason === "string" && body.reason.trim() ? body.reason.trim().slice(0, 200) : "released by worker";
+    await this.releaseTask(task, reason);
+    if (typeof body.workerId === "string" && /^indexer-worker-\d{2}$/.test(body.workerId)) {
+      await this.setWorker(body.workerId, (worker) => ({ ...worker, taskId: null, taskStartedAt: null, lastSeen: Date.now() }));
+    }
+    return { ok: true, taskId: task.id, state: "pending", requeued: true };
+  }
+
+  /* -------------------------------- workforce ------------------------------ */
+
+  private async activeWorkers(plan: SwarmPlan): Promise<number> {
+    const stored = await this.state.storage.get<number>(KEYS.activeWorkers);
+    return clampActive(stored ?? plan.workers);
+  }
+
+  /** The operator's current workforce size. Refuses to exceed the platform ceiling. */
+  private async setWorkers(body: { count?: unknown; workers?: unknown }): Promise<{ ok: boolean; workers: number; status: SwarmStatus }> {
+    const requested = Number(body.count ?? body.workers);
+    if (!Number.isInteger(requested) || requested < 1 || requested > SWARM_WORKER_COUNT) {
+      throw new Error(`count must be an integer between 1 and ${SWARM_WORKER_COUNT}.`);
+    }
+    await this.state.storage.put(KEYS.activeWorkers, requested);
+    return { ok: true, workers: requested, status: await this.status() };
+  }
+
+  /* -------------------------------- audit ---------------------------------- */
+
+  /**
+   * Every range task with its real byte span, state and retry count.
+   *
+   * This is how "14 ranges remain and they hold 15.1 GB" stops being an inference: the
+   * plan's own bounds say which ranges are disproportionate, which are leased, and how
+   * many attempts each has spent. It reads the durable task records and never mutates
+   * anything, so it is safe to call on a paused production job.
+   */
+  private async rangeAudit(url: URL): Promise<SwarmRangeAudit> {
+    const plan = await this.requirePlan();
+    const sourceFilter = url.searchParams.get("source");
+    const stateFilter = url.searchParams.get("state") as SwarmTaskState | null;
+    const sources = sourceFilter ? plan.sources.filter((source) => source.id === sourceFilter) : plan.sources;
+    const counts: Record<SwarmTaskState, number> = { pending: 0, leased: 0, done: 0, failed: 0, parked: 0 };
+    const entries: SwarmRangeAuditEntry[] = [];
+    let bytesPlanned = 0;
+    let bytesDone = 0;
+    let oversized = 0;
+    for (const source of sources) {
+      const ranges = (await this.state.storage.get<SwarmRange[]>(KEYS.ranges(source.id))) ?? [];
+      for (let offset = 0; offset < ranges.length; offset += 128) {
+        const slice = ranges.slice(offset, offset + 128);
+        const batch = await this.state.storage.get<SwarmTask>(
+          slice.map((range) => KEYS.task(swarmTaskId("range", source.id, range.index))),
+        );
+        for (const range of slice) {
+          const id = swarmTaskId("range", source.id, range.index);
+          const task = batch.get(KEYS.task(id));
+          const bytes = range.end - range.start;
+          const state = task?.state ?? "pending";
+          counts[state] += 1;
+          bytesPlanned += bytes;
+          if (state === "done") bytesDone += bytes;
+          const isOversized = bytes > SWARM.oversizedRangeBytes;
+          if (isOversized) oversized += 1;
+          if (stateFilter && state !== stateFilter) continue;
+          entries.push({
+            id,
+            sourceId: source.id,
+            index: range.index,
+            start: range.start,
+            end: range.end,
+            bytes,
+            state,
+            attempts: task?.attempts ?? 0,
+            baseLine: range.baseLine,
+            ...(task?.leaseOwner ? { leaseOwner: task.leaseOwner } : {}),
+            ...(task?.leaseUntil ? { leaseUntil: task.leaseUntil } : {}),
+            ...(task?.claimedAt ? { claimedAt: task.claimedAt } : {}),
+            ...(task?.completedAt ? { completedAt: task.completedAt } : {}),
+            ...(task?.error ? { error: task.error } : {}),
+            ...(task?.result ? { rows: task.result.rows } : {}),
+            oversized: isOversized,
+          });
+        }
+      }
+    }
+    entries.sort((a, b) => a.sourceId.localeCompare(b.sourceId) || a.index - b.index);
+    return {
+      version: plan.version,
+      sourceId: sourceFilter,
+      state: stateFilter,
+      planned: entries.length,
+      counts,
+      totals: { bytesPlanned, bytesDone, bytesOutstanding: Math.max(0, bytesPlanned - bytesDone), oversized },
+      ranges: entries,
+    };
   }
 
   /* --------------------------------- phase --------------------------------- */
@@ -650,6 +1064,7 @@ export class IndexingCoordinator implements DurableObject {
     taskId?: string;
     result?: SwarmTaskResult;
     block?: SwarmBlockDescriptor;
+    coverage?: { start: number; end: number };
     searchable?: { rows: number; companies?: number; contacts?: number; note?: string };
   }): Promise<unknown> {
     const workerId = requireWorkerId(body.workerId);
@@ -657,9 +1072,22 @@ export class IndexingCoordinator implements DurableObject {
     const task = await this.state.storage.get<SwarmTask>(KEYS.task(body.taskId));
     if (!task) throw new Error(`Unknown task ${body.taskId}`);
     if (task.state === "done") return { ok: true, duplicate: true, status: await this.status() };
-
+    /*
+     * A range is complete only when it covered its whole span. The worker reports the
+     * manifest's real byte range, and this refuses to count anything else: a range that
+     * stopped early must stay outstanding (and be redone), never become a silent gap
+     * that Pass 2 merges as if the bytes had been parsed.
+     */
+    if (task.kind === "range" && body.coverage) {
+      if (body.coverage.start !== task.start || body.coverage.end !== task.end) {
+        throw new Error(
+          `Range ${task.id} covered ${body.coverage.start}..${body.coverage.end}, but its task is ${task.start}..${task.end}; a partial range is not a completed range.`,
+        );
+      }
+    }
     const result = body.result ?? { rows: 0, rejected: 0, segments: 0, segmentBytes: 0, bytesRead: 0, classA: 0, classB: 0 };
     const now = Date.now();
+    await this.dropLease(task.id);
     await this.state.storage.put(KEYS.task(task.id), {
       ...task,
       state: "done",
@@ -719,6 +1147,7 @@ export class IndexingCoordinator implements DurableObject {
     if (!task) throw new Error(`Unknown task ${body.taskId}`);
     const message = (body.error ?? "unknown failure").slice(0, 500);
     const parked = task.attempts >= SWARM.maxAttempts;
+    await this.dropLease(task.id);
     await this.state.storage.put(
       KEYS.task(task.id),
       { ...task, state: parked ? "parked" : "pending", leaseOwner: undefined, leaseUntil: undefined, error: message } satisfies SwarmTask,
@@ -751,6 +1180,9 @@ export class IndexingCoordinator implements DurableObject {
       const task = await this.state.storage.get<SwarmTask>(KEYS.task(worker.taskId));
       if (task && task.state === "leased") {
         await this.state.storage.put(KEYS.task(task.id), { ...task, leaseUntil: now + SWARM.leaseMs } satisfies SwarmTask);
+        // The index must move with the task, or a healthy long range would look
+        // abandoned to `reclaimIndexed` 15 minutes after it was claimed.
+        await this.setLease(task.id, workerId, now + SWARM.leaseMs);
       }
     }
     await this.touchWorker(workerId, worker?.taskId ?? null);
@@ -767,6 +1199,14 @@ export class IndexingCoordinator implements DurableObject {
 
   private async resume(): Promise<SwarmStatus> {
     const counters = await this.counters();
+    // Requeue anything a pause (or a dead worker) left leased before the run
+    // continues. Otherwise the queues would look empty while ranges are still held,
+    // which is exactly the "resume produced no new work" failure this repairs.
+    await this.sweepStranded("block", { force: true });
+    await this.sweepStranded("range", { force: true });
+    await this.sweepStranded("merge_partition", { force: true });
+    await this.sweepStranded("assemble_shard", { force: true });
+    await this.sweepStranded("finalize", { force: true });
     // A paused run resumes in the phase its queues describe, never by replaying a
     // phase whose tasks are already committed.
     const stage: SwarmStage =
@@ -781,6 +1221,7 @@ export class IndexingCoordinator implements DurableObject {
               : "finalize";
     await this.state.storage.put(KEYS.stage, stage);
     await this.state.storage.delete(KEYS.stopReason);
+    await this.state.storage.delete(KEYS.pausedAt);
     return this.status();
   }
 
@@ -911,7 +1352,7 @@ export class IndexingCoordinator implements DurableObject {
       updatedAt: new Date(now).toISOString(),
       mode: plan.mode,
       partitions: plan.partitions,
-      workersAuthorised: plan.workers,
+      workersAuthorised: await this.activeWorkers(plan),
       workersActive: activeWorkers,
       tasks: {
         blocksPending: Math.max(0, counters.blocksTotal - counters.blocksDone),
@@ -1066,6 +1507,12 @@ function kindForStage(stage: SwarmStage): SwarmTaskKind {
 
 function cloudPrefix(version: string): string {
   return `cloud/jobs/${version}`;
+}
+
+/** 1…16, with a missing/zero value falling back to the platform ceiling. */
+function clampActive(value: number): number {
+  if (!Number.isFinite(value)) return SWARM_WORKER_COUNT;
+  return Math.max(1, Math.min(SWARM_WORKER_COUNT, Math.floor(value) || SWARM_WORKER_COUNT));
 }
 
 function requireWorkerId(value: string | undefined): string {
