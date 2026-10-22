@@ -1382,6 +1382,19 @@ export interface RunOptions {
    */
   cloud?: CloudMergeIo;
   /**
+   * Parallel merge: first document ref of this run (default 0).
+   *
+   * Must be an aligned base from `planRefBases` (a multiple of 1000), because the
+   * reader maps a ref to an object with `ref / 250` (companies) and `ref / 1000`
+   * (contacts). Two partitions sharing an object would be written by two containers.
+   */
+  refBase?: number;
+  /**
+   * Parallel merge: merge only these spool partitions (by partition number).
+   * Omitted = every partition, which is the sequential run.
+   */
+  mergePartitions?: number[];
+  /**
    * Resume a Cloud Pass 2 whose merge already finished: skip the partition loop and
    * rebuild only the index shards, manifests and validation from the R2 state the
    * snapshot records. Set only by `tools/cloud/pass2.ts` from its durable
@@ -2319,15 +2332,28 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   const contactStats = { byDesignation: new Map<string, number>(), byDepartment: new Map<string, number>(), bySeniority: new Map<string, number>() };
   const coverage = { email: 0, linkedin: 0, phone: 0, neither: 0 };
 
-  let globalRef = 0;
+  /*
+   * Partition-scoped document references.
+   *
+   * A sequential run starts at ref 0. A parallel merge gives every spool partition
+   * its own aligned slice of the ref space (`planRefBases`), so two containers can
+   * merge two partitions at the same time without ever naming the same ref — or, and
+   * this is the part that matters, the same OBJECT: the object index is `ref / 250`
+   * (or `ref / 1000` for contacts), which is why the base must be aligned to 1000.
+   *
+   * Both counters below are object indices, not refs, so they must be derived from
+   * the base; leaving them at 0 is what would make a partition task overwrite the
+   * first partition's objects.
+   */
+  let globalRef = options.refBase ?? 0;
   let companyBuffer: Company[] = [];
   /** Ref of the first company in the current buffer (the object's `firstRef`). */
-  let companyBufferStart = 0;
+  let companyBufferStart = globalRef;
   let contactBuffer = new Map<number, Contact[]>();
   /** Object index currently being buffered, not a ref — see `flushContacts`. */
-  let contactBufferBucket = 0;
-  let companyPartitionIndex = 0;
-  let contactPartitionIndex = 0;
+  let contactBufferBucket = Math.floor(globalRef / SHARDING.companiesPerContactPartition);
+  let companyPartitionIndex = Math.floor(globalRef / SHARDING.companiesPerPartition);
+  let contactPartitionIndex = Math.floor(globalRef / SHARDING.companiesPerContactPartition);
   let companyDetailPartitions = 0;
   let contactDetailPartitions = 0;
 
@@ -2450,8 +2476,19 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   /** Timestamp of the last progress or heartbeat line, so heartbeats cannot spam. */
   let lastEmitAt = mergeStart;
 
-  for (let fileIndex = mergeResume ? spoolEntries.length : 0; fileIndex < spoolEntries.length; fileIndex += 1) {
-    const entry = spoolEntries[fileIndex];
+  /*
+   * Which partitions this run merges.
+   *
+   * Default: every partition in order, which is the sequential run and stays byte
+   * identical. `mergePartitions` narrows it to the partitions a parallel task owns;
+   * the ref base is what keeps their output disjoint. Ordering is preserved so a
+   * subset replays deterministically.
+   */
+  const mergeEntries = options.mergePartitions
+    ? spoolEntries.filter((entry) => options.mergePartitions!.includes(entry.partition))
+    : spoolEntries;
+  for (let fileIndex = mergeResume ? mergeEntries.length : 0; fileIndex < mergeEntries.length; fileIndex += 1) {
+    const entry = mergeEntries[fileIndex]!;
     const path = join(spoolDir, entry.file);
     const partitionStart = Date.now();
 
@@ -2966,12 +3003,15 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
      * on, plus how long this partition took.
      */
     const processedPartitions = fileIndex + 1;
+    // A parallel task merges a subset: progress and ETA describe THAT task's work,
+    // not the whole index (the coordinator aggregates the real fraction).
+    const partitionTotal = mergeEntries.length;
     const elapsedMs = Date.now() - mergeStart;
     const partitionMs = Date.now() - partitionStart;
     const etaSeconds =
-      processedPartitions > 0 && processedPartitions < totalPartitions && elapsedMs > 0
-        ? Math.round(((elapsedMs / processedPartitions) * (totalPartitions - processedPartitions)) / 1000)
-        : processedPartitions === totalPartitions
+      processedPartitions > 0 && processedPartitions < partitionTotal && elapsedMs > 0
+        ? Math.round(((elapsedMs / processedPartitions) * (partitionTotal - processedPartitions)) / 1000)
+        : processedPartitions === partitionTotal
           ? 0
           : null;
     const companiesPerSecond = elapsedMs > 0 ? Math.round(counters.uniqueCompanies / (elapsedMs / 1000)) : null;
@@ -2983,10 +3023,10 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       rowsRejected: counters.rowsRejected,
       companies: counters.uniqueCompanies,
       contacts: counters.uniqueContacts,
-      progress: processedPartitions / totalPartitions,
+      progress: processedPartitions / Math.max(1, partitionTotal),
       etaSeconds,
       message:
-        `pass 2: ${processedPartitions}/${totalPartitions} partitions · ${counters.uniqueCompanies.toLocaleString()} companies · ` +
+        `pass 2: ${processedPartitions}/${partitionTotal} partitions · ${counters.uniqueCompanies.toLocaleString()} companies · ` +
         `${counters.uniqueContacts.toLocaleString()} contacts (${(counters.contactsUnresolved ?? 0).toLocaleString()} kept without an employer) · ${(elapsedMs / 1000).toFixed(1)}s elapsed · ` +
         `${companiesPerSecond === null ? "-" : companiesPerSecond.toLocaleString()} companies/s · ` +
         `ETA ${etaSeconds === null || etaSeconds === 0 ? "-" : `${Math.floor(etaSeconds / 60)}m${String(etaSeconds % 60).padStart(2, "0")}s`}` +
