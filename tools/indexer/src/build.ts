@@ -1342,6 +1342,19 @@ export interface CloudMergeResume {
 
 
 
+/**
+ * Thrown by `runIndex` when a merge-only run has committed its partition artifacts.
+ *
+ * Carries the `CloudMergeResume` snapshot so a parallel partition task can report
+ * counters and objects without re-reading R2. Callers use `runPartitionMerge`.
+ */
+export class MergeOnlyComplete extends Error {
+  constructor(readonly snapshot: CloudMergeResume) {
+    super("merge-only run complete: partition artifacts are written, finalize was skipped");
+    this.name = "MergeOnlyComplete";
+  }
+}
+
 export interface RunOptions {
   /** Hard cap on records per source (sample runs). */
   sampleLimit?: number;
@@ -1394,6 +1407,12 @@ export interface RunOptions {
    * Omitted = every partition, which is the sequential run.
    */
   mergePartitions?: number[];
+  /**
+   * Stop after the merge, before FINALIZE (parallel merge). Throws
+   * `MergeOnlyComplete` carrying the snapshot; use `runPartitionMerge` instead of
+   * calling `runIndex` directly.
+   */
+  mergeOnly?: boolean;
   /**
    * Resume a Cloud Pass 2 whose merge already finished: skip the partition loop and
    * rebuild only the index shards, manifests and validation from the R2 state the
@@ -3069,10 +3088,14 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
   shardWriter.close();
   await new Promise<void>((resolve) => rejected.end(resolve));
 
-  // The merge is finished and every shard part is in R2: record everything the
-  // finalize phase needs, so a restart from here never repeats the merge.
-  if (cloud?.onMergeComplete) {
-    await cloud.onMergeComplete({
+  /*
+   * Snapshot of everything the finalize phase needs.
+   *
+   * It is built once here for three consumers: the single-job cloud driver
+   * (`onMergeComplete`), a parallel partition task (the returned snapshot, which the
+   * coordinator aggregates) and the merge-only early exit below.
+   */
+  const mergeSnapshot: CloudMergeResume = {
       counters,
       companyStats: {
         byIndustry: [...companyStats.byIndustry.entries()],
@@ -3095,8 +3118,23 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       contactDetailPartitions,
       globalRef,
       objects: writer.objects,
-    });
-  }
+  };
+
+  // The merge is finished and every shard part is in R2: record it so a restart from
+  // here never repeats the merge.
+  if (cloud?.onMergeComplete) await cloud.onMergeComplete(mergeSnapshot);
+
+  /*
+   * Parallel merge: stop before FINALIZE.
+   *
+   * In the swarm a partition task must NEVER reach finalize: finalize writes the final
+   * index shard objects, which are shared by all partitions, so a per-partition
+   * finalize would have 256 containers overwrite one another's shards. The task ends
+   * here with its snapshot; independent shard-assembly tasks and one manifest commit
+   * run later. The signal is an exception because `runIndex` has already passed the
+   * point where a `RunResult` (directory, manifest, validation) could exist honestly.
+   */
+  if (options.mergeOnly) throw new MergeOnlyComplete(mergeSnapshot);
 
   /* -------------------------------- finalize ------------------------------ */
 
@@ -3437,6 +3475,26 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
 /* -------------------------------------------------------------------------- */
 /* Upload + publish                                                           */
 /* -------------------------------------------------------------------------- */
+
+/**
+ * Merge ONE spool partition and stop before finalize (parallel merge).
+ *
+ * This is the operation a swarm merge task runs: `mergePartitions` selects the one
+ * partition it owns, `refBase` comes from `planRefBases`, and `mergeOnly` guarantees
+ * the task cannot write the shared index shards. Returns the snapshot the caller
+ * reports to the coordinator.
+ */
+export async function runPartitionMerge(config: IndexerConfig, options: RunOptions): Promise<CloudMergeResume> {
+  try {
+    await runIndex(config, { ...options, mergeOnly: true });
+  } catch (error) {
+    if (error instanceof MergeOnlyComplete) return error.snapshot;
+    throw error;
+  }
+  // Unreachable unless `mergeOnly` was stripped: refuse to pretend a partition was
+  // merged when the run returned normally.
+  throw new Error("runPartitionMerge finished without a merge-only snapshot");
+}
 
 export interface UploadResult {
   uploaded: number;

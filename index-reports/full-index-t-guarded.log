@@ -5559,3 +5559,60 @@ Preflight only: ready. Authentication, source keys, TSV mapping, disk and memory
 --sample 2 requested: this is a SMOKE TEST of the pipeline, not the full dataset.
   The version will be labelled PARTIAL and cannot be activated.
   --sample and --activate contradict each other: refusing to activate a partial index.
+
+-- 1/20 dependencies
+bun 1.4.2
+dependencies present
+
+-- 2/20 source version
+source version: cf010d300266 (working tree has uncommitted changes)
+
+-- 3/20 cost expectation
+cost estimate (R2 Standard, from Cloudflare's published prices):
+  a full index is expected in the 9–20 GB range (preflight prints its own estimate). At 20 GB:
+    storage        ~$0.30/month
+    one upload     ~$0.05 of Class A writes (≈12,000 objects at ~1.7 MB each)
+    one read pass  ~$0.0043 of Class B reads
+  egress is free, and search only ever reads shards and partitions, never the source objects.
+
+-- 4/20 resume state
+no checkpoint and no spool: this run starts at Pass 1, row 1 of each source
+
+Preflight
+  ok   csv1  0.00 GB  /tmp/companyintel-full-index-5BPy4h/guarded/raw/company.csv
+  ok   csv2  0.00 GB  /tmp/companyintel-full-index-5BPy4h/guarded/raw/people.csv
+  input total          0.00 GB
+  free disk            0.13 GB
+  temporary space need 0.01 GB  (upper bound)
+    spool               0.00 GB expected / 0.00 GB upper  (v2 segments written by pass 1)
+    raw cache staging   0.00 GB  (largest Mode B .part alive at once)
+    index output        0.00 GB  (written during pass 2, same volume by default)
+    run bookkeeping     0.00 GB  (checkpoint, spool manifest, rejected/objects lists)
+    safety margin       x1.25 applied to the four terms above, using the spool UPPER bound
+  expected total       0.01 GB  (same terms with the expected spool)
+  estimated output     0.00 GB
+  memory free / total  1.28 GB / 2.09 GB
+  cpu cores            1
+  sample               2 records per source (temporary space estimated from this, not from the full input)
+  duration estimate    ~0 s at 5,000 rows/s — the MEASURED end-to-end rate
+                       of the 1 M benchmark (R2 read + parse + spool). The run prints its own per-stage
+                       timings afterwards; use those, not this hint.
+
+
+Schema mapping actually in use (automatic mapping + config overrides)
+  ok   csv1  11 columns · delimiter "," · encoding utf8 · 0 override(s)
+       company id ← — · name ← "Company Name" · domain ← "Website"
+       contact email ← "Email" · phone ← "Phone" · linkedin ← —
+       not present in this file: companywebsite, companylinkedin, companyid, subindustry, companystate, companyrevenue, firstname, lastname, designation, seniority, department, linkedin, contactcountry, contactstate, contactcity
+       unmapped headers (1): Company Description
+  ok   csv2  9 columns · delimiter "," · encoding utf8 · 0 override(s)
+       company id ← — · name ← "organization" · domain ← "domain"
+       contact email ← "work_email" · phone ← — · linkedin ← —
+       not present in this file: companywebsite, companylinkedin, companyid, industry, subindustry, companycountry, companystate, companycity, companysize, companyrevenue, firstname, lastname, jobtitle, phone, linkedin, contactcountry, contactstate, contactcity
+       unmapped headers (2): person_location_country, person_bio
+
+Preflight only: ready. Authentication, source keys, TSV mapping, disk and memory all check out; nothing was built or uploaded.
+
+--sample 2 requested: this is a SMOKE TEST of the pipeline, not the full dataset.
+  The version will be labelled PARTIAL and cannot be activated.
+  --sample and --activate contradict each other: refusing to activate a partial index.
