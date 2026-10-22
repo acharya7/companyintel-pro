@@ -130,6 +130,19 @@ export interface RunCloudPass2Options {
 export async function runCloudPass2(options: RunCloudPass2Options): Promise<CloudPass2Result> {
   const { store, version } = options;
   const config = { ...options.config, datasetVersion: version };
+  /*
+   * Parallel partition mode (`tools/cloud/partition.ts`).
+   *
+   * A partition task owns ONE spool partition and a slice of the ref space. It does
+   * not own the job: the coordinator, the durable state, the Pass 2 checkpoint and
+   * the final index are shared, so this task must neither read them as its own
+   * resume signal nor write them.
+   *
+   * That distinction is a correctness requirement, not tidiness: the global Pass 2
+   * checkpoint records `mergeComplete: true` after ANY merge, so a partition task
+   * that consulted it merged nothing at all — the zero-company defect this fixes.
+   */
+  const partitionMode = options.onlyPartition !== undefined;
   const now = options.now ?? (() => Date.now());
   const log = options.onLog ?? (() => {});
   const startedMs = now();
@@ -209,6 +222,15 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
       expectedChunk = manifest.chunk + 1;
       let manifestRows = 0;
       for (const segment of manifest.segments) {
+        /*
+         * A partition task verifies ITS OWN segments, not the whole spool.
+         *
+         * The full-spool verification is right for a single sequential merge, but with
+         * 256 partition tasks it would HEAD every segment of the corpus 256 times — tens
+         * of millions of requests for evidence each task already has for its own input.
+         * The rows and bytes are likewise scoped, so a partition's totals are its own.
+         */
+        if (partitionMode && segment.partition !== options.onlyPartition) continue;
         const head = await store.head(segment.key);
         if (!head.exists || head.size !== segment.bytes) {
           problems.push(`${segment.key}: ${head.exists ? `size ${head.size} != ${segment.bytes}` : "missing"}`);
@@ -218,7 +240,9 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
         totalRows += segment.rows;
         totalSegmentBytes += segment.bytes;
       }
-      if (manifestRows !== manifest.rows) {
+      // Only a whole-manifest sum is comparable to `manifest.rows`; a partition-scoped
+      // pass sees a subset of the chunk's segments.
+      if (!partitionMode && manifestRows !== manifest.rows) {
         problems.push(`${source.id}: chunk ${manifest.chunk} records ${manifest.rows} rows but its segments hold ${manifestRows}`);
       }
       void key;
@@ -335,7 +359,7 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
    */
   const existingCheckpoint = await store.getJson<CloudPass2Checkpoint>(cloudKeys.pass2Checkpoint(version));
   let resumeState: CloudMergeResume | null = null;
-  if (existingCheckpoint?.mergeComplete && existingCheckpoint.resume) {
+  if (!partitionMode && existingCheckpoint?.mergeComplete && existingCheckpoint.resume) {
     const problems = await verifyShardParts(store, version, existingCheckpoint.shardParts, existingCheckpoint.shardPartBytes);
     if (problems.length) {
       log(
@@ -363,9 +387,10 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
    * would turn a restart after a 16-partition merge into a full replay of that merge,
    * which is the expensive mistake this bookkeeping exists to prevent.
    */
-  let mergeSnapshot: CloudMergeResume | null = existingCheckpoint?.mergeComplete
-    ? (existingCheckpoint.resume as CloudMergeResume | undefined) ?? null
-    : null;
+  let mergeSnapshot: CloudMergeResume | null =
+    !partitionMode && existingCheckpoint?.mergeComplete
+      ? (existingCheckpoint.resume as CloudMergeResume | undefined) ?? null
+      : null;
   const beat = async () => {
     await options.onHeartbeat?.();
   };
@@ -416,6 +441,9 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
       cloud: {
         onMergeComplete: async (snapshot) => {
           mergeSnapshot = snapshot;
+          // A partition task's snapshot belongs to the coordinator: publishing it to
+          // the shared checkpoint would tell the next partition its merge is done.
+          if (partitionMode) return;
           await writeCheckpoint({
             version,
             stage: "merge",
@@ -444,6 +472,12 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
          * an operator all see the same truth.
          */
         onFinalize: async (progress) => {
+          // mergeOnly stops before finalize; this can only run on a bug, and a
+          // partition task must still not write the shared state.
+          if (partitionMode) {
+            log(`partition ${options.onlyPartition}: ignored a finalize report (a partition task stops before finalize)`);
+            return;
+          }
           const at = new Date(now()).toISOString();
           const current = (await store.getJson<CloudJobState>(cloudKeys.state(version))) ?? state;
           const validating = progress.phase === "validate";
@@ -573,6 +607,13 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
           const control = await stateControl();
           if (control?.abort) throw new CloudStop("aborted");
           if (control?.pause) throw new CloudStop("paused");
+          /*
+           * A partition task stops here: the coordinator owns `state.json`, the
+           * progress fraction and the budget. Writing them from 256 containers
+           * would have each task report "1/1 partitions" and its own spend as the
+           * job's, which is both wrong and a lost-update race on the shared object.
+           */
+          if (partitionMode) return;
 
           const current = (await store.getJson<CloudJobState>(cloudKeys.state(version))) ?? state;
           current.stage = "pass2";
@@ -702,6 +743,13 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
       };
     }
     if (error instanceof CloudStop) {
+      // In a partition task the control flag is the coordinator's business: the task
+      // reports the stop so its lease can be released, and writes no job state.
+      if (partitionMode) {
+        throw new Error(
+          `Partition ${options.onlyPartition} stopped (${error.kind}${error.reason ? `: ${error.reason}` : ""}); no job state was written from this container.`,
+        );
+      }
       stopped = error.kind;
       const current = (await store.getJson<CloudJobState>(cloudKeys.state(version))) ?? state;
       current.stage = error.kind;
@@ -728,6 +776,8 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
       };
     }
     const current = (await store.getJson<CloudJobState>(cloudKeys.state(version))) ?? state;
+    // A partition task never owns the shared job state, not even to report failure.
+    if (partitionMode) throw error;
     current.stage = "failed";
     current.updatedAt = new Date(now()).toISOString();
     current.errors = [
@@ -813,12 +863,30 @@ export async function runCloudPass2(options: RunCloudPass2Options): Promise<Clou
 
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Chunk manifests, cached for the life of the process.
+ *
+ * A container runs many partition tasks in sequence, and each one needs the same
+ * manifests to know which segments belong to it. Without this cache a 500-chunk spool
+ * would re-GET 500 JSON objects for every one of ~256 partitions in that container;
+ * with it, the cost is paid once per container. The manifests are immutable for a
+ * version (the source objects are read-only during a run), so caching cannot serve
+ * stale data for a different task.
+ */
+const manifestCache = new Map<string, CloudChunkManifest>();
+
 async function loadChunkManifests(store: BlobStore, version: string, checkpoints: SourceCheckpoint[]): Promise<Map<string, CloudChunkManifest>> {
   const out = new Map<string, CloudChunkManifest>();
   for (const checkpoint of checkpoints) {
     for (let chunk = 0; chunk < checkpoint.chunks; chunk += 1) {
-      const manifest = await store.getJson<CloudChunkManifest>(cloudKeys.chunkManifest(version, checkpoint.sourceId, chunk));
-      if (!manifest) throw new Error(`Missing chunk manifest for ${checkpoint.sourceId} chunk ${chunk}.`);
+      const key = cloudKeys.chunkManifest(version, checkpoint.sourceId, chunk);
+      let manifest = manifestCache.get(key);
+      if (!manifest) {
+        const fetched = await store.getJson<CloudChunkManifest>(key);
+        if (!fetched) throw new Error(`Missing chunk manifest for ${checkpoint.sourceId} chunk ${chunk}.`);
+        manifest = fetched;
+        manifestCache.set(key, fetched);
+      }
       out.set(`${checkpoint.sourceId}/${chunk}`, manifest);
     }
   }

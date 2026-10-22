@@ -57,6 +57,49 @@ browser ── /indexing (control panel)
    final index objects are PUT straight to their versioned keys — the ~20 GB index is
    never written locally either.
 
+### Parallel merge, shard assembly and finalize (swarm phases)
+
+A 16-container swarm cannot run one sequential merge, and it must not let 256
+containers finalize: the final index shards are shared objects, so a per-partition
+finalize would have them overwrite each other. The pipeline is therefore split into
+independently leased tasks:
+
+```
+BLOCKS → INGEST → MERGE_PARTITIONS → ASSEMBLE_SHARDS → FINALIZE → COMPLETE
+```
+
+- **MERGE_PARTITIONS** — one task per spool partition (`merge-partition`). Each reads
+  only *its* segments (checksum-verified), merges them with the unchanged engine, and
+  writes its own projection, detail and `unassigned/` objects inside an aligned ref
+  slice from `planRefBases`. Posting parts are partition-tagged
+  (`pass2/parts/<kind>/<shard>/p-<partition>-<batch>.lines.gz`), so two containers can
+  never write the same key. The task stops before finalize and publishes
+  `cloud/jobs/<version>/partitions/<n>.json` last, as its completion marker. It never
+  writes `state.json`, the Pass 2 checkpoint or a final index shard.
+- **ASSEMBLE_SHARDS** — one task per `(kind, shard)` (`assemble-shard`). It reads every
+  partition's parts for that shard, merges them through the indexer's own payload
+  builder (same term grouping, dedup and ordering), writes exactly one
+  `indexes/<version>/<kind>/<shard>.json.gz`, and publishes
+  `cloud/jobs/<version>/shards/<kind>/<shard>.json`. Empty shards write no object, as
+  in the sequential run.
+- **FINALIZE** — one task (`finalize-parallel`), the single owner of the manifest. It
+  reads the durable partition and shard results, verifies every referenced object
+  exists with its recorded size, reconciles row coverage against the Pass 1
+  checkpoints, and writes `stats.json`, `directory.json`, `validation.json` and — last
+  — `manifest.json`. It never writes `active.json`: activation stays an explicit admin
+  action, so a failed generation cannot become searchable.
+
+The shard fan-out comes from the production shard counts (512 exact, 256 prefix, 256
+token, 512 trigram, 256 ids, plus the three contact-name kinds), i.e. 2,816 assembly
+tasks. `tests/swarm-shard-plan.test.ts` fails if the Worker's `SWARM_SHARDS` drifts
+from `tools/indexer/indexer.config.json`.
+
+`tests/cloud-parallel-equivalence.test.ts` runs the same corpus through both pipelines
+and compares the companies, contacts, association evidence, detail records, every
+shard's terms and postings, and the search results read back through the real Worker
+path. Document refs differ by design (each partition gets an aligned slice), so refs
+are translated to company ids before comparison.
+
 Company identity, contact association, unassigned contacts, duplicate prevention,
 projections, detail records, all indexes and manifests come from the same code as the
 local build. `tests/cloud-pass2.test.ts` proves this by merging the same segments both

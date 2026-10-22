@@ -42,6 +42,8 @@ import { forecast, type BenchmarkMeasurement } from "./cost";
 import { cloudSourcesFromConfig, runPass1, syncStateFromCheckpoints, verifyRun } from "./pass1";
 import { runRange } from "./range";
 import { runPartitionTask } from "./partition";
+import { runShardTask } from "./shard";
+import { finalizeParallelBuild } from "./finalize";
 import { runCloudPass2 } from "./pass2";
 import { R2BlobStore } from "./store";
 import { runScan } from "../realdata/scan";
@@ -758,6 +760,7 @@ async function mergePartitionCommand(store: R2BlobStore): Promise<void> {
   const refBase = num("ref-base");
   if (refBase === null || refBase < 0) throw new Error("--ref-base <n> is required (from planRefBases).");
   const partitions = num("partitions") ?? config.partitions;
+  const refCapacity = num("ref-capacity") ?? undefined;
   const workDir =
     typeof flag("work-dir") === "string" ? resolve(root, String(flag("work-dir"))) : join(tmpdir(), `companyintel-merge-${id}-p${partition}`);
 
@@ -772,6 +775,7 @@ async function mergePartitionCommand(store: R2BlobStore): Promise<void> {
     config: { ...config, partitions, datasetVersion: id },
     partition,
     refBase,
+    ...(refCapacity !== undefined ? { refCapacity } : {}),
     workDir,
     onLog: (line) => console.log(`  ${line}`),
   });
@@ -781,6 +785,48 @@ async function mergePartitionCommand(store: R2BlobStore): Promise<void> {
       `refs [${result.refBase.toLocaleString()}, ${result.nextRef.toLocaleString()})`,
   );
   console.log(JSON.stringify(result));
+}
+
+/**
+ * Assemble ONE final index shard from every partition's posting parts.
+ *
+ * One task per (kind, shard): the object key is derived from those two values, so
+ * two containers can never write the same shard, and a retried task overwrites only
+ * its own bytes. Never writes the directory, manifest or state.
+ */
+async function assembleShardCommand(store: R2BlobStore): Promise<void> {
+  const { config } = loadConfig();
+  const id = version();
+  const kind = flag("kind");
+  if (typeof kind !== "string") throw new Error("--kind <exact|prefix|token|trigram|ids|contactToken|contactPrefix|contactTrigram> is required.");
+  const shard = num("shard");
+  if (shard === null || shard < 0) throw new Error("--shard <n> is required.");
+
+  const result = await runShardTask({
+    store,
+    version: id,
+    config,
+    kind: kind as Parameters<typeof runShardTask>[0]["kind"],
+    shard,
+    onLog: (line) => console.log(`  ${line}`),
+  });
+  console.log(JSON.stringify(result));
+}
+
+/** Aggregate the durable partition and shard results into the manifest (single owner). */
+async function finalizeParallelCommand(store: R2BlobStore): Promise<void> {
+  const { config } = loadConfig();
+  const id = version();
+  const result = await finalizeParallelBuild({
+    store,
+    version: id,
+    config,
+    onLog: (line) => console.log(`  ${line}`),
+  });
+  console.log(JSON.stringify(result));
+  if (!result.validationPassed) {
+    throw new Error(`Finalize validation FAILED for ${id}; inspect manifests/${id}/validation.json. Nothing was activated.`);
+  }
 }
 
 async function main(): Promise<void> {
@@ -805,7 +851,9 @@ async function main(): Promise<void> {
         "Swarm tasks (one block or one byte range; leased by the indexing coordinator):",
         "  blocks    --version <id> --source <sourceId> --block <n> [--block-mb 64]",
         "  range     --version <id> --source <sourceId> --range <n> --start <bytes> --end <bytes> --base-line <n> [--partitions 256] [--no-verify]",
-        "  merge-partition --version <id> --partition <n> --ref-base <n> [--partitions 256] [--work-dir <dir>]",
+        "  merge-partition --version <id> --partition <n> --ref-base <n> [--ref-capacity <n>] [--partitions 256] [--work-dir <dir>]",
+        "  assemble-shard  --version <id> --kind <kind> --shard <n>",
+        "  finalize-parallel --version <id>   (aggregate results, validate, publish the manifest)",
         "",
         "Sources must be r2://<bucket>/<key>; the bucket comes from the credentials.",
       ].join("\n"),
@@ -824,6 +872,8 @@ async function main(): Promise<void> {
   if (command === "blocks") return blocksCommand(store);
   if (command === "range") return rangeCommand(store);
   if (command === "merge-partition") return mergePartitionCommand(store);
+  if (command === "assemble-shard") return assembleShardCommand(store);
+  if (command === "finalize-parallel") return finalizeParallelCommand(store);
   if (command === "pass2") return pass2(store);
   if (command === "interrupt") return interrupt(store);
   if (command === "pause" || command === "resume" || command === "abort" || command === "approve") return control(store, command);

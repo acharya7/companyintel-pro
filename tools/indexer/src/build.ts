@@ -735,7 +735,7 @@ async function freeDiskBytesFor(path: string): Promise<number | null> {
 /* Shard writing                                                              */
 /* -------------------------------------------------------------------------- */
 
-type ShardKind = "exact" | "prefix" | "token" | "trigram" | "ids" | "contactToken" | "contactPrefix" | "contactTrigram";
+export type ShardKind = "exact" | "prefix" | "token" | "trigram" | "ids" | "contactToken" | "contactPrefix" | "contactTrigram";
 
 const SHARD_KINDS: ShardKind[] = [
   "exact",
@@ -1592,6 +1592,79 @@ async function* linesFromParts(parts: AsyncIterable<string>): AsyncIterable<Post
   }
 }
 
+/** Metadata of one shard object written by `assembleShardToStore`. */
+export interface AssembledShard {
+  key: string;
+  bytes: number;
+  sha256: string;
+  /** Distinct terms in the shard. */
+  terms: number;
+  /** Postings (refs or contact ids) across all terms. */
+  postings: number;
+}
+
+/**
+ * Build ONE final index shard from posting lines and hand its bytes to `put`.
+ *
+ * This is the finalize step of a single shard, extracted so it can run as an
+ * independent task: parallel partition merges tag their posting parts with the
+ * partition that wrote them, and 256 tasks cannot each finalize the shared shard
+ * objects. One task per (kind, shard) reads every partition's parts for that shard,
+ * applies the SAME payload builder the sequential run uses (`companyShardPayload` /
+ * `contactShardPayload`: term grouping, consecutive-ref dedup, posting order) and
+ * writes only its own object — so the assembled index is the one the reader expects,
+ * not a second format.
+ *
+ * Returns `null` for an empty shard: no object is written, exactly as a local run
+ * skips a shard with no postings (the reader treats a missing shard as empty).
+ */
+export async function assembleShardToStore(options: {
+  /** Dataset version, used for the object key only. */
+  version: string;
+  kind: ShardKind;
+  shard: number;
+  /** Contact-name shard (ids + quality) instead of a company shard (refs + quality). */
+  contact: boolean;
+  /** Posting lines in the order they should be merged. */
+  parts: AsyncIterable<string>;
+  /** Destination write: R2 in the cloud, a temp file locally. */
+  put: (key: string, body: Buffer, gzip: boolean) => Promise<void>;
+}): Promise<AssembledShard | null> {
+  const name = String(options.shard).padStart(4, "0");
+  const label = `${options.kind}/${name}`;
+  /*
+   * Peek the first posting before building anything: an empty shard must not upload
+   * `{"terms":{}}` (the reader already treats a missing shard as empty), and a
+   * 2,816-shard layout would otherwise write 2,816 mostly-empty objects.
+   */
+  const iterator = options.parts[Symbol.asyncIterator]();
+  const first = await iterator.next();
+  if (first.done) return null;
+  const rest = (async function* () {
+    yield first.value as string;
+    for (;;) {
+      const next = await iterator.next();
+      if (next.done) return;
+      yield next.value as string;
+    }
+  })();
+  const payload = options.contact
+    ? await contactShardPayload(linesFromParts(rest), label)
+    : await companyShardPayload(linesFromParts(rest), label);
+  const terms = Object.keys(payload.terms);
+  let postings = 0;
+  for (const term of terms) {
+    const entry = (payload.terms as Record<string, { refs?: number[]; ids?: string[] }>)[term];
+    postings += entry.refs?.length ?? entry.ids?.length ?? 0;
+  }
+  const key = folderFor("indexes", options.version, `${label}.json`);
+  // `shardJsonParts` streams one term at a time and frees each as it goes, so the
+  // peak stays one term plus the compressor instead of the whole shard.
+  const writer = new ObjectWriter("", options.put);
+  const object = await writer.writeJsonParts(key, shardJsonParts(payload.terms));
+  return { key, bytes: object.bytes, sha256: object.sha256, terms: terms.length, postings };
+}
+
 export async function runIndex(config: IndexerConfig, options: RunOptions = {}): Promise<RunResult> {
   const startedAt = Date.now();
   // One context for the whole run: it owns the Mode B cache and credentials.
@@ -2416,6 +2489,26 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     });
   }
 
+  /*
+   * Partition-scoped row counters.
+   *
+   * A sequential run is handed the Pass 1 row total (`importedRows`) and does not
+   * re-count rows while merging. A parallel partition task must report only ITS
+   * partition, because the coordinator sums those numbers: 256 tasks each echoing
+   * the corpus total would be off by a factor of 256 and every coverage check would
+   * be meaningless. So the counters are zeroed here and rebuilt from the records
+   * actually read from this partition.
+   */
+  const scopedMerge = options.mergeOnly === true && (options.mergePartitions?.length ?? 0) > 0;
+  if (scopedMerge) {
+    counters.rowsRead = 0;
+    counters.rowsRejected = 0;
+    counters.recordsMissingCompanyId = 0;
+    for (const id of Object.keys(counters.perSource)) {
+      counters.perSource[id] = { rowsRead: 0, rowsRejected: 0, companies: 0, contacts: 0 };
+    }
+  }
+
   /**
    * Write one company partition as a SEARCH PROJECTION plus its detail object.
    *
@@ -2530,6 +2623,8 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
 
     const partitionHash = createHash("sha256");
     let recordsSeen = 0;
+    /** Rows read from each source in this partition (partition-scoped accounting). */
+    const sourceRows = new Map<string, number>();
     const resolver = new CompanyResolver();
     const groups = new Map<
       number,
@@ -2597,6 +2692,7 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
       for await (const record of rowsForPartition()) {
         recordsSeen += 1;
         const row = record.value;
+        sourceRows.set(row.source.source, (sourceRows.get(row.source.source) ?? 0) + 1);
         const decision = resolver.resolve({
           all: row.keys,
           bucket: row.bucket,
@@ -2693,6 +2789,15 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
         `Spool partition ${entry.file} does not match the checksum pass 1 recorded. Its contents changed after it was\n` +
           "  written, so it will not be merged. Nothing was deleted; re-run with --no-resume to rebuild the spool.",
       );
+    }
+
+    if (scopedMerge) {
+      counters.rowsRead += recordsSeen;
+      for (const [id, rows] of sourceRows) {
+        const target = counters.perSource[id] ?? { rowsRead: 0, rowsRejected: 0, companies: 0, contacts: 0 };
+        target.rowsRead += rows;
+        counters.perSource[id] = target;
+      }
     }
 
     /*
@@ -3067,7 +3172,10 @@ export async function runIndex(config: IndexerConfig, options: RunOptions = {}):
     if (cloud) {
       const CLOUD_SHARD_BATCH = 4;
       const batch = Math.floor(fileIndex / CLOUD_SHARD_BATCH);
-      if ((fileIndex + 1) % CLOUD_SHARD_BATCH === 0 || fileIndex === totalPartitions - 1) {
+      // The LAST partition THIS RUN merges must flush, not the last partition of the
+      // spool: a parallel task merges one entry, so keying the final flush off
+      // `totalPartitions` dropped every posting it produced.
+      if ((fileIndex + 1) % CLOUD_SHARD_BATCH === 0 || fileIndex === mergeEntries.length - 1) {
         await shardWriter.flushToCloud(cloud, batch);
       }
       await cloud.releasePartition(entry);

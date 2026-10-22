@@ -75,8 +75,11 @@ const ALLOWED_COMMANDS = new Set([
   // they never touch the single-job state (`/task` below, not `/job`).
   "blocks",
   "range",
-  // Parallel merge pipeline: one shard partition per task, then one shard.
+  // Parallel merge pipeline: one shard partition per task, then one shard, then the
+  // single-owner manifest commit.
   "merge-partition",
+  "assemble-shard",
+  "finalize-parallel",
 ]);
 
 /** The CLI is present only when the image was copied correctly. */

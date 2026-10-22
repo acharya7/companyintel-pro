@@ -23,6 +23,7 @@
 import { createHash } from "node:crypto";
 
 import { cloudKeys } from "../../src/shared/cloud/types";
+import type { IndexingCounters } from "../../src/shared/models";
 import {
   objectRangeForPartition,
   partitionFits,
@@ -50,6 +51,14 @@ export interface PartitionTaskOptions {
    * the cap but not to derive the base.
    */
   rowsByPartition?: number[];
+  /**
+   * Capacity the coordinator allocated to this partition (from the plan).
+   *
+   * The swarm sends it with the task so the container can enforce the cap WITHOUT
+   * re-reading every partition's manifests: a merge that outgrew its slice must fail
+   * before publishing refs that belong to its neighbour.
+   */
+  refCapacity?: number;
   /** Local scratch directory for one partition at a time. */
   workDir: string;
   onLog?: (line: string) => void;
@@ -71,6 +80,29 @@ export interface PartitionTaskResult {
   shardParts: number;
   objects: { key: string; bytes: number }[];
   objectBytes: number;
+  /**
+   * This partition's counters, aggregated by the finalize phase.
+   *
+   * Partition-scoped on purpose: `rowsRead` is the rows of THIS partition, and
+   * `perSource` is what it read from each source. The coordinator sums them to the
+   * corpus totals — which is the only way coverage can be reconciled when 256
+   * tasks each see a slice.
+   */
+  counters: IndexingCounters;
+  /** Facet distributions, merged by finalize into `manifests/<v>/stats.json`. */
+  companyStats: {
+    byIndustry: [string, number][];
+    byCountry: [string, number][];
+    bySize: [string, number][];
+  };
+  contactStats: {
+    byDesignation: [string, number][];
+    byDepartment: [string, number][];
+    bySeniority: [string, number][];
+  };
+  coverage: { email: number; linkedin: number; phone: number; neither: number };
+  /** Projection/detail objects this partition wrote, by kind. */
+  objectCounts: { companyProjections: number; companyDetails: number; contactProjections: number; contactDetails: number; unassigned: number };
   completedAt: string;
   /** Content hash of the object list, so the manifest commit can prove it saw this. */
   digest: string;
@@ -95,7 +127,25 @@ export async function runPartitionTask(options: PartitionTaskOptions): Promise<P
       );
     }
   }
-  const capacity = allocation?.capacities[partition] ?? Number.POSITIVE_INFINITY;
+  /*
+   * A ref base must be aligned to 1000: the reader derives object keys with
+   * `floor(ref/250)` (companies) and `floor(ref/1000)` (contacts), so an unaligned base
+   * would put this partition's first company in an object another partition owns.
+   */
+  if (options.refBase % 1000 !== 0) {
+    throw new Error(
+      `Ref base ${options.refBase} for partition ${partition} is not aligned to 1000; its refs would share an object with another partition.`,
+    );
+  }
+  const capacity = allocation?.capacities[partition] ?? options.refCapacity ?? Number.POSITIVE_INFINITY;
+  if (options.refCapacity !== undefined && options.refCapacity <= 0) {
+    throw new Error(`refCapacity must be a positive number of refs (got ${options.refCapacity}).`);
+  }
+  if (allocation && options.refCapacity !== undefined && options.refCapacity !== capacity) {
+    throw new Error(
+      `Partition ${partition} was given capacity ${options.refCapacity}, but the plan allocates ${capacity}. Refusing to merge against a disagreement.`,
+    );
+  }
 
   const result = await runCloudPass2({
     store,
@@ -154,6 +204,7 @@ export async function runPartitionTask(options: PartitionTaskOptions): Promise<P
     .update(objects.map((object) => `${object.key}:${object.bytes}`).join("\n"))
     .digest("hex");
 
+  const countOf = (prefix: string) => objects.filter((object) => object.key.startsWith(prefix)).length;
   const task: PartitionTaskResult = {
     version,
     partition,
@@ -162,6 +213,28 @@ export async function runPartitionTask(options: PartitionTaskOptions): Promise<P
     rows: snapshot.counters.rowsRead,
     companies: snapshot.counters.uniqueCompanies,
     contacts: snapshot.counters.uniqueContacts,
+    counters: snapshot.counters,
+    companyStats: {
+      byIndustry: snapshot.companyStats.byIndustry,
+      byCountry: snapshot.companyStats.byCountry,
+      bySize: snapshot.companyStats.bySize,
+    },
+    contactStats: {
+      byDesignation: snapshot.contactStats.byDesignation,
+      byDepartment: snapshot.contactStats.byDepartment,
+      bySeniority: snapshot.contactStats.bySeniority,
+    },
+    coverage: snapshot.coverage,
+    // Object keys are `<kind>/<version>/…`, so the version is part of every prefix:
+    // `details/companies/` would count nothing and make the directory claim a
+    // projection split that has no detail half.
+    objectCounts: {
+      companyProjections: countOf("companies/"),
+      companyDetails: countOf(`details/${version}/companies/`),
+      contactProjections: countOf("contacts/"),
+      contactDetails: countOf(`details/${version}/contacts/`),
+      unassigned: countOf("unassigned/"),
+    },
     nextRef,
     firstCompanyObject: ranges?.companyObjects.first ?? Math.floor(options.refBase / 250),
     lastCompanyObjectExclusive: ranges?.companyObjects.lastExclusive ?? Number.POSITIVE_INFINITY,

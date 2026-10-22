@@ -31,6 +31,9 @@ const PLAN: SwarmPlan = {
   sources: [{ id: "csv1", key: "raw/file1.csv", size: SIZE, etag: '"e1"', blocks: 3 }],
   budgetUsd: 50,
   workers: 4,
+  // One shard per kind keeps the assembly phase short while still covering all eight
+  // company + contact kinds the production layout fans out.
+  shards: { exact: 1, prefix: 1, token: 1, trigram: 1, ids: 1 },
 };
 
 function harness(seed: Record<string, unknown> = {}) {
@@ -157,14 +160,58 @@ describe("swarm coordinator", () => {
       partitions: PLAN.partitions,
     });
 
-    // The merge task is queued and any worker may claim it.
-    const claim = await call(coordinator, "/claim", { workerId: "indexer-worker-05" });
-    expect(claim.stage).toBe("merge");
-    expect((claim.task as SwarmTask).kind).toBe("merge");
+    // MERGE_PARTITIONS: one task per spool partition, each with its own ref slice.
+    const seen: number[] = [];
+    let lastRefBase = -1;
+    for (let partition = 0; partition < PLAN.partitions; partition += 1) {
+      const claim = (await call(coordinator, "/claim", { workerId: "indexer-worker-05" })) as { stage: string; task: SwarmTask };
+      expect(claim.stage).toBe("merge_partitions");
+      expect(claim.task.kind).toBe("merge_partition");
+      seen.push(claim.task.partition!);
+      expect(claim.task.refBase).toBeGreaterThan(lastRefBase);
+      expect(claim.task.refBase! % 1000).toBe(0);
+      expect(claim.task.refCapacity).toBeGreaterThan(0);
+      lastRefBase = claim.task.refBase!;
+      await call(coordinator, "/complete", {
+        workerId: "indexer-worker-05",
+        taskId: claim.task.id,
+        result: { rows: 0, rejected: 0, segments: 2, segmentBytes: 1024, bytesRead: 0, classA: 0, classB: 0 },
+      });
+    }
+    // Every partition exactly once, with a non-overlapping ref slice.
+    expect(seen).toEqual([0, 1, 2, 3]);
 
+    // ASSEMBLE_SHARDS: one task per (kind, shard), still under the same lease rules.
+    const shardClaims: string[] = [];
+    for (let index = 0; index < 8; index += 1) {
+      const claim = (await call(coordinator, "/claim", { workerId: `indexer-worker-0${index % 4}` })) as { stage: string; task: SwarmTask };
+      expect(claim.stage).toBe("assemble_shards");
+      expect(claim.task.kind).toBe("assemble_shard");
+      shardClaims.push(`${claim.task.shardKind}/${claim.task.shard}`);
+      await call(coordinator, "/complete", {
+        workerId: `indexer-worker-0${index % 4}`,
+        taskId: claim.task.id,
+        result: { rows: 0, rejected: 0, segments: 0, segmentBytes: 128, bytesRead: 0, classA: 0, classB: 0 },
+      });
+    }
+    expect(shardClaims).toEqual([
+      "exact/0",
+      "prefix/0",
+      "token/0",
+      "trigram/0",
+      "ids/0",
+      "contactToken/0",
+      "contactPrefix/0",
+      "contactTrigram/0",
+    ]);
+
+    // FINALIZE: a single owner, then the run completes.
+    const finalClaim = (await call(coordinator, "/claim", { workerId: "indexer-worker-05" })) as { stage: string; task: SwarmTask };
+    expect(finalClaim.stage).toBe("finalize");
+    expect(finalClaim.task.kind).toBe("finalize");
     await call(coordinator, "/complete", {
       workerId: "indexer-worker-05",
-      taskId: (claim.task as SwarmTask).id,
+      taskId: finalClaim.task.id,
       result: { rows: 30, rejected: 0, segments: 0, segmentBytes: 0, bytesRead: 0, classA: 0, classB: 0 },
       searchable: { rows: 30 },
     });

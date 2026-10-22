@@ -29,6 +29,7 @@ import { Hono } from "hono";
 import { CLOUD_CONTROL_VERSION, cloudKeys, type CloudControl } from "../../src/shared/cloud/types";
 import {
   SWARM,
+  SWARM_SHARDS,
   SWARM_WORKER_COUNT,
   clampWorkerCount,
   swarmKeys,
@@ -188,6 +189,13 @@ swarmRoutes.post("/plan", async (c) => {
     sources,
     budgetUsd: Number(env.CLOUD_JOB_BUDGET_USD ?? 0) > 0 ? Number(env.CLOUD_JOB_BUDGET_USD) : 50,
     workers,
+    /*
+     * The shard layout the assembly phase fans out over. It is the indexer's
+     * production configuration (`tools/indexer/indexer.config.json`, asserted equal by
+     * `tests/swarm-shard-plan.test.ts`), not a number chosen here: the reader derives
+     * every shard key from these counts.
+     */
+    shards: { ...SWARM_SHARDS },
   };
 
   const response = await coordinatorFetch(c, "/plan", { method: "POST", body: JSON.stringify(plan) });

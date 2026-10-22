@@ -264,12 +264,93 @@ export class IndexerWorker implements DurableObject {
       return true;
     }
 
-    // Merge: Pass 2 writes the job state; the searchable row count comes from there.
-    const state = await readJson<{
-      totals?: { rowsIndexed?: number; segments?: number };
-      pass2?: { indexObjects?: number; indexBytes?: number };
-    }>(this.env.COMPANY_DATA, `cloud/jobs/${plan.version}/state.json`);
-    const rows = state?.totals?.rowsIndexed ?? 0;
+    if (current.kind === "merge_partition") {
+      // The partition task's own completion marker. Its presence is the evidence that
+      // the partition's projections, details and posting parts were written.
+      const result = await readJson<{ rows?: number; companies?: number; contacts?: number; shardParts?: number; objectBytes?: number }>(
+        this.env.COMPANY_DATA,
+        `cloud/jobs/${plan.version}/partitions/${String(index).padStart(4, "0")}.json`,
+      );
+      if (!result) {
+        await this.coordinator("/fail", { workerId, taskId: current.id, error: "partition result object was not written" });
+        return false;
+      }
+      await this.coordinator("/complete", {
+        workerId,
+        taskId: current.id,
+        result: {
+          // Rows are NOT added to the ingest totals: the same source rows are already
+          // counted by the range tasks that parsed them. Reporting them again would
+          // double the job's row count.
+          rows: 0,
+          rejected: 0,
+          segments: result.shardParts ?? 0,
+          segmentBytes: result.objectBytes ?? 0,
+          bytesRead: 0,
+          classA: 0,
+          classB: 0,
+          note: `partition complete: ${(result.companies ?? 0).toLocaleString()} companies, ${(result.contacts ?? 0).toLocaleString()} contacts`,
+        },
+      });
+      return true;
+    }
+
+    if (current.kind === "assemble_shard") {
+      const kind = current.id.split(":")[1] ?? "";
+      const result = await readJson<{ terms?: number; postings?: number; bytes?: number; empty?: boolean; key?: string | null }>(
+        this.env.COMPANY_DATA,
+        `cloud/jobs/${plan.version}/shards/${kind}/${String(index).padStart(4, "0")}.json`,
+      );
+      if (!result) {
+        await this.coordinator("/fail", { workerId, taskId: current.id, error: "shard result object was not written" });
+        return false;
+      }
+      await this.coordinator("/complete", {
+        workerId,
+        taskId: current.id,
+        result: {
+          rows: 0,
+          rejected: 0,
+          segments: 0,
+          segmentBytes: result.bytes ?? 0,
+          bytesRead: 0,
+          classA: 0,
+          classB: 0,
+          note: result.empty
+            ? `${kind}/${index}: empty (no object written)`
+            : `${kind}/${index}: ${(result.terms ?? 0).toLocaleString()} terms, ${(result.postings ?? 0).toLocaleString()} postings`,
+        },
+      });
+      return true;
+    }
+
+    /*
+     * FINALIZE (or a legacy single-merge task): the manifest is the evidence.
+     *
+     * A finalize that published a manifest with `validationPassed: false` must NOT be
+     * reported as complete: that would activate a generation whose objects failed
+     * verification. It is failed instead, so the coordinator parks it for an operator.
+     */
+    const manifest = await readJson<{
+      validationPassed?: boolean;
+      counters?: { rowsRead?: number; uniqueCompanies?: number; uniqueContacts?: number };
+      objectCount?: number;
+    }>(this.env.COMPANY_DATA, `manifests/${plan.version}/manifest.json`);
+    const state = await readJson<{ totals?: { rowsIndexed?: number; segments?: number }; pass2?: { indexObjects?: number; indexBytes?: number } }>(
+      this.env.COMPANY_DATA,
+      `cloud/jobs/${plan.version}/state.json`,
+    );
+    if (current.kind === "finalize" && (!manifest || manifest.validationPassed !== true)) {
+      await this.coordinator("/fail", {
+        workerId,
+        taskId: current.id,
+        error: manifest
+          ? "finalize published a manifest whose validation failed; nothing was activated"
+          : "finalize did not publish a manifest",
+      });
+      return false;
+    }
+    const rows = manifest?.counters?.rowsRead ?? state?.totals?.rowsIndexed ?? 0;
     await this.coordinator("/complete", {
       workerId,
       taskId: current.id,
@@ -281,9 +362,11 @@ export class IndexerWorker implements DurableObject {
         bytesRead: 0,
         classA: 0,
         classB: 0,
-        note: `merge complete: ${state?.pass2?.indexObjects ?? 0} index object(s)`,
+        note: manifest
+          ? `finalize complete: ${(manifest.counters?.uniqueCompanies ?? 0).toLocaleString()} companies, ${(manifest.counters?.uniqueContacts ?? 0).toLocaleString()} contacts`
+          : `merge complete: ${state?.pass2?.indexObjects ?? 0} index object(s)`,
       },
-      searchable: { rows },
+      ...(current.kind === "finalize" ? { searchable: { rows, companies: manifest?.counters?.uniqueCompanies, contacts: manifest?.counters?.uniqueContacts } } : {}),
     });
     return true;
   }
@@ -294,38 +377,9 @@ export class IndexerWorker implements DurableObject {
   private async startTask(task: SwarmTask, claimPlan?: ClaimedPlan): Promise<{ ok: true; args: string[] } | { ok: false; error: string }> {
     const plan = claimPlan ?? (await this.state.storage.get<ClaimedPlan>(KEYS.plan));
     if (!plan) return { ok: false, error: "no swarm plan identity for this worker" };
-    const args =
-      task.kind === "merge"
-        ? ["pass2", "--version", plan.version, "--partitions", String(plan.partitions)]
-        : task.kind === "block"
-          ? [
-              "blocks",
-              "--version",
-              plan.version,
-              "--source",
-              task.sourceId,
-              "--block",
-              String(task.index),
-              "--block-mb",
-              String(Math.round(plan.blockBytes / (1024 * 1024))),
-            ]
-          : [
-              "range",
-              "--version",
-              plan.version,
-              "--source",
-              task.sourceId,
-              "--range",
-              String(task.index),
-              "--start",
-              String(task.start),
-              "--end",
-              String(task.end),
-              "--base-line",
-              String(task.baseLine ?? 1),
-              "--partitions",
-              String(plan.partitions),
-            ];
+    const built = taskArgs(task, plan);
+    if ("error" in built) return { ok: false, error: built.error };
+    const args = built.args;
 
     const container = this.container();
     if (!container) return { ok: false, error: "this worker is not declared as a container class" };
@@ -355,7 +409,10 @@ export class IndexerWorker implements DurableObject {
       // A merge can run for hours; the platform caps one call at 6h. The pump's poll
       // alarm also keeps the DO active, which is what actually holds the container
       // open, but the explicit window removes the dependence on alarm timing.
-      await this.renewInactivity(container, task.kind === "merge" ? 6 * 60 * 60 * 1000 : 60 * 60 * 1000);
+      // A merge or a finalize can run for hours; a block scan or a single shard is
+      // minutes. The platform caps one call at 6h either way.
+      const longRunning = task.kind === "merge" || task.kind === "merge_partition" || task.kind === "finalize";
+      await this.renewInactivity(container, longRunning ? 6 * 60 * 60 * 1000 : 60 * 60 * 1000);
       return { ok: true, args };
     } catch (error) {
       return { ok: false, error: `container request failed: ${error instanceof Error ? error.message : String(error)}` };
@@ -437,6 +494,74 @@ export class IndexerWorker implements DurableObject {
     }
     return response.json();
   }
+}
+
+/**
+ * The CLI invocation for one leased task.
+ *
+ * A missing argument is an ERROR, never an empty string: `--ref-base ""` would be
+ * rejected by the CLI inside the container, which turns a coordinator bug into a
+ * failed task with a confusing message. Returning the precise reason here parks it
+ * immediately instead.
+ */
+function taskArgs(task: SwarmTask, plan: ClaimedPlan): { args: string[] } | { error: string } {
+  if (task.kind === "merge") return { args: ["pass2", "--version", plan.version, "--partitions", String(plan.partitions)] };
+  if (task.kind === "finalize") return { args: ["finalize-parallel", "--version", plan.version] };
+  if (task.kind === "block") {
+    return {
+      args: [
+        "blocks",
+        "--version",
+        plan.version,
+        "--source",
+        task.sourceId,
+        "--block",
+        String(task.index),
+        "--block-mb",
+        String(Math.round(plan.blockBytes / (1024 * 1024))),
+      ],
+    };
+  }
+  if (task.kind === "merge_partition") {
+    if (task.refBase === undefined) return { error: `partition task ${task.id} has no refBase; cannot merge it safely` };
+    return {
+      args: [
+        "merge-partition",
+        "--version",
+        plan.version,
+        "--partition",
+        String(task.partition ?? task.index),
+        "--ref-base",
+        String(task.refBase),
+        ...(task.refCapacity !== undefined ? ["--ref-capacity", String(task.refCapacity)] : []),
+        "--partitions",
+        String(plan.partitions),
+      ],
+    };
+  }
+  if (task.kind === "assemble_shard") {
+    if (!task.shardKind) return { error: `shard task ${task.id} has no shardKind` };
+    return { args: ["assemble-shard", "--version", plan.version, "--kind", task.shardKind, "--shard", String(task.shard ?? task.index)] };
+  }
+  return {
+    args: [
+      "range",
+      "--version",
+      plan.version,
+      "--source",
+      task.sourceId,
+      "--range",
+      String(task.index),
+      "--start",
+      String(task.start),
+      "--end",
+      String(task.end),
+      "--base-line",
+      String(task.baseLine ?? 1),
+      "--partitions",
+      String(plan.partitions),
+    ],
+  };
 }
 
 async function readJson<T>(bucket: R2Bucket, key: string): Promise<T | null> {

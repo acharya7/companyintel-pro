@@ -106,17 +106,52 @@ export const SWARM_BUDGET = {
   hardUsd: 50,
 } as const;
 
+/**
+ * The phase pipeline: BLOCKS → INGEST → MERGE_PARTITIONS → ASSEMBLE_SHARDS →
+ * FINALIZE → COMPLETE.
+ *
+ * `merge` is kept for a run planned before the partition split existed: its single
+ * merge task still completes, but no new run creates one.
+ */
 export type SwarmStage =
   | "planned"
   | "blocks"
   | "ingest"
+  | "merge_partitions"
+  | "assemble_shards"
+  | "finalize"
   | "merge"
   | "complete"
   | "paused"
   | "aborted"
   | "failed";
 
-export type SwarmTaskKind = "block" | "range" | "merge";
+export type SwarmTaskKind =
+  | "block"
+  | "range"
+  /** One spool partition merged into its own aligned ref space. */
+  | "merge_partition"
+  /** One final index shard assembled from every partition's posting parts. */
+  | "assemble_shard"
+  /** Single-owner manifest commit over the durable partition and shard results. */
+  | "finalize"
+  /** Legacy: the whole merge in one container (pre-partition plans only). */
+  | "merge";
+
+/**
+ * The production shard layout, mirroring `tools/indexer/indexer.config.json`.
+ *
+ * A Worker bundle cannot read `tools/`, so the counts the coordinator must fan out
+ * are declared here — and `tests/swarm-shard-plan.test.ts` fails if this drifts from
+ * the indexer configuration, so the fan-out is never an assumed total.
+ */
+export const SWARM_SHARDS = {
+  exact: 512,
+  prefix: 256,
+  token: 256,
+  trigram: 512,
+  ids: 256,
+} as const;
 
 export type SwarmTaskState = "pending" | "leased" | "done" | "failed" | "parked";
 
@@ -127,6 +162,14 @@ export interface SwarmSourcePlan {
   etag: string | null;
   /** Blocks that must be scanned before ranges for this source can be planned. */
   blocks: number;
+}
+
+export interface SwarmShards {
+  exact: number;
+  prefix: number;
+  token: number;
+  trigram: number;
+  ids: number;
 }
 
 export interface SwarmPlan {
@@ -140,6 +183,13 @@ export interface SwarmPlan {
   budgetUsd: number | null;
   /** Workers the operator authorised for this run (never more than 16). */
   workers: number;
+  /**
+   * Shard counts the assembly phase must cover.
+   *
+   * Absent on a plan created before parallel shard assembly existed; the coordinator
+   * then refuses to fan out instead of guessing a count.
+   */
+  shards?: SwarmShards;
 }
 
 /** What a block scan found. Small enough that 1,000 of them fit in DO storage. */
@@ -177,13 +227,21 @@ export interface SwarmTask {
   id: string;
   kind: SwarmTaskKind;
   sourceId: string;
-  /** Block or range ordinal for `block`/`range`; `0` for the merge task. */
+  /** Block, range, partition or shard ordinal; `0` for a single-owner task. */
   index: number;
   /** Absolute byte range for `range`/`block` tasks. */
   start: number;
   end: number;
   /** `range` only: physical source line of the range's first record. */
   baseLine?: number;
+  /** `merge_partition` only: the ref slice this partition owns. */
+  partition?: number;
+  refBase?: number;
+  refCapacity?: number;
+  partitionRows?: number;
+  /** `assemble_shard` only: which shard object this task builds. */
+  shardKind?: string;
+  shard?: number;
   state: SwarmTaskState;
   attempts: number;
   leaseOwner?: string;
@@ -244,7 +302,20 @@ export interface SwarmStatus {
   partitions: number;
   workersAuthorised: number;
   workersActive: number;
-  tasks: { blocksPending: number; blocksDone: number; rangesPending: number; rangesDone: number; failed: number; parked: number };
+  tasks: {
+    blocksPending: number;
+    blocksDone: number;
+    rangesPending: number;
+    rangesDone: number;
+    /** Parallel merge tasks of the current run. */
+    partitionsTotal?: number;
+    partitionsDone?: number;
+    /** Shard assembly tasks of the current run. */
+    shardsTotal?: number;
+    shardsDone?: number;
+    failed: number;
+    parked: number;
+  };
   sources: SwarmSourceProgress[];
   totals: {
     rows: number;
@@ -280,9 +351,32 @@ export const swarmKeys = {
   status: (version: string) => `cloud/jobs/${version}/swarm/status.json`,
 } as const;
 
-/** Task id, deterministic and sortable: `block:csv1:000123`, `range:csv1:000002`. */
+/**
+ * Task id, deterministic and sortable: `block:csv1:000123`, `range:csv1:000002`,
+ * `merge_partition:all:000123`, `assemble_shard:exact:0007`, `finalize:all:000000`.
+ *
+ * The id is also how a worker finds the task's durable result object, so the kind and
+ * ordinal in it are part of the contract, not just a label.
+ */
 export function swarmTaskId(kind: SwarmTaskKind, sourceId: string, index: number): string {
-  return kind === "merge" ? `merge:${sourceId}:000000` : `${kind}:${sourceId}:${String(index).padStart(6, "0")}`;
+  if (kind === "merge" || kind === "finalize") return `${kind}:${sourceId}:000000`;
+  return `${kind}:${sourceId}:${String(index).padStart(6, "0")}`;
+}
+
+/** Every shard-assembly task the plan requires, in the sequential finalize order. */
+export function swarmShardTasks(shards: SwarmShards): { kind: string; shard: number; contact: boolean }[] {
+  const tasks: { kind: string; shard: number; contact: boolean }[] = [];
+  for (const kind of ["exact", "prefix", "token", "trigram", "ids"] as const) {
+    for (let shard = 0; shard < shards[kind]; shard += 1) tasks.push({ kind, shard, contact: false });
+  }
+  for (const [kind, count] of [
+    ["contactToken", shards.token],
+    ["contactPrefix", shards.prefix],
+    ["contactTrigram", shards.trigram],
+  ] as const) {
+    for (let shard = 0; shard < count; shard += 1) tasks.push({ kind, shard, contact: true });
+  }
+  return tasks;
 }
 
 /**

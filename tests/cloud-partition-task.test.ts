@@ -18,7 +18,7 @@ import { gunzipSync } from "node:zlib";
 import { cloudKeys } from "../src/shared/cloud/types";
 import { planRefBases } from "../tools/indexer/src/ref-space";
 import { runPass1, type Pass1SourceSpec } from "../tools/cloud/pass1";
-import { partitionPartPrefix, partitionResultKey, runPartitionTask } from "../tools/cloud/partition";
+import { partitionResultKey, runPartitionTask } from "../tools/cloud/partition";
 import { MemoryBlobStore } from "../tools/cloud/store";
 
 const CSV = `"Company Name","Website","Industry","Country","Contact Name","Job Title","Email"
@@ -96,9 +96,16 @@ describe("cloud partition task", () => {
     const totalCompanies = results.reduce((total, result) => total + result.companies, 0);
     expect(totalCompanies).toBeGreaterThan(0);
     expect(totalCompanies).toBeLessThanOrEqual(rows);
+    // Every spool row was merged by exactly one partition. This is the assertion the
+    // zero-company defect broke: each task echoed the corpus total instead of its own
+    // partition, so the coordinator could never reconcile coverage.
+    expect(results.reduce((total, result) => total + result.rows, 0)).toBe(rows);
 
-    // Company projections really are inside their partition's range, and the
-    // partition-tagged posting parts exist for a populated partition.
+    // Company projections really are inside their partition's range, and every
+    // populated partition owns partition-tagged posting parts. Which shards those
+    // parts land in depends on the fixture's terms, so the check is across all
+    // `exact` shards rather than an assumed shard 0.
+    const exactParts = await store.list(`${cloudKeys.jobRoot(VERSION)}/pass2/parts/exact/`);
     for (const result of populated) {
       for (const object of result.objects.filter((entry) => entry.key.startsWith("companies/"))) {
         const body = gunzipSync(await store.getRange(object.key, 0, object.bytes)).toString("utf8");
@@ -106,8 +113,11 @@ describe("cloud partition task", () => {
         expect(payload.firstRef).toBeGreaterThanOrEqual(result.refBase);
         expect(payload.firstRef + payload.companies.length).toBeLessThanOrEqual(result.refBase + result.capacity);
       }
-      const parts = await store.list(partitionPartPrefix(VERSION, "exact", 0));
-      expect(parts.some((part) => part.key.includes(`p-${String(result.partition).padStart(3, "0")}-`))).toBe(true);
+      const tag = `p-${String(result.partition).padStart(3, "0")}-`;
+      expect(exactParts.some((part) => part.key.includes(tag))).toBe(true);
+      // A partition merges once, so every posting batch it writes is batch 0 and no
+      // two partitions can collide on a shard.
+      expect(exactParts.filter((part) => part.key.includes(tag)).every((part) => part.key.includes(`${tag}000000`))).toBe(true);
     }
 
     // Nothing was finalised and nothing was activated.

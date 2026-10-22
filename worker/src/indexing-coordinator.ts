@@ -39,6 +39,7 @@ import {
   budgetLevel,
   planSourceRanges,
   swarmCost,
+  swarmShardTasks,
   swarmTaskId,
   type SwarmAccounting,
   type SwarmBlockDescriptor,
@@ -52,6 +53,7 @@ import {
   type SwarmTaskResult,
   type SwarmWorkerState,
 } from "../../src/shared/cloud/swarm";
+import { planRefBases, type RefAllocation } from "../../src/shared/cloud/ref-space";
 
 export interface CoordinatorEnv {
   COMPANY_DATA: R2Bucket;
@@ -62,6 +64,12 @@ interface Counters {
   blocksDone: number;
   rangesTotal: number;
   rangesDone: number;
+  /** Parallel merge tasks (one per spool partition) of the current run. */
+  mergesTotal: number;
+  mergesDone: number;
+  /** Shard-assembly tasks of the current run. */
+  shardsTotal: number;
+  shardsDone: number;
   failed: number;
   parked: number;
 }
@@ -91,7 +99,8 @@ const KEYS = {
   workers: "workers",
   perSource: "perSource",
   ranges: (sourceId: string) => `ranges:${sourceId}`,
-  queue: (kind: SwarmTaskKind | "merge") => `q:${kind}`,
+  queue: (kind: SwarmTaskKind) => `q:${kind}`,
+  allocation: "allocation",
   task: (id: string) => `t:${id}`,
   block: (sourceId: string, index: number) => `blk:${sourceId}:${String(index).padStart(6, "0")}`,
   errors: "errors",
@@ -158,6 +167,10 @@ export class IndexingCoordinator implements DurableObject {
       blocksDone: 0,
       rangesTotal: 0,
       rangesDone: 0,
+      mergesTotal: 0,
+      mergesDone: 0,
+      shardsTotal: 0,
+      shardsDone: 0,
       failed: 0,
       parked: 0,
     } satisfies Counters);
@@ -232,7 +245,7 @@ export class IndexingCoordinator implements DurableObject {
   }
 
   /** Pop the next pending id for a kind, lease it, and return the task. */
-  private async takePending(kind: SwarmTaskKind | "merge", workerId: string): Promise<SwarmTask | null> {
+  private async takePending(kind: SwarmTaskKind, workerId: string): Promise<SwarmTask | null> {
     const queueKey = KEYS.queue(kind);
     const queue = (await this.state.storage.get<string[]>(queueKey)) ?? [];
     while (queue.length) {
@@ -344,24 +357,110 @@ export class IndexingCoordinator implements DurableObject {
       const queue = (await this.state.storage.get<string[]>(KEYS.queue("range"))) ?? [];
       if (queue.length || counters.rangesDone < counters.rangesTotal) return false;
       await this.publishPass1(plan);
-      const id = swarmTaskId("merge", "all", 0);
+      /*
+       * MERGE_PARTITIONS: one task per spool partition, each with its own aligned ref
+       * slice. The allocation is computed ONCE here from the Pass 1 chunk manifests
+       * (each partition's real row count), so every task re-derives the same base and
+       * no two can write the same ref — or the same object.
+       */
+      const rowsByPartition = await this.partitionRows(plan);
+      const allocation = planRefBases(rowsByPartition);
+      await this.state.storage.put(KEYS.allocation, { rowsByPartition, ...allocation });
+      const ids: string[] = [];
+      for (let partition = 0; partition < plan.partitions; partition += 1) {
+        const id = swarmTaskId("merge_partition", "all", partition);
+        await this.state.storage.put(KEYS.task(id), {
+          id,
+          kind: "merge_partition",
+          sourceId: "all",
+          index: partition,
+          start: 0,
+          end: 0,
+          partition,
+          refBase: allocation.bases[partition]!,
+          refCapacity: allocation.capacities[partition]!,
+          partitionRows: rowsByPartition[partition] ?? 0,
+          state: "pending",
+          attempts: 0,
+        } satisfies SwarmTask);
+        ids.push(id);
+      }
+      await this.state.storage.put(KEYS.queue("merge_partition"), ids);
+      await this.state.storage.put(KEYS.counters, { ...counters, mergesTotal: ids.length });
+      await this.state.storage.put(KEYS.ingestDoneAt, Date.now());
+      await this.state.storage.put(KEYS.stage, "merge_partitions" satisfies SwarmStage);
+      return true;
+    }
+
+    if (stage === "merge_partitions") {
+      const queue = (await this.state.storage.get<string[]>(KEYS.queue("merge_partition"))) ?? [];
+      if (queue.length || counters.mergesDone < counters.mergesTotal) return false;
+      /*
+       * ASSEMBLE_SHARDS: one task per (kind, shard). The list comes from the plan's
+       * shard counts, never an assumed total, and every task writes exactly one final
+       * index object — the whole reason the merge tasks were forbidden from writing
+       * any.
+       */
+      const shards = plan.shards;
+      if (!shards) {
+        throw new Error(
+          "This plan has no shard counts, so shard assembly cannot be fanned out. Re-plan the run with a shard layout.",
+        );
+      }
+      const tasks = swarmShardTasks(shards);
+      const ids: string[] = [];
+      for (const task of tasks) {
+        const id = swarmTaskId("assemble_shard", task.kind, task.shard);
+        await this.state.storage.put(KEYS.task(id), {
+          id,
+          kind: "assemble_shard",
+          sourceId: task.kind,
+          index: task.shard,
+          start: 0,
+          end: 0,
+          shardKind: task.kind,
+          shard: task.shard,
+          state: "pending",
+          attempts: 0,
+        } satisfies SwarmTask);
+        ids.push(id);
+      }
+      await this.state.storage.put(KEYS.queue("assemble_shard"), ids);
+      await this.state.storage.put(KEYS.counters, { ...counters, shardsTotal: ids.length });
+      await this.state.storage.put(KEYS.stage, "assemble_shards" satisfies SwarmStage);
+      return true;
+    }
+
+    if (stage === "assemble_shards") {
+      const queue = (await this.state.storage.get<string[]>(KEYS.queue("assemble_shard"))) ?? [];
+      if (queue.length || counters.shardsDone < counters.shardsTotal) return false;
+      // FINALIZE: one task, because the manifest commit is a single-owner operation.
+      const id = swarmTaskId("finalize", "all", 0);
       await this.state.storage.put(KEYS.task(id), {
         id,
-        kind: "merge",
-        sourceId: plan.sources[0]!.id,
+        kind: "finalize",
+        sourceId: "all",
         index: 0,
         start: 0,
         end: 0,
         state: "pending",
         attempts: 0,
       } satisfies SwarmTask);
-      await this.state.storage.put(KEYS.queue("merge"), [id]);
-      await this.state.storage.put(KEYS.ingestDoneAt, Date.now());
-      await this.state.storage.put(KEYS.stage, "merge" satisfies SwarmStage);
+      await this.state.storage.put(KEYS.queue("finalize"), [id]);
+      await this.state.storage.put(KEYS.stage, "finalize" satisfies SwarmStage);
+      return true;
+    }
+
+    if (stage === "finalize") {
+      const finalizeTask = await this.state.storage.get<SwarmTask>(KEYS.task(swarmTaskId("finalize", "all", 0)));
+      if (!finalizeTask || finalizeTask.state !== "done") return false;
+      await this.state.storage.put(KEYS.stage, "complete" satisfies SwarmStage);
       return true;
     }
 
     if (stage === "merge") {
+      // Legacy single-merge plan: the one task is still honoured, but no new run
+      // creates it (the parallel phases above replace it).
       const queue = (await this.state.storage.get<string[]>(KEYS.queue("merge"))) ?? [];
       const mergeTask = await this.state.storage.get<SwarmTask>(KEYS.task(swarmTaskId("merge", "all", 0)));
       if (queue.length || !mergeTask || mergeTask.state !== "done") return false;
@@ -369,6 +468,61 @@ export class IndexingCoordinator implements DurableObject {
       return true;
     }
     return false;
+  }
+
+  /**
+   * Rows in every spool partition, from the Pass 1 chunk manifests.
+   *
+   * The ref allocation is derived from these counts, so it must come from what Pass 1
+   * actually wrote: a guessed uniform split would under-allocate a skewed partition
+   * and two tasks would then target the same objects.
+   */
+  private async partitionRows(plan: SwarmPlan): Promise<number[]> {
+    const rows = new Array<number>(plan.partitions).fill(0);
+    for (const source of plan.sources) {
+      const checkpoint = await this.getR2Json<{ chunks?: number }>(`${cloudPrefix(plan.version)}/checkpoints/${source.id}.json`);
+      const chunks = checkpoint?.chunks ?? 0;
+      for (let chunk = 0; chunk < chunks; chunk += 1) {
+        const manifest = await this.getR2Json<{ segments?: { partition: number; rows: number }[] }>(
+          `${cloudPrefix(plan.version)}/chunks/${source.id}/${String(chunk).padStart(6, "0")}.json`,
+        );
+        for (const segment of manifest?.segments ?? []) {
+          if (segment.partition < 0 || segment.partition >= plan.partitions) continue;
+          rows[segment.partition] = (rows[segment.partition] ?? 0) + segment.rows;
+        }
+      }
+    }
+    if (rows.every((count) => count === 0)) {
+      /*
+       * No chunk manifest was readable. Fall back to the aggregate checkpoint and give
+       * every partition the whole corpus as its upper bound: that over-allocates (which
+       * costs only ref numbers, never correctness) but can never under-allocate a
+       * skewed partition into its neighbour's objects.
+       */
+      let total = 0;
+      for (const source of plan.sources) {
+        const checkpoint = await this.getR2Json<{ rows?: number }>(`${cloudPrefix(plan.version)}/checkpoints/${source.id}.json`);
+        total += checkpoint?.rows ?? 0;
+      }
+      if (total === 0) {
+        throw new Error(
+          `Pass 1 recorded no rows in any of the ${plan.partitions} partitions, so the merge cannot be divided. ` +
+            "Refusing to fan out a merge that would write nothing.",
+        );
+      }
+      return rows.map(() => total);
+    }
+    return rows;
+  }
+
+  private async getR2Json<T>(key: string): Promise<T | null> {
+    const object = await this.env.COMPANY_DATA.get(key);
+    return object ? ((await object.json()) as T) : null;
+  }
+
+  /** The allocated ref space, for the status report and task arguments. */
+  private async allocation(): Promise<(RefAllocation & { rowsByPartition: number[] }) | null> {
+    return (await this.state.storage.get<RefAllocation & { rowsByPartition: number[] }>(KEYS.allocation)) ?? null;
   }
 
   /**
@@ -532,8 +686,17 @@ export class IndexingCoordinator implements DurableObject {
       };
       await this.state.storage.put(KEYS.perSource, perSource);
       await this.state.storage.put(KEYS.counters, { ...counters, rangesDone: counters.rangesDone + 1 });
+    } else if (task.kind === "merge_partition") {
+      await this.state.storage.put(KEYS.counters, { ...counters, mergesDone: counters.mergesDone + 1 });
+    } else if (task.kind === "assemble_shard") {
+      await this.state.storage.put(KEYS.counters, { ...counters, shardsDone: counters.shardsDone + 1 });
     } else {
-      await this.state.storage.put(KEYS.searchable, { ...(body.searchable ?? { rows: result.rows }), at: new Date(now).toISOString() });
+      // A single-owner task: the merge (legacy) or the finalize commit. `searchable`
+      // is only set by the finalize, so a planned-but-unvalidated version can never
+      // be reported as searchable.
+      if (body.searchable) {
+        await this.state.storage.put(KEYS.searchable, { ...body.searchable, at: new Date(now).toISOString() });
+      }
     }
 
     await this.addAccounting(result);
@@ -604,13 +767,18 @@ export class IndexingCoordinator implements DurableObject {
 
   private async resume(): Promise<SwarmStatus> {
     const counters = await this.counters();
-    // A paused run resumes in the phase its queues describe, never by replaying
-    // ranges that are already committed.
-    const stage: SwarmStage = counters.rangesTotal && counters.rangesDone < counters.rangesTotal
-      ? "ingest"
-      : counters.blocksDone < counters.blocksTotal
+    // A paused run resumes in the phase its queues describe, never by replaying a
+    // phase whose tasks are already committed.
+    const stage: SwarmStage =
+      counters.blocksDone < counters.blocksTotal
         ? "blocks"
-        : "merge";
+        : counters.rangesTotal && counters.rangesDone < counters.rangesTotal
+          ? "ingest"
+          : counters.mergesTotal && counters.mergesDone < counters.mergesTotal
+            ? "merge_partitions"
+            : counters.shardsTotal && counters.shardsDone < counters.shardsTotal
+              ? "assemble_shards"
+              : "finalize";
     await this.state.storage.put(KEYS.stage, stage);
     await this.state.storage.delete(KEYS.stopReason);
     return this.status();
@@ -750,6 +918,10 @@ export class IndexingCoordinator implements DurableObject {
         blocksDone: counters.blocksDone,
         rangesPending: Math.max(0, counters.rangesTotal - counters.rangesDone),
         rangesDone: counters.rangesDone,
+        partitionsTotal: counters.mergesTotal,
+        partitionsDone: counters.mergesDone,
+        shardsTotal: counters.shardsTotal,
+        shardsDone: counters.shardsDone,
         failed: counters.failed,
         parked: counters.parked,
       },
@@ -790,16 +962,22 @@ export class IndexingCoordinator implements DurableObject {
   }
 
   private async counters(): Promise<Counters> {
-    return (
-      (await this.state.storage.get<Counters>(KEYS.counters)) ?? {
-        blocksTotal: 0,
-        blocksDone: 0,
-        rangesTotal: 0,
-        rangesDone: 0,
-        failed: 0,
-        parked: 0,
-      }
-    );
+    const stored = await this.state.storage.get<Partial<Counters>>(KEYS.counters);
+    // Explicit defaults (rather than the stored object alone): a run planned before
+    // the parallel phases existed has no merge/shard counters, and `undefined + 1`
+    // would make every later progress report NaN.
+    return {
+      blocksTotal: stored?.blocksTotal ?? 0,
+      blocksDone: stored?.blocksDone ?? 0,
+      rangesTotal: stored?.rangesTotal ?? 0,
+      rangesDone: stored?.rangesDone ?? 0,
+      mergesTotal: stored?.mergesTotal ?? 0,
+      mergesDone: stored?.mergesDone ?? 0,
+      shardsTotal: stored?.shardsTotal ?? 0,
+      shardsDone: stored?.shardsDone ?? 0,
+      failed: stored?.failed ?? 0,
+      parked: stored?.parked ?? 0,
+    };
   }
 
   private async bumpCounter(field: keyof Counters): Promise<void> {
@@ -876,11 +1054,14 @@ function emptyProgress(): SourceProgress {
   return { rangesDone: 0, rows: 0, rejected: 0, segments: 0, segmentBytes: 0, bytesCovered: 0 };
 }
 
-function kindForStage(stage: SwarmStage): SwarmTaskKind | "merge" {
+function kindForStage(stage: SwarmStage): SwarmTaskKind {
   if (stage === "blocks") return "block";
   if (stage === "ingest") return "range";
+  if (stage === "merge_partitions") return "merge_partition";
+  if (stage === "assemble_shards") return "assemble_shard";
+  if (stage === "finalize") return "finalize";
   if (stage === "merge") return "merge";
-  return "merge";
+  return "finalize";
 }
 
 function cloudPrefix(version: string): string {
