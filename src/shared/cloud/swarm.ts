@@ -1,6 +1,6 @@
 /**
- * The parallel (swarm) indexing model: 16 Container-backed workers, one durable
- * coordinator, and byte ranges that can be processed in any order.
+ * The parallel (swarm) indexing model: up to 128 Container-backed workers (64 by
+ * default), one durable coordinator, and byte ranges processed in any order.
  *
  * Why this exists
  *   The original cloud job is a single sequential CLI: one container reads both
@@ -9,7 +9,7 @@
  *   SAME on-R2 formats — a range writes exactly the segment objects, chunk manifest
  *   and partition files that Pass 1 writes — so the existing, verified Pass 2 merge
  *   consumes swarm output unchanged, while the expensive read/parse/map work runs
- *   on 16 independent instances.
+ *   on independent instances.
  *
  * Why ranges need an alignment pass
  *   A range may only start where a *record* starts. A newline inside a quoted field
@@ -29,15 +29,28 @@
  *   no overlap and no gap (see `planSourceRanges`).
  */
 
-/** How many Container-backed workers a swarm uses. Each is a distinct DO identity. */
-export const SWARM_WORKER_COUNT = 16;
+/**
+ * Worker identities the coordinator can operate — the hard ceiling for a workforce.
+ *
+ * This is the identity space, not a provisioning promise: the containers that actually
+ * run are bounded by `[[containers]].max_instances` in `wrangler.toml`. The two are
+ * deliberately separate so a scale-down does not have to redeploy, and so widening the
+ * pool can never silently create work the platform has no capacity for.
+ */
+export const SWARM_WORKER_COUNT = 128;
+
+/** Workforce used when the operator does not name one (the full-corpus target pool). */
+export const SWARM_WORKER_DEFAULT = 64;
 
 /**
- * Deterministic worker identity: `indexer-worker-00` … `indexer-worker-15`.
+ * Deterministic worker identity: `indexer-worker-00` … `indexer-worker-127`.
  *
- * The identity is the Durable Object *name*, so `idFromName` yields 16 distinct
- * Durable Objects and therefore up to 16 distinct containers. `max_instances = 16`
- * alone would not do that: a single DO name is a single instance.
+ * The identity is the Durable Object *name*, so `idFromName` yields one distinct
+ * Durable Object (and therefore one container) per id. `max_instances` alone would
+ * not do that: a single DO name is a single instance.
+ *
+ * Two digits while the index is below 100 keeps every id the existing run already
+ * uses byte-identical (`indexer-worker-07`); the third digit appears only past 99.
  */
 export function swarmWorkerId(index: number): string {
   if (!Number.isInteger(index) || index < 0 || index >= SWARM_WORKER_COUNT) {
@@ -52,7 +65,7 @@ export function swarmWorkerIds(): string[] {
 
 /** Worker index encoded in a worker id, or `null` when the name is not a swarm worker. */
 export function swarmWorkerIndex(workerId: string): number | null {
-  const match = /^indexer-worker-(\d{2})$/.exec(workerId);
+  const match = /^indexer-worker-(\d{2,3})$/.exec(workerId);
   if (!match) return null;
   const index = Number(match[1]);
   return index >= 0 && index < SWARM_WORKER_COUNT ? index : null;
@@ -84,7 +97,7 @@ export const SWARM = {
    * has a very long run of blocks without one.
    */
   oversizedRangeBytes: 512 << 20,
-  /** Server-side spool budget for one range task (container disk is 12 GB). */
+  /** Server-side spool budget for one range task (container disk is 20 GB). */
   maxRangeSpoolBytes: 8 * 1024 ** 3,
   /** Reject a single CSV record larger than this instead of buffering it to OOM. */
   maxRecordBytes: 128 * 1024 ** 2,
@@ -96,8 +109,14 @@ export const SWARM = {
   idleMs: 30 * 1000,
   /** Claims a task may fail before it is parked for an operator. */
   maxAttempts: 4,
-  /** Container class this swarm is sized for (`wrangler.toml` must agree). */
-  instance: { type: "standard-2", vcpu: 1, gib: 6, diskGb: 12 },
+  /**
+   * Container class this swarm is sized for (`wrangler.toml` must agree).
+   *
+   * `standard-4`: 4 vCPU / 12 GiB / 20 GB disk. A partition merge is CPU-bound on
+   * hashing and JSON serialisation and its scratch is one partition at a time, so the
+   * larger class shortens the critical path without changing what is written.
+   */
+  instance: { type: "standard-4", vcpu: 4, gib: 12, diskGb: 20 },
 } as const;
 
 /**
@@ -289,7 +308,7 @@ export interface SwarmPlan {
   rangeBlocks: number;
   sources: SwarmSourcePlan[];
   budgetUsd: number | null;
-  /** Workers the operator authorised for this run (never more than 16). */
+  /** Workers the operator authorised for this run (never more than 128). */
   workers: number;
   /**
    * Shard counts the assembly phase must cover.
@@ -589,9 +608,9 @@ export function planSourceRanges(
   return { boundaries, ranges };
 }
 
-/** Clamp a requested worker count to the authorised maximum. */
+/** Clamp a requested worker count to the platform ceiling (default: the target pool). */
 export function clampWorkerCount(requested: number | undefined): number {
-  if (requested === undefined || !Number.isFinite(requested)) return SWARM_WORKER_COUNT;
+  if (requested === undefined || !Number.isFinite(requested)) return SWARM_WORKER_DEFAULT;
   return Math.max(1, Math.min(SWARM_WORKER_COUNT, Math.floor(requested)));
 }
 
@@ -599,8 +618,8 @@ export function clampWorkerCount(requested: number | undefined): number {
  * Worker ids a selected workforce owns — and, by complement, the ids a scale-down
  * must stop.
  *
- * A count is a SET of identities, not a hint: "use four workers" means containers
- * 04…15 are stopped, otherwise the operator would be paying for sixteen while
+ * A count is a SET of identities, not a hint: "use four workers" means every id above
+ * 03 is stopped, otherwise the operator would be paying for the whole pool while
  * believing four are running.
  */
 export function swarmActiveWorkerIds(count: number): string[] {

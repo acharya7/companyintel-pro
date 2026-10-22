@@ -56,7 +56,7 @@ No Convex, no SQL database, no KV/D1/Durable Objects, no Redis, no search server
 | `docs/verification.md` | phase-by-phase verification report: what was executed here, what is BLOCKED, defects found and fixed, manual browser/Access checklist |
 | `docs/execution-plan.md` | the full-indexing plan: sources, mappings, commands, RAM/disk/duration/size/cost, checkpoint config, validation steps, approval gate |
 | `docs/staging.md` | the isolated staging Worker (`wrangler.staging.toml`), how this exact source reaches GitHub, Cloudflare Workers Builds settings, least-privilege permissions, the controlled real-cloud benchmark (resource allocation, expected cost, approval gate), and the measured Pass 2 memory analysis |
-| `docs/swarm.md` | parallel indexing: 16 `standard-2` containers with distinct Durable Object identities, the alignment/ranges/merge phases, leases and recovery, the budget gates, the runbook, and the one stage that is deliberately still single-writer |
+| `docs/swarm.md` | parallel indexing: 64 `standard-4` containers (up to 128 identities) with distinct Durable Object identities, the alignment/ranges/merge phases, leases and recovery, the budget gates, the runbook, and the one stage that is deliberately still single-writer |
 
 ## Quick start
 

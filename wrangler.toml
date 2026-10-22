@@ -53,19 +53,24 @@ binding = "COMPANY_DATA"
 bucket_name = "company-intel-data"
 
 # ---------------------------------------------------------------------------
-# Parallel indexing: 16 × standard-2 containers.
+# Parallel indexing: up to 64 × standard-4 containers (identity space: 128).
 #
-# `standard-2` = 1 vCPU, 6 GiB RAM, 12 GB ephemeral disk. 16 of them give 16 vCPU,
-# 96 GiB RAM and 192 GB of provisioned disk, which is the authorised ceiling for the
-# full 64.26 GB corpus. Do not raise `max_instances` or the instance class without a
-# separate decision — that is the operator's spending gate, not a tuning knob.
+# `standard-4` = 4 vCPU, 12 GiB RAM, 20 GB ephemeral disk. A partition merge is
+# CPU-bound on hashing/serialisation and its scratch is one partition at a time, so the
+# larger class shortens the critical path without changing what is written.
+#
+# `max_instances` here is the PROVISIONED ceiling; the coordinator can address up to
+# SWARM_WORKER_COUNT (128) identities, but only this many containers can exist at once.
+# Raising `max_instances` is a spending decision: 64 × standard-4 is roughly $25/hour
+# at published rates, so the application's own $45/$50 budget gates stop new claims
+# long before that if the plan's budget is left at $50.
 #
 # IMPORTANT: `max_instances` is only an UPPER BOUND. It does not create instances, and
 # a namespace addressed by one name (`idFromName("indexer")`) still yields exactly one
-# container. The 16 concurrent containers come from 16 distinct Durable Object
-# identities — `indexer-worker-00` … `indexer-worker-15` — each of which is this
+# container. The concurrent containers come from distinct Durable Object identities —
+# `indexer-worker-00` … `indexer-worker-63` here — each of which is this
 # `IndexerWorker` class (see worker/src/indexer-worker.ts). Getting this wrong is the
-# difference between 16 workers and one worker that appears 16 times in a config.
+# difference between 64 workers and one worker that appears 64 times in a config.
 #
 # `wrangler deploy` builds ./Dockerfile with Docker and pushes it to Cloudflare's
 # managed registry, so a deploy needs Docker or Workers Builds. Containers have no
@@ -75,8 +80,8 @@ bucket_name = "company-intel-data"
 [[containers]]
 class_name = "IndexerWorker"
 image = "./Dockerfile"
-instance_type = "standard-2"
-max_instances = 16
+instance_type = "standard-4"
+max_instances = 64
 
 [[durable_objects.bindings]]
 name = "INDEXER_WORKER"

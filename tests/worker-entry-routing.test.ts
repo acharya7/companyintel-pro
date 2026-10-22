@@ -145,12 +145,12 @@ describe("Static-asset routing configuration", () => {
       }
       expect(source).toMatch(/binding\s*=\s*"COMPANY_DATA"/);
       expect(source).toMatch(/bucket_name\s*=\s*"company-intel-data"/);
-      // Production declares the 16-worker swarm container AND keeps the single-job
+      // Production declares the wide swarm container AND keeps the single-job
       // container; staging keeps only the latter, at one instance.
       if (file === "wrangler.toml") {
         expect(source).toMatch(/class_name\s*=\s*"IndexerWorker"/);
-        expect(source).toMatch(/instance_type\s*=\s*"standard-2"/);
-        expect(source).toMatch(/max_instances\s*=\s*16/);
+        expect(source).toMatch(/instance_type\s*=\s*"standard-4"/);
+        expect(source).toMatch(/max_instances\s*=\s*64/);
       } else {
         expect(source).toMatch(/max_instances\s*=\s*1/);
       }

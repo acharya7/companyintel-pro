@@ -17,7 +17,7 @@
 import { describe, expect, test } from "bun:test";
 import { Hono } from "hono";
 
-import type { SwarmStatus, SwarmWorkerStopResult } from "../src/shared/cloud/swarm";
+import { SWARM_WORKER_COUNT, type SwarmStatus, type SwarmWorkerStopResult } from "../src/shared/cloud/swarm";
 import { swarmRoutes } from "../worker/src/swarm-admin";
 
 const STATUS: SwarmStatus = {
@@ -129,7 +129,7 @@ describe("swarm admin: pause drains containers without aborting the job", () => 
     const coordinatorOrder = coordinator.calls.map((entry) => entry.path);
     expect(coordinatorOrder[0]).toBe("/pause");
 
-    expect(stopCalls(workers.calls)).toHaveLength(16);
+    expect(stopCalls(workers.calls)).toHaveLength(SWARM_WORKER_COUNT);
     expect(response.body.action).toBe("pause");
     expect(response.body.released).toEqual(["range:csv1:000012"]);
     const shutdown = response.body.shutdown as {
@@ -138,8 +138,8 @@ describe("swarm admin: pause drains containers without aborting the job", () => 
       failed: number;
       results: SwarmWorkerStopResult[];
     };
-    expect(shutdown.requested).toBe(16);
-    expect(shutdown.stopped).toBe(16);
+    expect(shutdown.requested).toBe(SWARM_WORKER_COUNT);
+    expect(shutdown.stopped).toBe(SWARM_WORKER_COUNT);
     expect(shutdown.failed).toBe(0);
     expect(shutdown.results[0]).toMatchObject({ ok: true, containerDestroyed: true, releaseConfirmed: true });
     // The job's identity is untouched: no abort, no re-plan, no version change.
@@ -153,7 +153,7 @@ describe("swarm admin: pause drains containers without aborting the job", () => 
     const response = await call("/pause");
     const shutdown = response.body.shutdown as { stopped: number; failed: number; results: SwarmWorkerStopResult[] };
     expect(response.body.ok).toBe(false);
-    expect(shutdown.stopped).toBe(15);
+    expect(shutdown.stopped).toBe(SWARM_WORKER_COUNT - 1);
     expect(shutdown.failed).toBe(1);
     expect(shutdown.results.find((result) => result.workerId === "indexer-worker-07")).toMatchObject({
       ok: false,
@@ -161,7 +161,7 @@ describe("swarm admin: pause drains containers without aborting the job", () => 
       error: "container destroy failed: platform error",
     });
     // Every worker was still asked.
-    expect(stopCalls(workers.calls)).toHaveLength(16);
+    expect(stopCalls(workers.calls)).toHaveLength(SWARM_WORKER_COUNT);
   });
 
   test("a lease that could not be handed back is visible in the per-worker result", async () => {
@@ -173,27 +173,18 @@ describe("swarm admin: pause drains containers without aborting the job", () => 
 });
 
 describe("swarm admin: a worker count is a set, not a hint", () => {
-  test("launching four stops workers 04…15 and pumps only 00…03", async () => {
+  test("launching four stops workers 04…127 and pumps only 00…03", async () => {
     const { call, coordinator, workers } = harness();
     const response = await call("/launch", { workers: 4 });
     expect(response.status).toBe(202);
     expect(response.body.launched).toBe(4);
 
     expect(coordinator.calls.find((entry) => entry.path === "/workers")!.body).toMatchObject({ count: 4 });
-    expect(stopCalls(workers.calls)).toEqual([
-      "indexer-worker-04",
-      "indexer-worker-05",
-      "indexer-worker-06",
-      "indexer-worker-07",
-      "indexer-worker-08",
-      "indexer-worker-09",
-      "indexer-worker-10",
-      "indexer-worker-11",
-      "indexer-worker-12",
-      "indexer-worker-13",
-      "indexer-worker-14",
-      "indexer-worker-15",
-    ]);
+    const retired = stopCalls(workers.calls);
+    expect(retired).toHaveLength(SWARM_WORKER_COUNT - 4);
+    expect(retired[0]).toBe("indexer-worker-04");
+    // `stopCalls` sorts ids as strings, so membership is asserted, not position.
+    expect(retired).toContain(`indexer-worker-${SWARM_WORKER_COUNT - 1}`);
     expect(pumpCalls(workers.calls)).toEqual([
       "indexer-worker-00",
       "indexer-worker-01",
@@ -210,38 +201,26 @@ describe("swarm admin: a worker count is a set, not a hint", () => {
 
     const coordinatorOrder = coordinator.calls.map((entry) => entry.path);
     expect(coordinatorOrder.indexOf("/workers")).toBeLessThan(coordinatorOrder.indexOf("/resume"));
-    expect(stopCalls(workers.calls)).toHaveLength(12);
+    expect(stopCalls(workers.calls)).toHaveLength(SWARM_WORKER_COUNT - 4);
     expect(pumpCalls(workers.calls)).toEqual(["indexer-worker-00", "indexer-worker-01", "indexer-worker-02", "indexer-worker-03"]);
   });
 
-  test("scaling to two mid-run stops 02…15 and does not resume", async () => {
+  test("scaling to two mid-run stops 02…127 and does not resume", async () => {
     const { call, coordinator, workers } = harness();
     const response = await call("/scale", { workers: 2 });
     expect(response.status).toBe(200);
     expect(response.body.workers).toBe(2);
-    expect(stopCalls(workers.calls)).toEqual([
-      "indexer-worker-02",
-      "indexer-worker-03",
-      "indexer-worker-04",
-      "indexer-worker-05",
-      "indexer-worker-06",
-      "indexer-worker-07",
-      "indexer-worker-08",
-      "indexer-worker-09",
-      "indexer-worker-10",
-      "indexer-worker-11",
-      "indexer-worker-12",
-      "indexer-worker-13",
-      "indexer-worker-14",
-      "indexer-worker-15",
-    ]);
+    const retired = stopCalls(workers.calls);
+    expect(retired).toHaveLength(SWARM_WORKER_COUNT - 2);
+    expect(retired[0]).toBe("indexer-worker-02");
+    expect(retired).toContain(`indexer-worker-${SWARM_WORKER_COUNT - 1}`);
     expect(pumpCalls(workers.calls)).toHaveLength(0);
     expect(coordinator.calls.map((entry) => entry.path)).not.toContain("/resume");
   });
 
   test("refuses a workforce the platform cannot run", async () => {
     const { call } = harness();
-    for (const workers of [0, 17, 3.5]) {
+    for (const workers of [0, SWARM_WORKER_COUNT + 1, 3.5]) {
       const response = await call("/scale", { workers });
       expect(response.status).toBe(400);
       expect(String((response.body.error as { code?: string } | undefined)?.code)).toBe("invalid_workers");
@@ -250,12 +229,12 @@ describe("swarm admin: a worker count is a set, not a hint", () => {
 });
 
 describe("swarm admin: stopping containers never aborts the job", () => {
-  test("stop-all pauses the coordinator and stops all sixteen", async () => {
+  test("stop-all pauses the coordinator and stops every identity", async () => {
     const { call, coordinator, workers } = harness();
     const response = await call("/stop", {});
     expect(response.status).toBe(200);
     expect(coordinator.calls.map((entry) => entry.path)).toEqual(["/pause"]);
-    expect(stopCalls(workers.calls)).toHaveLength(16);
+    expect(stopCalls(workers.calls)).toHaveLength(SWARM_WORKER_COUNT);
     expect((response.body.status as SwarmStatus).stage).toBe("paused");
   });
 
@@ -269,7 +248,7 @@ describe("swarm admin: stopping containers never aborts the job", () => {
 
   test("rejects an unknown worker id instead of stopping everything", async () => {
     const { call, workers } = harness();
-    const response = await call("/stop", { workers: ["indexer-worker-99"] });
+    const response = await call("/stop", { workers: [`indexer-worker-${SWARM_WORKER_COUNT}`] });
     expect(response.status).toBe(400);
     expect(stopCalls(workers.calls)).toHaveLength(0);
   });

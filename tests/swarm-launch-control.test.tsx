@@ -21,8 +21,8 @@ import { ShutdownReport, SwarmConfirmFacts, SwarmLaunch } from "../src/component
 describe("full-corpus launch control", () => {
   test("renders the start control for an authorised administrator", () => {
     const html = renderToString(<SwarmLaunch authorized staging={false} />);
-    expect(html).toContain("START FULL INDEXING — 16 CONTAINERS");
-    expect(html).toContain("Full dataset indexing — 16 containers");
+    expect(html).toContain("START FULL INDEXING — 64 CONTAINERS");
+    expect(html).toContain("Full dataset indexing — 64 containers");
   });
 
   test("is not rendered for an identity the control plane rejected", () => {
@@ -45,7 +45,7 @@ describe("full-corpus launch control", () => {
     expect(html).toContain("54.04 GB");
     expect(html).toContain("64.26 GB");
     // Size, shape and fan-out.
-    expect(html).toContain("16 × Cloudflare standard-2");
+    expect(html).toContain("64 × Cloudflare standard-4 (4 vCPU / 12 GiB / 20 GB)");
     expect(html).toContain("256 independent merge tasks");
     expect(html).toContain("2,816 shard tasks");
     // The budget objective and the automatic gates, including the pause behaviour.

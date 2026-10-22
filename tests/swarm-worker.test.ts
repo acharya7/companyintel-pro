@@ -11,7 +11,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { cloudKeys } from "../src/shared/cloud/types";
-import { SWARM_WORKER_COUNT, swarmKeys, swarmWorkerId, swarmWorkerIds } from "../src/shared/cloud/swarm";
+import { SWARM_WORKER_COUNT, swarmKeys, swarmWorkerId, swarmWorkerIds, swarmWorkerIndex } from "../src/shared/cloud/swarm";
 import { IndexerWorker } from "../worker/src/indexer-worker";
 import { fakeDoState } from "./helpers/fake-do";
 import { FakeR2Bucket } from "./helpers/fake-r2";
@@ -106,16 +106,22 @@ const RANGE_RESULT = {
 };
 
 describe("swarm worker identity", () => {
-  test("16 deterministic, distinct identities", () => {
+  test("128 deterministic, distinct identities, with the existing ids unchanged", () => {
     const ids = swarmWorkerIds();
     expect(ids).toHaveLength(SWARM_WORKER_COUNT);
     expect(new Set(ids).size).toBe(SWARM_WORKER_COUNT);
     expect(ids[0]).toBe("indexer-worker-00");
-    expect(ids.at(-1)).toBe("indexer-worker-15");
+    // The ids the current run already uses keep their exact names …
+    expect(ids[15]).toBe("indexer-worker-15");
+    // … and the widened pool continues past them.
+    expect(ids.at(-1)).toBe(`indexer-worker-${SWARM_WORKER_COUNT - 1}`);
     expect(swarmWorkerId(7)).toBe("indexer-worker-07");
-    expect(() => swarmWorkerId(16)).toThrow();
-    // The identity is the DO *name*: distinct names are what create 16 instances.
-    expect(new Set(ids.map((id) => `swarm:${id}`)).size).toBe(16);
+    expect(swarmWorkerId(100)).toBe("indexer-worker-100");
+    expect(() => swarmWorkerId(SWARM_WORKER_COUNT)).toThrow();
+    // The identity is the DO *name*: distinct names are what create instances.
+    expect(new Set(ids.map((id) => `swarm:${id}`)).size).toBe(SWARM_WORKER_COUNT);
+    // Every id round-trips through the parser the routes use.
+    expect(ids.every((id, index) => swarmWorkerIndex(id) === index)).toBe(true);
   });
 });
 

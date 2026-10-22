@@ -20,7 +20,7 @@
 import { describe, expect, test } from "bun:test";
 
 import { cloudKeys } from "../src/shared/cloud/types";
-import type { SwarmBlockDescriptor, SwarmPlan, SwarmTask } from "../src/shared/cloud/swarm";
+import { SWARM_WORKER_COUNT, type SwarmBlockDescriptor, type SwarmPlan, type SwarmTask } from "../src/shared/cloud/swarm";
 import { IndexingCoordinator } from "../worker/src/indexing-coordinator";
 import { IndexerWorker } from "../worker/src/indexer-worker";
 import { fakeDoState } from "./helpers/fake-do";
@@ -237,10 +237,10 @@ describe("coordinator: an operator can limit the workforce", () => {
     expect(status.workersAuthorised).toBe(1);
   });
 
-  test("refuses a workforce outside 1..16", async () => {
+  test("refuses a workforce outside the identity space", async () => {
     const { coordinator } = harness();
     await call(coordinator, "/plan", PLAN as unknown as Record<string, unknown>);
-    for (const count of [0, 17, 2.5]) {
+    for (const count of [0, SWARM_WORKER_COUNT + 1, 2.5]) {
       const response = await call(coordinator, "/workers", { count });
       expect(response.status).toBe(500);
     }

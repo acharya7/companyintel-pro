@@ -14,7 +14,13 @@
 
 import { describe, expect, test } from "bun:test";
 
-import type { SwarmBlockDescriptor, SwarmPlan, SwarmTask } from "../src/shared/cloud/swarm";
+import {
+  SWARM_BUDGET,
+  SWARM_CONTAINER_USD_PER_SECOND,
+  type SwarmBlockDescriptor,
+  type SwarmPlan,
+  type SwarmTask,
+} from "../src/shared/cloud/swarm";
 import { IndexingCoordinator } from "../worker/src/indexing-coordinator";
 import { fakeDoState } from "./helpers/fake-do";
 import { FakeR2Bucket } from "./helpers/fake-r2";
@@ -243,14 +249,18 @@ describe("swarm coordinator", () => {
     const { coordinator, state } = harness();
     await call(coordinator, "/plan", PLAN as unknown as Record<string, unknown>);
 
-    // $49 of container time: past the $45 soft gate, under the $50 pause.
-    state.map.set("accounting", { containerSeconds: 1_400_000, classA: 0, classB: 0, bytesRead: 0, bytesWritten: 0 });
+    // Container seconds are derived from the configured instance's price, so this
+    // stays a test of the GATES rather than of one container class's dollar figure.
+    const softSeconds = Math.ceil((SWARM_BUDGET.softUsd + 1) / SWARM_CONTAINER_USD_PER_SECOND);
+    const hardSeconds = Math.ceil((SWARM_BUDGET.hardUsd + 20) / SWARM_CONTAINER_USD_PER_SECOND);
+    // Past the soft gate, under the pause.
+    state.map.set("accounting", { containerSeconds: softSeconds, classA: 0, classB: 0, bytesRead: 0, bytesWritten: 0 });
     const soft = (await call(coordinator, "/claim", { workerId: "indexer-worker-00" })) as { stop?: string; task?: unknown };
     expect(soft.stop).toBe("budget_soft");
     expect(soft.task).toBeNull();
 
-    // $70: the run pauses and says why, instead of spending past the limit.
-    state.map.set("accounting", { containerSeconds: 2_000_000, classA: 0, classB: 0, bytesRead: 0, bytesWritten: 0 });
+    // Past the hard gate: the run pauses and says why, instead of spending past the limit.
+    state.map.set("accounting", { containerSeconds: hardSeconds, classA: 0, classB: 0, bytesRead: 0, bytesWritten: 0 });
     const hard = (await call(coordinator, "/claim", { workerId: "indexer-worker-00" })) as { stop?: string };
     expect(hard.stop).toBe("budget");
     const status = (await call(coordinator, "/status")) as unknown as { stage: string; stopReason?: string; accounting: { level: string } };

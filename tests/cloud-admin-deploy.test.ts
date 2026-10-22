@@ -30,12 +30,12 @@ const dockerfile = readFileSync(join(root, "Dockerfile"), "utf8");
 const cloudDockerfile = readFileSync(join(root, "cloud", "Dockerfile"), "utf8");
 
 describe("Cloudflare Containers deployment config", () => {
-  test("declares the 16-worker swarm container, its Durable Objects and the migrations", () => {
+  test("declares the wide swarm container, its Durable Objects and the migrations", () => {
     expect(config).toContain("[[containers]]");
-    // The swarm: 16 × standard-2, reached through 16 distinct DO identities.
+    // The swarm: 64 × standard-4 provisioned, reached through distinct DO identities.
     expect(config).toMatch(/class_name\s*=\s*"IndexerWorker"/);
-    expect(config).toMatch(/instance_type\s*=\s*"standard-2"/);
-    expect(config).toMatch(/max_instances\s*=\s*16/);
+    expect(config).toMatch(/instance_type\s*=\s*"standard-4"/);
+    expect(config).toMatch(/max_instances\s*=\s*64/);
     expect(config).toMatch(/name\s*=\s*"INDEXER_WORKER"/);
     expect(config).toMatch(/name\s*=\s*"INDEXING_COORDINATOR"/);
     expect(config).toMatch(/new_sqlite_classes\s*=\s*\["IndexerWorker", "IndexingCoordinator"\]/);

@@ -37,6 +37,7 @@ import {
   SWARM,
   SWARM_BUDGET,
   SWARM_WORKER_COUNT,
+  SWARM_WORKER_DEFAULT,
   budgetLevel,
   planSourceRanges,
   swarmCost,
@@ -115,7 +116,7 @@ const KEYS = {
   rowsAtWindowStart: "rowsAtWindowStart",
   searchable: "searchable",
   /**
-   * The operator's CURRENT workforce size (1…16), separate from `plan.workers`.
+   * The operator's CURRENT workforce size (1…128), separate from `plan.workers`.
    *
    * The plan records what the run was authorised with; this records what is running
    * now, so scaling down is a durable decision the coordinator enforces on the next
@@ -1509,15 +1510,15 @@ function cloudPrefix(version: string): string {
   return `cloud/jobs/${version}`;
 }
 
-/** 1…16, with a missing/zero value falling back to the platform ceiling. */
+/** 1…128, with a missing/zero value falling back to the target pool (64). */
 function clampActive(value: number): number {
-  if (!Number.isFinite(value)) return SWARM_WORKER_COUNT;
-  return Math.max(1, Math.min(SWARM_WORKER_COUNT, Math.floor(value) || SWARM_WORKER_COUNT));
+  if (!Number.isFinite(value)) return SWARM_WORKER_DEFAULT;
+  return Math.max(1, Math.min(SWARM_WORKER_COUNT, Math.floor(value) || SWARM_WORKER_DEFAULT));
 }
 
 function requireWorkerId(value: string | undefined): string {
-  if (typeof value !== "string" || !/^indexer-worker-\d{2}$/.test(value)) {
-    throw new Error("workerId must be one of indexer-worker-00 … indexer-worker-15");
+  if (typeof value !== "string" || !/^indexer-worker-\d{2,3}$/.test(value) || swarmWorkerIndex(value) === null) {
+    throw new Error(`workerId must be one of indexer-worker-00 … indexer-worker-${SWARM_WORKER_COUNT - 1}`);
   }
   return value;
 }

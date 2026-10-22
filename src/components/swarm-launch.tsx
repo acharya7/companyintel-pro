@@ -5,8 +5,8 @@
  * single confirmation standing in for the individual phase approvals:
  *
  *   1. POST /api/cloud/jobs/<version>/control  { action: "approve" }   ← full-run gate
- *   2. POST /api/cloud/swarm/plan   { version, partitions: 256, blockMb: 64, rangeBlocks: 2, workers: 16 }
- *   3. POST /api/cloud/swarm/launch            { workers: 16 }
+ *   2. POST /api/cloud/swarm/plan   { version, partitions: 256, blockMb: 64, rangeBlocks: 2, workers: 64 }
+ *   3. POST /api/cloud/swarm/launch            { workers: 64 }
  *   4. GET  /api/cloud/swarm/status            ← the live state rendered below
  *
  * It never bypasses Access: every request goes through the same admin API the rest of
@@ -16,7 +16,7 @@
  *
  * Duplicate protection: if a parallel run already exists, the control refuses to
  * start a second one for a different version, resumes the same version instead of
- * re-planning it, and re-launching only pumps the 16 workers (which is how a stalled
+ * re-planning it, and re-launching only pumps the selected workers (which is how a stalled
  * swarm is woken without resetting its queues).
  */
 
@@ -36,7 +36,9 @@ const SOURCE_FACTS = [
 ];
 
 const TERMINAL = new Set(["complete", "aborted", "failed"]);
-const WORKER_CHOICES = [1, 2, 4, 6, 8, 12, 16];
+const WORKER_CHOICES = [1, 2, 4, 8, 16, 32, 64, 96, 128];
+/** Target pool for the full corpus; the operator can scale within the coordinator's ceiling. */
+const WORKER_DEFAULT = 64;
 
 /** What every swarm control answers with, including what the containers really did. */
 interface SwarmControlResponse {
@@ -115,7 +117,7 @@ export function SwarmLaunch({ authorized, staging }: { authorized: boolean; stag
   const [workerChoice, setWorkerChoice] = useState<number | null>(null);
   /** The last stop's per-worker outcome, shown until the next control is used. */
   const [shutdown, setShutdown] = useState<SwarmStopSummary | null>(null);
-  const workers = workerChoice ?? status?.workersAuthorised ?? 16;
+  const workers = workerChoice ?? status?.workersAuthorised ?? WORKER_DEFAULT;
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -205,9 +207,9 @@ export function SwarmLaunch({ authorized, staging }: { authorized: boolean; stag
       } else if (!(existing?.version === id && !TERMINAL.has(existing.stage))) {
         await admin("/api/cloud/swarm/plan", {
           method: "POST",
-          body: JSON.stringify({ version: id, partitions: 256, blockMb: 64, rangeBlocks: 2, workers: 16 }),
+          body: JSON.stringify({ version: id, partitions: 256, blockMb: 64, rangeBlocks: 2, workers: WORKER_DEFAULT }),
         });
-        setNotice(`Full-corpus plan created for ${id}: 256 partitions, 16 containers.`);
+        setNotice(`Full-corpus plan created for ${id}: 256 partitions, ${WORKER_DEFAULT} containers.`);
       } else {
         setNotice(`A plan for ${id} already exists at ${existing.stage}; re-launching its workers.`);
       }
@@ -293,7 +295,7 @@ export function SwarmLaunch({ authorized, staging }: { authorized: boolean; stag
   return (
     <Section
       className="mb-4"
-      title="Full dataset indexing — 16 containers"
+      title={`Full dataset indexing — ${WORKER_DEFAULT} containers`}
       description="One confirmation starts the production swarm: blocks → parallel ingest → 256 partition merges → 2,816 shard tasks → finalize. The coordinator runs in Cloudflare and survives closing this tab."
       actions={
         <>
@@ -307,7 +309,7 @@ export function SwarmLaunch({ authorized, staging }: { authorized: boolean; stag
           </Button>
           <Button className="gap-2" onClick={() => setConfirming(true)} disabled={busy !== null || running}>
             <Rocket className="size-4" />
-            {running ? "Full indexing is running" : "START FULL INDEXING — 16 CONTAINERS"}
+            {running ? "Full indexing is running" : `START FULL INDEXING — ${WORKER_DEFAULT} CONTAINERS`}
           </Button>
         </>
       }
@@ -416,7 +418,7 @@ export function SwarmLaunch({ authorized, staging }: { authorized: boolean; stag
           </>
         ) : (
           <p className="text-xs text-muted-foreground">
-            {statusKnown ? "No parallel run yet. Starting one approves the full run, plans 256 partitions and pumps all 16 containers." : "Reading swarm status…"}
+            {statusKnown ? `No parallel run yet. Starting one approves the full run, plans 256 partitions and pumps all ${WORKER_DEFAULT} containers.` : "Reading swarm status…"}
           </p>
         )}
       </div>
@@ -508,7 +510,7 @@ export function SwarmConfirmFacts({ version }: { version: string }) {
         </div>
         <div className="contents">
           <dt className="text-muted-foreground">containers</dt>
-          <dd>16 × Cloudflare standard-2</dd>
+          <dd>64 × Cloudflare standard-4 (4 vCPU / 12 GiB / 20 GB)</dd>
         </div>
         <div className="contents">
           <dt className="text-muted-foreground">partitions</dt>

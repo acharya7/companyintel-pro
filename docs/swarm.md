@@ -1,7 +1,8 @@
-# Parallel indexing — 16 containers, one coordinator
+# Parallel indexing — 64 containers, one coordinator
 
-The full corpus (≈64.26 GB in `raw/file1.csv` and `raw/file2.csv`) is processed by **16
-Container-backed workers** instead of one sequential CLI. This document is the runbook
+The full corpus (≈64.26 GB in `raw/file1.csv` and `raw/file2.csv`) is processed by
+**Container-backed workers** (64 by default, up to the coordinator's 128 identities)
+instead of one sequential CLI. This document is the runbook
 and the design record: what each piece owns, why the boundaries are where they are, and
 what is still **not** parallel.
 
@@ -24,13 +25,14 @@ and 64 GB of parsing does not fit in a useful amount of time.
 | Component | Class | Identity | Role |
 | --- | --- | --- | --- |
 | Coordinator | `IndexingCoordinator` | `idFromName("swarm")` | Durable task table, leases, phases, budget, aggregate Pass 1 publication |
-| Worker ×16 | `IndexerWorker` | `idFromName("indexer-worker-00" … "-15")` | Owns one container, claims one task at a time, reports results |
+| Worker ×64 | `IndexerWorker` | `idFromName("indexer-worker-00" … "-63")` | Owns one container, claims one task at a time, reports results |
 | Container | `./Dockerfile` → `cloud/runner.mjs` | per worker | Runs `blocks` / `range` / `pass2` for the claimed task |
 
-`max_instances = 16` is only an upper bound. **16 concurrent containers exist because
-there are 16 distinct Durable Object names.** An implementation that addressed one name
-and raised `max_instances` would run one container and look configured for sixteen — the
-single most important thing to keep true in `wrangler.toml`.
+`max_instances = 64` is only an upper bound. **Concurrent containers exist because each
+has a distinct Durable Object name** (`SWARM_WORKER_COUNT` = 128 identities; the pool
+starts at 64). An implementation that addressed one name and raised `max_instances`
+would run one container and look configured for many — the single most important thing
+to keep true in `wrangler.toml`.
 
 ```
                  ┌──────────────────────────┐
@@ -144,7 +146,7 @@ now on 16 vCPUs instead of one.
 
 `CLOUD_JOB_BUDGET_USD` (50 in `wrangler.toml`) is the run's budget. The estimate is:
 
-* container seconds × `SWARM_CONTAINER_USD_PER_SECOND` (standard-2: 1 vCPU + 6 GiB), charged
+* container seconds × `SWARM_CONTAINER_USD_PER_SECOND` (standard-4: 4 vCPU + 12 GiB), charged
   from worker heartbeats — a worker that stops heartbeating stops accruing, so a dead
   container is not billed as if it were running;
 * R2 Class A / Class B requests and written bytes, reported by each task.
@@ -161,18 +163,18 @@ allowlist. `plan` also requires `control.approvedFullRun`.
 
 ### From the panel (one confirmation)
 
-`<APP>/indexing` → **Full dataset indexing — 16 containers** →
-**START FULL INDEXING — 16 CONTAINERS**.
+`<APP>/indexing` → **Full dataset indexing — 64 containers** →
+**START FULL INDEXING — 64 CONTAINERS**.
 
 The card renders only after an authorised `/api/cloud/jobs` read succeeds, so an
 identity the admin allowlist rejects never sees the button. One confirmation dialog
-lists both source objects (10.22 GB + 54.04 GB ≈ 64.26 GB), 16 × standard-2, the 256
+lists both source objects (10.22 GB + 54.04 GB ≈ 64.26 GB), 64 × standard-4, the 256
 partition merge tasks, the $50 objective and the automatic budget pause. Confirming
 runs, in order and with no further approvals:
 
 1. `POST /api/cloud/jobs/<version>/control` `{"action":"approve"}` — the full-run gate;
-2. `POST /api/cloud/swarm/plan` `{version, partitions:256, blockMb:64, rangeBlocks:2, workers:16}`;
-3. `POST /api/cloud/swarm/launch` `{"workers":16}`;
+2. `POST /api/cloud/swarm/plan` `{version, partitions:256, blockMb:64, rangeBlocks:2, workers:64}`;
+3. `POST /api/cloud/swarm/launch` `{"workers":64}`;
 4. `GET /api/cloud/swarm/status`, then polled every 5 s while the panel is open.
 
 Duplicate protection: a non-terminal run for another version is refused; the same
@@ -195,10 +197,10 @@ curl -X POST "$APP/api/cloud/jobs/prod-real-2026-10-22/control" \
 # 2. Create the plan: HEADs both sources, refuses an existing/validated version
 curl -X POST "$APP/api/cloud/swarm/plan" \
   -H 'content-type: application/json' \
-  -d '{"version":"prod-real-2026-10-22","partitions":256,"workers":16}'
+  -d '{"version":"prod-real-2026-10-22","partitions":256,"workers":64}'
 
-# 3. Start 16 workers (each claims work and then advances itself)
-curl -X POST "$APP/api/cloud/swarm/launch" -H 'content-type: application/json' -d '{"workers":16}'
+# 3. Start 64 workers (each claims work and then advances itself)
+curl -X POST "$APP/api/cloud/swarm/launch" -H 'content-type: application/json' -d '{"workers":64}'
 
 # 4. Follow it
 curl "$APP/api/cloud/swarm/status"
@@ -209,7 +211,7 @@ curl -X POST "$APP/api/cloud/swarm/stop"        # the same stop, without resumin
 curl -X POST "$APP/api/cloud/swarm/stop" \
   -H 'content-type: application/json' -d '{"workers":["indexer-worker-07"]}'
 curl -X POST "$APP/api/cloud/swarm/scale" \
-  -H 'content-type: application/json' -d '{"workers":4}'   # stops 04…15, keeps the run
+  -H 'content-type: application/json' -d '{"workers":4}'   # stops 04…127, keeps the run
 curl -X POST "$APP/api/cloud/swarm/resume" \
   -H 'content-type: application/json' -d '{"workers":4}'   # resume the SAME version with four
 curl "$APP/api/cloud/swarm/ranges?state=leased"           # ids, byte spans, attempts, leases
@@ -262,13 +264,13 @@ exactly what `docs/verification.md` forbids.
 | --- | --- |
 | `tests/swarm-plan.test.ts` | cuts land only after a newline (byte-compared, so non-ASCII is handled), ranges are disjoint and exhaustive, and the swarm's per-partition spool is **byte-identical** to Cloud Pass 1's |
 | `tests/swarm-coordinator.test.ts` | one worker per task, expired leases reclaimed, aggregate Pass 1 objects writable and verifiable, idempotent completion, $45/$50 budget gates |
-| `tests/swarm-worker.test.ts` | 16 distinct identities, real CLI arguments (`--base-line`, `--partitions`, offsets) sent to the container, result read back from R2, container destroyed on completion |
+| `tests/swarm-worker.test.ts` | 128 distinct identities (00…15 unchanged), real CLI arguments (`--base-line`, `--partitions`, offsets) sent to the container, result read back from R2, container destroyed on completion |
 | `tests/swarm-pause-drain.test.ts` | pause releases leases without failing/parking, a lease with no worker record is still recovered, `maxAttempts` parks, a worker above the active count is retired, a mismatched coverage is refused, the audit reports sizes/attempts, and the worker releases-then-destroys (never restarts under a pause) |
-| `tests/swarm-scale.test.ts` | the routes: pause is ordered and reports all 16 answers, launch/resume/scale stop every id above the selected count, a named worker can be stopped, and nothing aborts or re-plans |
+| `tests/swarm-scale.test.ts` | the routes: pause is ordered and reports every worker's answer, launch/resume/scale stop every id above the selected count, a named worker can be stopped, and nothing aborts or re-plans |
 | `tests/swarm-range-memory.test.ts` | a 1 KiB parse window produces byte-identical spool to one window and to Pass 1, temp spools are cleaned up, a short range writes no manifest, and a pathological record is refused with its offset |
-| `tests/cloud-admin-deploy.test.ts`, `tests/worker-entry-routing.test.ts` | production config: `IndexerWorker`, `standard-2`, `max_instances = 16`, both migrations, Access untouched; staging stays at one instance |
+| `tests/cloud-admin-deploy.test.ts`, `tests/worker-entry-routing.test.ts` | production config: `IndexerWorker`, `standard-4`, `max_instances = 64`, both migrations, Access untouched; staging stays at one instance |
 | `tests/staging-config.test.ts`, `tests/staging-isolation.test.ts` | staging isolation unchanged |
 
 Not covered by tests, and therefore unproven until a real deployment: cold-start timing of
-16 containers at once, actual container-to-R2 throughput, and the real wall-clock
+64 containers at once, actual container-to-R2 throughput, and the real wall-clock
 throughput of the merge.
