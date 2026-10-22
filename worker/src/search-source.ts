@@ -315,14 +315,26 @@ export class R2CandidateSource implements CandidateSource {
       for (const ref of read) asked.add(partitionOfRef(ref));
       this.partitionRequests += asked.size;
       const companies = await this.store.getCompaniesByRefs(this.datasetVersion, read, maxPartitions);
+      /*
+       * Cache EVERY company the store returned, not just the ones this pass asked
+       * for. A partition object is read whole, so the rest of its companies are
+       * already in hand; caching them is what makes `hydratedPartitions` an honest
+       * statement.
+       *
+       * Marking a partition "hydrated" while caching only the requested refs is the
+       * defect this fixes: a later pass (the weak token/trigram tier, or a deferred
+       * fuzzy sweep) skipped every ref in that partition as "already read", so those
+       * candidates were silently omitted. Memory stays bounded — maxPartitions ×
+       * companiesPerPartition — and no extra request is made.
+       */
+      for (const [ref, company] of companies) {
+        this.byId.set(company.id, company);
+        this.hydratedDocs.set(ref, toSearchDoc(company));
+      }
       for (const partition of fresh) this.hydratedPartitions.add(partition);
       for (const ref of read) {
-        const company = companies.get(ref) as Company | undefined;
-        if (!company) continue;
-        this.byId.set(company.id, company);
-        const doc = toSearchDoc(company);
-        this.hydratedDocs.set(ref, doc);
-        found.set(ref, doc);
+        const doc = this.hydratedDocs.get(ref);
+        if (doc) found.set(ref, doc);
       }
     }
 

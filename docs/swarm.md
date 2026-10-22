@@ -141,6 +141,34 @@ outside it.
 All routes are under `/api/cloud` and verified by Cloudflare Access plus the admin
 allowlist. `plan` also requires `control.approvedFullRun`.
 
+### From the panel (one confirmation)
+
+`<APP>/indexing` → **Full dataset indexing — 16 containers** →
+**START FULL INDEXING — 16 CONTAINERS**.
+
+The card renders only after an authorised `/api/cloud/jobs` read succeeds, so an
+identity the admin allowlist rejects never sees the button. One confirmation dialog
+lists both source objects (10.22 GB + 54.04 GB ≈ 64.26 GB), 16 × standard-2, the 256
+partition merge tasks, the $50 objective and the automatic budget pause. Confirming
+runs, in order and with no further approvals:
+
+1. `POST /api/cloud/jobs/<version>/control` `{"action":"approve"}` — the full-run gate;
+2. `POST /api/cloud/swarm/plan` `{version, partitions:256, blockMb:64, rangeBlocks:2, workers:16}`;
+3. `POST /api/cloud/swarm/launch` `{"workers":16}`;
+4. `GET /api/cloud/swarm/status`, then polled every 5 s while the panel is open.
+
+Duplicate protection: a non-terminal run for another version is refused; the same
+version is resumed from its durable plan instead of re-planned; a completed version is
+never re-planned (the coordinator is per version). The live card shows job version,
+stage, active containers, source coverage, rows, parsed and searchable rows/second,
+partition and shard progress, ETA, accrued estimate, remaining budget, errors/parked
+tasks, and working Pause / Resume / Stop.
+
+Execution does not depend on the browser: the coordinator and each worker advance on
+Durable Object alarms, so the tab can be closed after the confirmation.
+
+The same sequence from a terminal, for scripted use:
+
 ```bash
 # 1. Approve the run (records the approval the full-corpus gate checks)
 curl -X POST "$APP/api/cloud/jobs/prod-real-2026-10-22/control" \

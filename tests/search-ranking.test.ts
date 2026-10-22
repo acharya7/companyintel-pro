@@ -238,6 +238,27 @@ describe("budgets, truncation and completeness", () => {
     return companies;
   }
 
+  /**
+   * The same 900 rows, but the query matches one company in every eight.
+   *
+   * A budget test needs a page the budget can actually leave short, and hydration
+   * reads a profile partition WHOLE (250 companies, `SHARDING.companiesPerPartition`).
+   * With every company matching, a single partition always fills the 100-row maximum
+   * page, so the budget would never be the reason the page is short. Dispersing the
+   * matches (~30 per partition, ~115 in total) keeps the budget — not the stored
+   * data — the limiting factor, which is what these two tests are about.
+   */
+  function dispersed(): Company[] {
+    const companies: Company[] = [];
+    for (let i = 0; i < 900; i += 1) {
+      companies.push(makeCompany(i, i % 8 === 0 ? `Alpha Industries ${i}` : `Beta Trading ${i}`, i % 5));
+    }
+    // One exact name, so the notice under test is the budget notice and not the
+    // "showing partial matches" message an exact-name-less query produces.
+    companies[0] = makeCompany(0, "Alpha Industries", 300);
+    return companies;
+  }
+
   test("the CPU budget truncates the weakest evidence, keeps the strongest, and reports the count", async () => {
     const { bucket, directory, dir } = buildIndex(crowded());
     try {
@@ -262,7 +283,7 @@ describe("budgets, truncation and completeness", () => {
   });
 
   test("a partition budget that cuts the answer short is reported, not hidden", async () => {
-    const { bucket, directory, dir } = buildIndex(crowded());
+    const { bucket, directory, dir } = buildIndex(dispersed());
     try {
       const source = new R2CandidateSource(new R2Store(bucket), directory);
       const response = await searchCompanies(source, "alpha industries", {
@@ -281,7 +302,7 @@ describe("budgets, truncation and completeness", () => {
   });
 
   test("the adaptive ladder reaches further than a single retry, and stops when the page fills", async () => {
-    const { bucket, directory, dir } = buildIndex(crowded());
+    const { bucket, directory, dir } = buildIndex(dispersed());
     try {
       const oneStep = await searchCompanies(new R2CandidateSource(new R2Store(bucket), directory), "alpha industries", {
         pageSize: 100,

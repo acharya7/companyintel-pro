@@ -6,9 +6,13 @@
  * control is the same `control.json` flag the engine checks between chunks. The
  * handlers only translate HTTP to the CLI; no indexing logic is duplicated.
  *
- * A full run cannot be started from the panel. `run` requires an explicit
- * `maxSourceMb`, so the browser can launch a bounded benchmark but never the
- * 64 GB job, which needs operator approval recorded in `control.json`.
+ * This bridge cannot start a full run: `run` requires an explicit `maxSourceMb`, so
+ * the browser can launch a bounded benchmark but never the 64 GB job, which needs
+ * operator approval recorded in `control.json`. The deployed Worker does expose the
+ * one-click full-corpus launch (`/api/cloud/swarm/*` + the approval route), but that
+ * runs on Durable Objects and Containers, which a Vite dev server has no binding
+ * for — `/api/cloud/swarm/*` therefore answers 503 here with that reason instead of
+ * a bare 404 that would look like a missing route.
  */
 
 import { spawn, spawnSync } from "node:child_process";
@@ -286,6 +290,17 @@ export async function handleCloudAdmin(request, response, root = process.cwd()) 
       json(response, output.status === 0 ? 200 : 422, {
         ok: output.status === 0,
         output: `${output.stdout ?? ""}${output.stderr ?? ""}`.trim().split("\n").slice(-25).join("\n"),
+      });
+      return true;
+    }
+
+    if (parts[0] === "swarm") {
+      json(response, 503, {
+        error: {
+          code: "swarm_requires_deployment",
+          message:
+            "The 16-container swarm needs the deployed Worker: its Durable Object coordinator and Container bindings do not exist in the local dev server. Open /indexing on the deployed Worker to start it.",
+        },
       });
       return true;
     }

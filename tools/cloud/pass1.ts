@@ -529,7 +529,6 @@ async function recordFailure(store: BlobStore, version: string, now: () => numbe
   } catch (secondary) {
     // Recording the failure must not mask the failure itself.
     if (secondary instanceof Error) {
-      // eslint-disable-next-line no-console
       console.error(`could not record the failure in ${cloudKeys.state(version)}: ${secondary.message}`);
     }
   }

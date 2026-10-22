@@ -5,9 +5,14 @@
  * to R2 (`cloud/jobs/<version>/state.json`), and every control writes the same
  * `control.json` flag the engine checks between chunks. Nothing here is mocked.
  *
- * The panel can start a BOUNDED benchmark. It cannot start the full corpus: that
- * requires the measured forecast to be approved and is deliberately not reachable
- * from a browser control.
+ * Two kinds of run live here:
+ *   - a BOUNDED benchmark, started and driven through this page's own controls;
+ *   - the full corpus, started by ONE administrator confirmation in `SwarmLaunch`,
+ *     which approves the run, plans 256 partitions and pumps all 16 containers
+ *     through the existing production endpoints. From there the durable coordinator
+ *     owns execution, so the browser may be closed.
+ *
+ * Neither path bypasses Access, the admin allowlist or the budget gates.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -17,6 +22,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { EmptyState, PageHeader, Section, StatCard, StatusPill } from "@/components/common";
+import { SwarmLaunch } from "@/components/swarm-launch";
 import type { CloudControl, CloudJobState, CloudRunStatus } from "@/shared/cloud/types";
 
 /** Mirrors `JobListing` in `worker/src/indexer-admin.ts`. */
@@ -31,6 +37,17 @@ const WARNING_LABEL: Record<JobWarning["kind"], string> = {
   stale: "Run is not advancing",
 };
 
+/** A control-plane failure keeps its HTTP status: 401/403 means "not an administrator". */
+class AdminError extends Error {
+  status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "AdminError";
+    this.status = status;
+  }
+}
+
 async function admin<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
@@ -41,7 +58,7 @@ async function admin<T>(path: string, init?: RequestInit): Promise<T> {
     },
   });
   const body = (await response.json()) as T & { error?: { message?: string } };
-  if (!response.ok) throw new Error(body?.error?.message ?? `Request failed (${response.status})`);
+  if (!response.ok) throw new AdminError(body?.error?.message ?? `Request failed (${response.status})`, response.status);
   return body;
 }
 
@@ -77,6 +94,8 @@ export default function IndexingControl() {
   const [notice, setNotice] = useState<string | null>(null);
   const [verifyOutput, setVerifyOutput] = useState<string | null>(null);
   const [staging, setStaging] = useState(false);
+  /** True only after the Access-protected `/api/cloud/jobs` read succeeded. */
+  const [authorized, setAuthorized] = useState(false);
   // `null` until the first successful read, so the panel does not warn about a
   // missing container before it knows.
   const [containerBound, setContainerBound] = useState<boolean | null>(null);
@@ -93,6 +112,7 @@ export default function IndexingControl() {
       setSelected((current) => current ?? data.jobs[0]?.state.version ?? null);
       setStaging(Boolean(data.staging));
       setContainerBound(Boolean(data.containerBound));
+      setAuthorized(true);
       // A staging deployment only accepts `stg-` version ids; default the benchmark
       // field to one so the first attempt is not a 400.
       if (data.staging && !stagingPrefixApplied.current) {
@@ -101,6 +121,9 @@ export default function IndexingControl() {
       }
       setError(null);
     } catch (caught) {
+      // A 401/403 is an authorisation answer, not a transport failure: hide the
+      // launch control instead of offering a button that can never succeed.
+      if (caught instanceof AdminError && (caught.status === 401 || caught.status === 403)) setAuthorized(false);
       setError(caught instanceof Error ? caught.message : String(caught));
     }
   }, []);
@@ -326,6 +349,13 @@ export default function IndexingControl() {
           <span>{notice}</span>
         </div>
       ) : null}
+
+      {/*
+       * The one-click full-corpus launch. It sits outside the job listing because a
+       * swarm run is coordinated by its own durable object, not by `cloud/jobs`
+       * state — so it must be reachable on a deployment that has never run a job.
+       */}
+      <SwarmLaunch authorized={authorized} staging={staging} />
 
       {jobs.length === 0 ? (
         <EmptyState

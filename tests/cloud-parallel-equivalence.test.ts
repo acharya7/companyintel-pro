@@ -339,24 +339,32 @@ describe("parallel partition merges + shard assembly", () => {
     }
   });
 
-  test("the real read path returns the same search results for both indexes", async () => {
+  test("the real read path returns the same results for dense and sparse company objects", async () => {
     const bucket = new FakeR2Bucket();
     loadVersion(bucket, store, REFERENCE);
     loadVersion(bucket, store, SPLIT);
     /*
-     * Whole-name queries, i.e. the exact/prefix tier. Those candidates are hydrated
-     * through the exact index regardless of ref layout, so the result sets must be
-     * identical.
+     * Whole-name queries (exact/prefix tier) AND weak queries (token/trigram only),
+     * compared in full.
      *
-     * Weak (token/trigram only) queries are deliberately not compared: the reader
-     * hydrates per company object and marks a WHOLE object read, so on a 73-record
-     * fixture (where the sequential build keeps every company in one object while the
-     * parallel build spreads them over aligned ref slices) the two layouts expose a
-     * different number of weak candidates to the scorer. That is a property of the
-     * fixture's object density, not of the index contents — and the shard comparison
-     * above proves the contents (terms and postings) are identical.
+     * The weak queries are the regression for the hydration-completeness defect: the
+     * sequential build packs 73 companies into ONE dense object, while the parallel
+     * build spreads them over eight sparse, aligned objects. Before the fix, a
+     * partition read for a strong candidate was marked completely hydrated while only
+     * the requested refs had been cached, so the weak tier silently lost candidates —
+     * and the two layouts disagreed. Both densities must now return identical hits.
      */
-    const queries = ["Company 7 Ltd", "Company 13 Ltd", "Company 0 Ltd", "Acme Ltd", "Nowhere Holdings 3", "zzzzzzqqqqq"];
+    const queries = [
+      "Company 7 Ltd",
+      "Company 13 Ltd",
+      "Company 0 Ltd",
+      "Acme Ltd",
+      "Nowhere Holdings 3",
+      "Company 7",
+      "company 3",
+      "Person 1",
+      "zzzzzzqqqqq",
+    ];
     for (const query of queries) {
       const expected = await searchVersion(bucket, REFERENCE, query);
       const actual = await searchVersion(bucket, SPLIT, query);
@@ -369,19 +377,13 @@ describe("parallel partition merges + shard assembly", () => {
         trigram: expected.retrieval.trigram,
       });
       expect(actual.retrieval.candidates).toBe(expected.retrieval.candidates);
-      // The whole-name hits (what the user's query actually names) are identical, in
-      // the same order, with the same ids and contact counts.
-      const wholeName = (hits: { matchCategory: string }[]) => hits.filter((hit) => hit.matchCategory === "exact" || hit.matchCategory === "alias");
-      expect(wholeName(actual.hits).map((hit) => `${hit.name}:${hit.id}:${hit.contactCount}`)).toEqual(
-        wholeName(expected.hits).map((hit) => `${hit.name}:${hit.id}:${hit.contactCount}`),
+      // Every hit, in order, with the same id and contact count — whole-name and weak
+      // matches alike. This is the assertion that failed before the hydration fix.
+      expect(actual.hits.map((hit) => `${hit.name}:${hit.id}:${hit.contactCount}:${hit.matchCategory}`)).toEqual(
+        expected.hits.map((hit) => `${hit.name}:${hit.id}:${hit.contactCount}:${hit.matchCategory}`),
       );
-      // No result the sequential index found is missing from the parallel one.
-      const actualIds = new Set(actual.hits.map((hit) => hit.id));
-      expect(expected.hits.map((hit) => hit.id).filter((id) => !actualIds.has(id))).toEqual([]);
-      if (query === "zzzzzzqqqqq") {
-        expect(actual.page.total).toBe(0);
-        expect(expected.page.total).toBe(0);
-      }
+      expect(actual.page.total).toBe(expected.page.total);
+      if (query === "zzzzzzqqqqq") expect(actual.page.total).toBe(0);
     }
   });
 

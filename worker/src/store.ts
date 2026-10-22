@@ -337,6 +337,20 @@ export class R2Store {
    * of them. Refs whose partition falls outside `maxParts` are simply absent
    * from the result map — the caller treats that as "not hydrated", never as an
    * error.
+   *
+   * COMPLETENESS CONTRACT
+   * ---------------------
+   * The result contains **every company in every partition this call read**, not
+   * only the refs that were asked for. A partition object is fetched whole, so the
+   * extra entries are free — and they are what lets a caller truthfully record "this
+   * partition was hydrated completely".
+   *
+   * Returning only the requested refs caused a real search defect: the caller marked
+   * the whole partition as read, then skipped every other ref in it as "already read,
+   * not in the object", so a query whose token/trigram candidates shared an object
+   * with an exact match could silently lose them. The condition is not fixture-only:
+   * any result set that retrieves a few refs from an object and later retrieves more
+   * from the same object hits it.
    */
   async getCompaniesByRefs(version: string, refs: number[], maxParts: number = SHARDING.maxHydrate): Promise<Map<number, Company>> {
     const grouped = new Map<number, number[]>();
@@ -352,12 +366,12 @@ export class R2Store {
       ordered.push(entry);
     }
     const out = new Map<number, Company>();
-    await mapLimit(ordered, 8, async ([partition, partitionRefs]) => {
+    await mapLimit(ordered, 8, async ([partition]) => {
       const payload = await this.getJson<CompanyPartitionPayload>(companyPartitionKey(version, partition));
       if (!payload) return;
-      for (const ref of partitionRefs) {
-        const company = payload.companies[ref - payload.firstRef] as Company | undefined;
-        if (company) out.set(ref, company);
+      for (let index = 0; index < payload.companies.length; index += 1) {
+        const company = payload.companies[index] as Company | undefined;
+        if (company) out.set(payload.firstRef + index, company);
       }
     });
     return out;
