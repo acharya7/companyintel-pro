@@ -65,10 +65,9 @@ import { planRefBases, type RefAllocation } from "../../src/shared/cloud/ref-spa
 
 export interface CoordinatorEnv {
   COMPANY_DATA: R2Bucket;
-  /** Forwarded to every container this coordinator's workers start. */
-  R2_ACCOUNT_ID?: string;
-  R2_ACCESS_KEY_ID?: string;
-  R2_SECRET_ACCESS_KEY?: string;
+  // Container credentials are forwarded by the worker bridge
+  // (`indexer-worker.ts`), never read here: this Durable Object plans and
+  // accounts for tasks, and does not start containers itself.
   /**
    * The authorised spend ceiling for this run (USD). The deployment sets it, so the
    * warn/soft/hard gates scale with it instead of being compiled in at $40/$45/$50.
@@ -185,14 +184,10 @@ export class IndexingCoordinator implements DurableObject {
         case "POST /retry-parked":
           return json(await this.retryParked(await readBody(request)));
         case "GET /diagnostics":
-          // Presence only — never a value. A container that reports "credentials must be
-          // set together" needs the operator to know WHICH binding is missing.
+          // Non-secret deployment settings only. The container-only R2 secret
+          // names are read exclusively by the two container bridges that forward
+          // them; this Durable Object never touches them.
           return json({
-            r2AccountId: Boolean(this.env.R2_ACCOUNT_ID),
-            r2AccessKeyId: Boolean(this.env.R2_ACCESS_KEY_ID),
-            r2SecretAccessKey: Boolean(this.env.R2_SECRET_ACCESS_KEY),
-            r2AccessKeyIdLength: this.env.R2_ACCESS_KEY_ID?.length ?? 0,
-            r2SecretAccessKeyLength: this.env.R2_SECRET_ACCESS_KEY?.length ?? 0,
             budgetUsd: this.env.CLOUD_JOB_BUDGET_USD ?? null,
           });
         case "GET /status":

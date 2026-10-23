@@ -30,6 +30,7 @@ import { z } from "zod";
 import type { AccessIdentity, Env } from "./env";
 import type { EnvWithContainer } from "./indexer-container";
 import { R2Store } from "./store";
+import { cloudKeys, type CloudJobState } from "../../src/shared/cloud/types";
 import { normalizeQuery } from "../../src/shared/normalize";
 import { stableHash } from "../../src/shared/hash";
 import {
@@ -39,6 +40,8 @@ import {
   realDataKeys,
   type RealDataCoverage,
   type RealDataCoverageResponse,
+  type RealDataCoverageStatus,
+  type RealDataSourceCoverage,
   type RealDataScanCacheEntry,
   type RealDataScanKind,
   type RealDataScanResponse,
@@ -104,6 +107,67 @@ async function readJson<T>(store: R2Store, key: string): Promise<T | null> {
 
 /* ------------------------------- coverage -------------------------------- */
 
+/**
+ * Coverage derived from the completed job's own checkpoints.
+ *
+ * The coverage object is written before activation and older generations wrote
+ * one for a bounded sample, so it can never be the primary evidence for a
+ * different version. The cloud job state is: it records, per source, the byte
+ * size, the offset the reader stopped at, whether the source was completed, and
+ * the rows each source contributed. `complete` therefore means "every intended
+ * source byte was read", not "no row was rejected" — a normalized-away row is
+ * accounted for separately and is not a gap in coverage.
+ *
+ * When neither the job state nor a version-matched coverage object exists, the
+ * answer is `unknown` rather than a silent `partial`.
+ */
+function coverageFromJobState(state: CloudJobState, version: string, completedAt: string | null): RealDataCoverage | null {
+  if (state.version !== version || !Array.isArray(state.sources) || state.sources.length === 0) return null;
+  const sources: RealDataSourceCoverage[] = state.sources.map((source) => {
+    const size = typeof source.size === "number" && source.size > 0 ? source.size : source.sourceBytes;
+    const covered = Math.min(source.sourceBytes ?? 0, size);
+    return {
+      id: source.id,
+      key: source.key,
+      sizeBytes: size,
+      bytesCovered: covered,
+      recordsRead: source.rows,
+      coveragePercent: size > 0 ? Math.min(100, (covered / size) * 100) : 0,
+      method: "cloud-pass1-checkpoint",
+    };
+  });
+  const total = sources.reduce((sum, source) => sum + source.sizeBytes, 0);
+  const coveredBytes = sources.reduce((sum, source) => sum + source.bytesCovered, 0);
+  const finished = state.stage === "complete" && state.mode === "full" && state.coverage === "full";
+  const allSourcesComplete = state.sources.every(
+    (source) =>
+      source.complete === true &&
+      typeof source.size === "number" &&
+      source.size > 0 &&
+      source.nextOffset >= source.size,
+  );
+  const complete = Boolean(finished && allSourcesComplete && total > 0 && coveredBytes >= total);
+  const status: RealDataCoverageStatus = complete ? "complete" : "partial";
+  return {
+    format: 2,
+    version,
+    label: complete ? "REAL DATA — COMPLETE COVERAGE" : "REAL DATA — PARTIAL COVERAGE",
+    partial: !complete,
+    coverageStatus: status,
+    dataOrigin: "index",
+    generatedAt: state.updatedAt ?? completedAt ?? new Date().toISOString(),
+    sources,
+    totals: {
+      sourceBytesCovered: coveredBytes,
+      sourceBytesTotal: total,
+      coveragePercent: total > 0 ? Math.min(100, (coveredBytes / total) * 100) : 0,
+    },
+    lastRefreshAt: completedAt ?? state.finishedAt ?? state.updatedAt,
+    note:
+      "Derived from the completed indexing job's per-source checkpoints: every source byte was read and the version was built and validated from all of it.",
+  };
+}
+
 realdataRoutes.get("/api/realdata/coverage", async (c) => {
   const store = c.get("store");
   const checkedAt = new Date().toISOString();
@@ -116,6 +180,7 @@ realdataRoutes.get("/api/realdata/coverage", async (c) => {
       dataOrigin: "none",
       label: "NO REAL DATA ACTIVE",
       partial: true,
+      coverageStatus: "unknown",
       companies: 0,
       contacts: 0,
       coverage: null,
@@ -127,37 +192,80 @@ realdataRoutes.get("/api/realdata/coverage", async (c) => {
     };
     return c.json(response);
   }
-  const [manifest, coverage] = await Promise.all([
+  const [manifest, stored, jobState] = await Promise.all([
     store.getManifest(pointer.version),
     readJson<RealDataCoverage>(store, realDataKeys.coverage(pointer.version)),
+    readJson<CloudJobState>(store, cloudKeys.state(pointer.version)),
   ]);
-  const companies = manifest?.counters?.uniqueCompanies ?? 0;
-  const contacts = manifest?.counters?.uniqueContacts ?? 0;
-  const partial = coverage?.partial ?? true;
-  const label = coverage?.label ?? (partial ? "REAL DATA — PARTIAL COVERAGE" : "REAL DATA — COMPLETE COVERAGE");
+  const companies = manifest?.counters?.uniqueCompanies ?? stored?.companies ?? 0;
+  const contacts = manifest?.counters?.uniqueContacts ?? stored?.contacts ?? 0;
+
+  // Authoritative evidence first: the completed job's checkpoints. A stored
+  // coverage object is only a fallback when it describes this exact version.
+  const derived = jobState ? coverageFromJobState(jobState, pointer.version, manifest?.completedAt ?? null) : null;
+  const fallback = stored && stored.version === pointer.version ? stored : null;
+  const coverageStatus: RealDataCoverageStatus =
+    derived?.coverageStatus ?? fallback?.coverageStatus ?? (fallback ? (fallback.partial ? "partial" : "complete") : "unknown");
+  const base = derived ?? fallback;
+  const partial = coverageStatus !== "complete";
+  const label =
+    coverageStatus === "complete"
+      ? "REAL DATA — COMPLETE COVERAGE"
+      : coverageStatus === "partial"
+        ? "REAL DATA — PARTIAL COVERAGE"
+        : "REAL DATA — COVERAGE UNKNOWN";
+  const coverage: RealDataCoverage = {
+    format: base?.format ?? 2,
+    version: pointer.version,
+    label,
+    partial,
+    coverageStatus,
+    dataOrigin: base?.dataOrigin === "sample" ? "index" : (base?.dataOrigin ?? "index"),
+    generatedAt: base?.generatedAt ?? new Date().toISOString(),
+    sources: base?.sources ?? [],
+    totals: base?.totals ?? { sourceBytesCovered: 0, sourceBytesTotal: 0, coveragePercent: 0 },
+    companies,
+    contacts,
+    lastRefreshAt: manifest?.completedAt ?? base?.lastRefreshAt ?? base?.generatedAt,
+    note:
+      base?.note ??
+      "No per-source checkpoint was found for this version, so total source coverage cannot be proven. Search and record counts are still read from the active validated index.",
+  };
+  // Pass 1 is where rows are rejected; Pass 2's manifest counts what it indexed,
+  // so its `rowsRejected` is 0 even when source rows were dropped. Prefer the job
+  // accounting so the UI can distinguish "read and normalized away" from "never
+  // read".
+  const rejected = jobState?.totals?.rowsRejected ?? manifest?.counters?.rowsRejected;
   const response: RealDataCoverageResponse = {
     version: pointer.version,
     dataOrigin: "r2",
     label,
     partial,
+    coverageStatus,
+    ...(typeof rejected === "number" ? { rowsRejected: rejected } : {}),
     companies,
     contacts,
-    coverage: coverage
-      ? {
-          ...coverage,
-          companies,
-          contacts,
-          lastRefreshAt: manifest?.completedAt ?? coverage.generatedAt,
-        }
-      : null,
+    coverage,
     scanBudgetMb: budget,
     scanAvailable,
     directScan: scanAvailable,
     checkedAt,
-    message: partial
-      ? `Search is answering from ${companies.toLocaleString()} companies and ${contacts.toLocaleString()} contacts read from the original R2 files. The rest of the 64 GB corpus has not been indexed yet; a bounded source scan can look for a specific record outside this coverage.`
-      : `Search is answering from the complete indexed corpus (${companies.toLocaleString()} companies, ${contacts.toLocaleString()} contacts).`,
+    message:
+      coverageStatus === "complete"
+        ? `Search is answering from the complete indexed corpus: every source byte was processed (${companies.toLocaleString()} companies, ${contacts.toLocaleString()} contacts).` +
+          (typeof rejected === "number" && rejected > 0
+            ? ` ${rejected.toLocaleString()} source rows were rejected during normalization and are not part of the searchable corpus.`
+            : "")
+        : coverageStatus === "partial"
+          ? `Search is answering from ${companies.toLocaleString()} companies and ${contacts.toLocaleString()} contacts read from the original R2 files. Only a measured prefix of the source corpus has been indexed; a bounded source scan can look for a specific record outside this coverage.`
+          : `Search is answering from ${companies.toLocaleString()} companies and ${contacts.toLocaleString()} contacts in the active validated index. No completed-job coverage record could be read for this version, so complete source coverage is not claimed.`,
   };
+  // Regenerate the small coverage object from the authoritative checkpoints, so
+  // every other reader (and the next request) sees the corrected status. A write
+  // failure must not turn a successful read into an error.
+  if (derived) {
+    await store.putJson(realDataKeys.coverage(pointer.version), { ...coverage, lastRefreshAt: undefined }).catch(() => null);
+  }
   return c.json(response);
 });
 

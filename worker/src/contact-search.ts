@@ -26,7 +26,6 @@
 import type { Company, Contact, UnassignedContact } from "../../src/shared/models";
 import {
   SHARDING,
-  contactPostingsFor,
   contactShardCounts,
   type ContactShardKind,
   type IndexDirectory,
@@ -55,7 +54,7 @@ const STAGE_WEIGHT: Record<ContactShardKind, number> = {
 /** Candidate contacts handed to the scorer for one search. */
 const MAX_SCORED = 300;
 /** Contact objects hydrated for one search (one read per company partition). */
-const MAX_HYDRATE_CONTACTS = 60;
+const MAX_HYDRATE_CONTACTS = 40;
 /** Distinct contact partitions a single search may read. */
 const MAX_CONTACT_PARTS = 12;
 
@@ -102,13 +101,18 @@ function termsFor(kind: ContactShardKind, normalized: string): string[] {
   const tokens = normalized.split(" ").filter(Boolean);
   if (kind === "contactToken") return [...new Set(tokens)];
   if (kind === "contactPrefix") {
+    /*
+     * Only the longest prefixes are looked up. Enumerating every shorter prefix
+     * ("p", "pr", "pri", …) used to mean ~20 shard reads for a two-word name,
+     * and at 86 M contacts each contact-prefix shard is ~48 MB compressed. Every
+     * name matched by a shorter prefix of the query is still retrieved by the
+     * longest prefix or by the token index, and scoring decides the page, so the
+     * shorter lookups bought no extra recall — only tens of megabytes of transfer
+     * and decompression per search.
+     */
     const prefixes = new Set<string>();
-    const maxName = Math.min(SHARDING.maxPrefixLength, normalized.length);
-    for (let i = 1; i <= maxName; i += 1) prefixes.add(normalized.slice(0, i));
-    for (const token of tokens) {
-      const max = Math.min(SHARDING.maxPrefixLength, token.length);
-      for (let i = 1; i <= max; i += 1) prefixes.add(token.slice(0, i));
-    }
+    if (normalized) prefixes.add(normalized.slice(0, SHARDING.maxPrefixLength));
+    for (const token of tokens) prefixes.add(token.slice(0, SHARDING.maxPrefixLength));
     return [...prefixes];
   }
   return trigramsOf(normalized);
@@ -144,16 +148,27 @@ async function retrieve(
   }
 
   const hits = new Map<string, { matches: number; quality: number }>();
-  await mapLimit([...byShard.entries()], 8, async ([shard, shardTerms]) => {
-    const payload = await store.getContactShard(version, kind, shard);
-    if (!payload) return;
+  // Two decompressors at a time: a contact shard can expand to hundreds of
+  // megabytes, and the isolate budget must hold every concurrently open stream.
+  await mapLimit([...byShard.entries()], 2, async ([shard, shardTerms]) => {
+    /*
+     * Stream the shard and keep only the requested terms' ids. `JSON.parse` on the
+     * whole object (the previous behaviour) needed the compressed object AND its
+     * full decompressed text AND the parsed postings at once; at 86 M contacts the
+     * largest contact-trigram shard is ~113 MB compressed and could not fit in a
+     * Worker isolate. The scanner bounds peak memory to the collected ids and
+     * cancels the R2 response as soon as every requested term is answered.
+     */
+    const scan = await store.streamContactShard(version, kind, shard, shardTerms, { idsPerTerm: 8000 });
+    if (!scan) return;
     for (const term of shardTerms) {
-      const postings = contactPostingsFor(payload, term);
+      const postings = scan.postings.get(term);
       if (!postings) continue;
       const ids = postings.ids;
       const quality = postings.q;
       for (let i = 0; i < ids.length; i += 1) {
         const id = ids[i];
+        if (!id) continue;
         const q = quality ? (quality[i] ?? 0) / 255 : 0.5;
         const entry = hits.get(id) ?? { matches: 0, quality: 0 };
         entry.matches += 1;
@@ -311,9 +326,17 @@ export async function searchContacts(
   }
 
   const scores = new Map<string, number>();
-  // Prefix first (strongest signal), then tokens, then trigrams for typo
-  // tolerance only if the strong stages produced little to rank.
-  await retrieve(store, directory.version, shardCounts, "contactPrefix", termsFor("contactPrefix", normalized), MAX_SCORED, scores);
+  /*
+   * Token index first: it holds every whole name word and its shards are a few
+   * megabytes, so an exact or multi-word query is answered in one bounded pass.
+   *
+   * The prefix index is deliberately NOT queried for contact names. Its shards are
+   * ~48 MB compressed each and a single prefix term can sit near the end of a
+   * ~490 M character object; scanning three of them per name was the dominant cost
+   * of a person search (~10 s) and gained no recall that the token and trigram
+   * stages do not already provide. Partial names and typos are handled by the
+   * trigram stage below, which stops as soon as it has enough candidates.
+   */
   await retrieve(store, directory.version, shardCounts, "contactToken", termsFor("contactToken", normalized), MAX_SCORED, scores);
   if (scores.size < Math.max(options.pageSize, 10)) {
     await retrieve(store, directory.version, shardCounts, "contactTrigram", termsFor("contactTrigram", normalized), MAX_SCORED, scores);

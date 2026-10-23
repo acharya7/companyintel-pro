@@ -66,20 +66,20 @@ export default function Dashboard() {
     <>
       <PageHeader
         eyebrow="Workspace"
-        title="Dashboard"
-        description="Dataset health, search activity and your saved pipeline in one place."
+        title="Overview"
+        description="Dataset readiness, search activity and your saved pipeline in one place. Every number is read from the active dataset; no trend is invented."
         actions={
           <>
             <Button variant="outline" className="gap-2" asChild>
-              <Link to="/companies">
-                <Search className="size-4" />
-                Company search
+              <Link to="/people">
+                <Users className="size-4" />
+                Find people
               </Link>
             </Button>
             <Button className="gap-2" asChild>
-              <Link to="/leads">
-                <Star className="size-4" />
-                Saved leads
+              <Link to="/companies">
+                <Search className="size-4" />
+                Find companies
               </Link>
             </Button>
           </>
@@ -87,6 +87,32 @@ export default function Dashboard() {
       />
 
       <RealDataCoverageNotice className="mb-4" />
+
+      {/* Shortcuts are deliberately plain links: the overview exists to start work,
+          not to add another dashboard to read. */}
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        {[
+          { to: "/companies", label: "Find companies", detail: "Search, filter and open profiles", icon: Building2 },
+          { to: "/people", label: "Find people", detail: "Search 86M+ indexed contacts", icon: Users },
+          { to: "/leads", label: "Saved leads", detail: "Your pipeline and notes", icon: Star },
+          { to: "/exports", label: "Export data", detail: "Download selected records as CSV", icon: FileDown },
+        ].map((action) => (
+          <Link
+            key={action.to}
+            to={action.to}
+            className="surface group flex items-center gap-3 p-4 transition-colors hover:border-primary/40 hover:bg-primary/[0.04]"
+          >
+            <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+              <action.icon className="size-4" />
+            </span>
+            <span className="min-w-0">
+              <span className="block text-sm font-medium">{action.label}</span>
+              <span className="block truncate text-[11px] text-muted-foreground">{action.detail}</span>
+            </span>
+            <ArrowRight className="ml-auto size-4 text-muted-foreground/60 transition-transform group-hover:translate-x-0.5 group-hover:text-primary" />
+          </Link>
+        ))}
+      </div>
 
       {!indexed ? (
         <div className="surface border-chart-3/40 bg-chart-3/[0.06] p-5">
@@ -156,7 +182,7 @@ export default function Dashboard() {
             sample
               ? "Synthetic preview dataset — never production data"
               : indexed
-                ? `${datasetMode.partial ? "PARTIAL COVERAGE" : "COMPLETE COVERAGE"} · ${datasetMode.version ?? status.data?.activeVersion ?? "unknown"}`
+                ? `${datasetMode.coverageStatus === "complete" ? "COMPLETE COVERAGE" : datasetMode.coverageStatus === "partial" ? "PARTIAL COVERAGE" : "COVERAGE UNKNOWN"} · ${datasetMode.version ?? status.data?.activeVersion ?? "unknown"}`
                 : "No validated version is published"
           }
           icon={<Database className="size-4" />}

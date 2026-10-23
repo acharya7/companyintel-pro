@@ -67,15 +67,20 @@ export function RealDataCoverageNotice({ className, compact = false }: { classNa
           <Database className="size-3" />
           REAL DATA
         </Badge>
-        {data.partial ? (
+        {data.coverageStatus === "complete" ? (
+          <Badge variant="outline" className="gap-1.5 border-emerald-600/40 text-emerald-700 dark:text-emerald-300">
+            <CheckCircle2 className="size-3" />
+            COMPLETE COVERAGE
+          </Badge>
+        ) : data.coverageStatus === "partial" ? (
           <Badge variant="outline" className="gap-1.5 border-amber-500/40 text-amber-700 dark:text-amber-400">
             <AlertTriangle className="size-3" />
             PARTIAL COVERAGE
           </Badge>
         ) : (
-          <Badge variant="outline" className="gap-1.5 border-emerald-600/40 text-emerald-700 dark:text-emerald-300">
-            <CheckCircle2 className="size-3" />
-            COMPLETE COVERAGE
+          <Badge variant="outline" className="gap-1.5 border-slate-400/40 text-slate-600 dark:text-slate-300">
+            <AlertTriangle className="size-3" />
+            COVERAGE UNKNOWN
           </Badge>
         )}
         <span className="text-xs text-muted-foreground">
@@ -107,12 +112,19 @@ export function RealDataCoverageNotice({ className, compact = false }: { classNa
             {source.key.replace("raw/", "")}: {formatBytes(source.bytesCovered)} · {formatNumber(source.recordsRead)} rows
           </span>
         ))}
-      </div>
-
-      {!compact ? (
-        <p className="text-[11px] leading-relaxed text-muted-foreground">
-          Every record above is an original R2 row — no synthetic data. The remaining source bytes have not been indexed; a bounded
-          source scan can look for a specific record outside this coverage, and the result always states what it searched.
+        {typeof data.rowsRejected === "number" && data.rowsRejected > 0 ? (
+          <span className="text-muted-foreground" title="Rows read from the source but dropped during normalization; they are not unindexed bytes.">
+            {formatNumber(data.rowsRejected)} rows rejected in normalization
+          </span>
+        ) : null}
+      </div>        {!compact ? (
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
+          Every record above is an original R2 row — no synthetic data.{" "}
+          {data.coverageStatus === "complete"
+            ? "Every intended source byte was processed by the completed indexing job; rows rejected during normalization are reported separately and are not a coverage gap."
+            : data.coverageStatus === "partial"
+              ? "Only a measured prefix of the source bytes has been indexed; a bounded source scan can look for a specific record outside this coverage, and the result always states what it searched."
+              : "No completed-job coverage record could be read for this version, so complete coverage is not claimed either way."}
         </p>
       ) : null}
     </div>
@@ -375,7 +387,7 @@ export function SourceScanPanel({
     }
   }
 
-  if (!coverage.data || !coverage.data.partial || !available) return null;
+  if (!coverage.data || coverage.data.coverageStatus === "complete" || !available) return null;
 
   const scanned = status?.totals.bytesScanned ?? 0;
   const budgetBytes = (status?.maxMbPerSource ?? budget) * 1024 * 1024;

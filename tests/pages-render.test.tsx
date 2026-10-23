@@ -198,7 +198,7 @@ describe("pages render without a missing API method", () => {
 
   test("Dashboard renders in no-dataset mode and says so", async () => {
     const html = await renderPage(<Dashboard />, { seed: { datasetStatus: noDataset } });
-    expect(html).toContain("Dashboard");
+    expect(html).toContain("Overview");
     expect(html).toContain("Dataset not indexed");
     // No fabricated figures: statistics have not been generated.
     expect(html).toContain("Statistics not generated yet");
@@ -207,7 +207,7 @@ describe("pages render without a missing API method", () => {
 
   test("Dashboard renders in demo mode and labels the sample dataset", async () => {
     const html = await renderPage(<Dashboard />, { seed: { datasetStatus: demoDataset } });
-    expect(html).toContain("Dashboard");
+    expect(html).toContain("Overview");
     expect(html).toContain("Sample");
     expect(html).not.toContain("is not a function");
   });
@@ -229,7 +229,7 @@ describe("pages render without a missing API method", () => {
 
   test("Dashboard shows a readable error, not a crash, when status fails", async () => {
     const html = await renderPage(<Dashboard />, { seed: { error: "Network unreachable" } });
-    expect(html).toContain("Request failed");
+    expect(html).toContain("could not be reached");
     expect(html).toContain("Network unreachable");
   });
 

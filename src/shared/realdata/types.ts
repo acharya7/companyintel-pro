@@ -19,6 +19,8 @@
 /** Where a result came from. Every search response states one of these. */
 export type RealDataOrigin = "cache" | "index" | "scan" | "sample";
 
+export type RealDataCoverageStatus = "complete" | "partial" | "unknown";
+
 /** Coverage record written next to a dataset version by the early-access build. */
 export interface RealDataSourceCoverage {
   id: string;
@@ -35,6 +37,15 @@ export interface RealDataCoverage {
   version: string;
   label: string;
   partial: boolean;
+  /**
+   * Evidence-backed coverage state.
+   *
+   * `complete`  every intended source byte was processed and the index was built
+   *             from all of it; `partial` a measured prefix was; `unknown` no
+   *             authoritative record proves either, which is never reported as
+   *             partial by default.
+   */
+  coverageStatus?: RealDataCoverageStatus;
   dataOrigin: RealDataOrigin;
   generatedAt: string;
   sources: RealDataSourceCoverage[];
@@ -62,6 +73,10 @@ export interface RealDataCoverageResponse {
   /** The human label the dashboard shows: REAL DATA — PARTIAL COVERAGE, etc. */
   label: string;
   partial: boolean;
+  /** Tri-state coverage. `partial` is kept as `coverageStatus !== "complete"`. */
+  coverageStatus: RealDataCoverageStatus;
+  /** Source rows read but rejected during normalization (not unindexed bytes). */
+  rowsRejected?: number;
   companies: number;
   contacts: number;
   coverage: RealDataCoverage | null;

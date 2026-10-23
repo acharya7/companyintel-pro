@@ -14,9 +14,10 @@
 
 import type { Company, Contact, DatasetStats, DatasetVersionSummary, SavedLead, SavedSearch, UnassignedContact, UserSettings, ActivityEntry } from "../../src/shared/models";
 import { R2_PREFIX, leadShardKey, statsKey, activeManifestKey, companyPartitionKey, contactPartitionKey, companyDetailKey, contactDetailKey, exportMetaKey, exportObjectKey, indexDirectoryKey, indexShardKey, manifestKey, partitionOfRef, contactPartitionOfRef, savedSearchesKey, settingsKey, activityKey, unassignedPartitionKey, validationKey, progressKey, detailForCompany, detailForContacts, isDetailSplitFormat, type IndexDirectory, type ShardPayload, type IndexKind, type CompanyPartitionPayload, type ContactPartitionPayload, type CompanyDetailPayload, type ContactDetailPayload, type ContactShardKind, type ContactShardPayload, type UnassignedPartitionPayload } from "../../src/shared/search/index-format";
-import { SHARDING, contactsFor, postingsFor, snapshotKey } from "../../src/shared/search/index-format";
+import { SHARDING, contactsFor, snapshotKey } from "../../src/shared/search/index-format";
 import { shardOf } from "../../src/shared/hash";
 import { isCacheableKey, type ObjectCache, type ReadMetrics } from "./search-cache";
+import { scanContactShardStream, scanRefShardStream, type ContactShardScan } from "./contact-shard-stream";
 
 export const LEAD_SHARDS = 64;
 export const MAX_WRITE_RETRIES = 4;
@@ -94,12 +95,27 @@ export class R2Store {
 
   /* ------------------------------ primitives ----------------------------- */
 
+  /**
+   * GET one object with a small, bounded retry.
+   *
+   * R2 returns transient 5xx/ECONNRESET errors under load, and a single blip used
+   * to surface as a 503 "index directory missing" for a dataset that is perfectly
+   * readable. Two retries with 60/180 ms backoff cover that class of failure
+   * without turning a genuinely missing key into a slow request (a 404 is
+   * returned immediately and is indistinguishable from an absent key).
+   */
   private async readObject(key: string): Promise<R2ObjectBody | null> {
-    try {
-      return await this.bucket.get(key);
-    } catch {
-      return null;
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        return await this.bucket.get(key);
+      } catch (error) {
+        lastError = error;
+        if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 60 * 3 ** attempt));
+      }
     }
+    console.warn(`R2 read failed after retries for ${key}: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
+    return null;
   }
 
   /**
@@ -297,6 +313,54 @@ export class R2Store {
   }
 
   /**
+   * Bounded-memory read of one contact shard: only the requested terms' ids.
+   *
+   * Deliberately bypasses the isolate object cache. The cache stores each object
+   * body whole, and the largest contact-trigram shard is exactly the object that
+   * must never be buffered (≈113 MB compressed). Streaming straight from R2 is
+   * what keeps a global person search inside the isolate's memory limit.
+   *
+   * The cache would also be counter-productive here: a scan usually stops after
+   * a few hundred KB of the decompressed text, so caching the full object would
+   * cost more memory and bytes than the query itself.
+   */
+  async streamContactShard(
+    version: string,
+    kind: ContactShardKind,
+    shard: number,
+    terms: string[],
+    options: { idsPerTerm?: number; maxChars?: number } = {},
+  ): Promise<ContactShardScan | null> {
+    const key = indexShardKey(version, kind, shard);
+    const object = await this.readObject(key);
+    if (!object) return null;
+
+    const body = (): ReadableStream<Uint8Array> | null => {
+      if (object.body) return object.body as ReadableStream<Uint8Array>;
+      return null;
+    };
+
+    const gzipFlagged = object.httpMetadata?.contentEncoding === "gzip";
+    if (gzipFlagged) {
+      const stream = body();
+      return scanContactShardStream(stream ? stream.pipeThrough(new DecompressionStream("gzip")) : null, terms, options);
+    }
+
+    // No metadata (an object copied in with rclone/S3): try gzip, and fall back
+    // to the raw body if decompression rejects it. Both paths keep memory flat.
+    try {
+      const compressed = body();
+      if (!compressed) return null;
+      return await scanContactShardStream(compressed.pipeThrough(new DecompressionStream("gzip")), terms, options);
+    } catch {
+      // The body stream was consumed by the failed attempt, so re-fetch it.
+      const retry = await this.readObject(key);
+      const raw = retry?.body as ReadableStream<Uint8Array> | undefined;
+      return raw ? scanContactShardStream(raw, terms, options) : null;
+    }
+  }
+
+  /**
    * Ids index postings for many contact ids at once, grouped by shard.
    *
    * This is the second half of contact hydration: a name posting names a contact
@@ -313,15 +377,39 @@ export class R2Store {
       else byShard.set(shard, [id]);
     }
     const out = new Map<string, number>();
-    await mapLimit([...byShard.entries()], 8, async ([shard, shardIds]) => {
-      const payload = await this.getShard(version, "ids", shard);
-      if (!payload) return;
-      for (const id of shardIds) {
-        const ref = postingsFor(payload, id)?.refs?.[0];
+    await mapLimit([...byShard.entries()], 3, async ([shard, shardIds]) => {
+      /*
+       * Stream the shard for just these ids. Parsing each visited ids shard whole
+       * (the previous behaviour) meant ~50 shards × ~15 MB of decompressed JSON
+       * for one page of people; the scanner keeps only the requested refs, so a
+       * person search no longer allocates hundreds of megabytes during hydration.
+       */
+      const refs = await this.streamRefShard(version, shard, shardIds);
+      for (const [id, values] of refs) {
+        const ref = values[0];
         if (typeof ref === "number") out.set(id, ref);
       }
     });
     return out;
+  }
+
+  /** Bounded-memory read of one ids shard: only the requested ids' refs. */
+  async streamRefShard(version: string, shard: number, ids: string[]): Promise<Map<string, number[]>> {
+    const key = indexShardKey(version, "ids", shard);
+    const object = await this.readObject(key);
+    if (!object) return new Map();
+    const stream = (object.body as ReadableStream<Uint8Array> | undefined) ?? null;
+    if (object.httpMetadata?.contentEncoding === "gzip") {
+      return scanRefShardStream(stream ? stream.pipeThrough(new DecompressionStream("gzip")) : null, ids);
+    }
+    try {
+      if (!stream) return new Map();
+      return await scanRefShardStream(stream.pipeThrough(new DecompressionStream("gzip")), ids);
+    } catch {
+      const retry = await this.readObject(key);
+      const raw = retry?.body as ReadableStream<Uint8Array> | undefined;
+      return raw ? scanRefShardStream(raw, ids) : new Map();
+    }
   }
 
   /**

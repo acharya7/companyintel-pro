@@ -118,7 +118,7 @@ export default function DatasetManagement() {
           value={mode.mode === "real" ? "REAL DATA" : mode.label}
           hint={
             mode.mode === "real"
-              ? `${mode.partial ? "PARTIAL COVERAGE" : "COMPLETE COVERAGE"} · version ${mode.version ?? data.activeVersion ?? "unknown"}`
+              ? `${mode.coverageStatus === "complete" ? "COMPLETE COVERAGE" : mode.coverageStatus === "partial" ? "PARTIAL COVERAGE" : "COVERAGE UNKNOWN"} · version ${mode.version ?? data.activeVersion ?? "unknown"}`
               : mode.mode === "demo"
                 ? "Bundled synthetic dataset — never presented as production data"
                 : "R2 reachable or not, nothing is published: search has no real records to return"
@@ -151,7 +151,7 @@ export default function DatasetManagement() {
             data.dataOrigin === "sample"
               ? "Preview only — not your dataset"
               : mode.mode === "real"
-                ? `${mode.partial ? "PARTIAL COVERAGE" : "COMPLETE COVERAGE"} · ${mode.version ?? data.activeVersion ?? "unknown"}`
+                ? `${mode.coverageStatus === "complete" ? "COMPLETE COVERAGE" : mode.coverageStatus === "partial" ? "PARTIAL COVERAGE" : "COVERAGE UNKNOWN"} · ${mode.version ?? data.activeVersion ?? "unknown"}`
                 : "Serving the published index"
           }
           icon={<Database className="size-4" />}

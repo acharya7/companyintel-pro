@@ -168,7 +168,9 @@ describe("swarm worker pump", () => {
     expect(first.status).toBe(200);
     expect((await first.json()) as unknown).toMatchObject({ started: RANGE_TASK.id });
 
-    const task = containerCalls.find((call) => call.url.endsWith("/task"));
+    // The pump polls with `GET /task` first and then starts the claimed task with
+    // `POST /task`; the arguments ride on the POST.
+    const task = containerCalls.find((call) => call.url.endsWith("/task") && call.init?.method === "POST");
     expect(task).toBeDefined();
     const args = (JSON.parse(String(task!.init!.body)) as { args: string[] }).args;
     expect(args.slice(0, 2)).toEqual(["range", "--version"]);
@@ -257,7 +259,7 @@ describe("swarm worker pump", () => {
         body: JSON.stringify({ workerId: "indexer-worker-02" }),
       }),
     );
-    const args = (JSON.parse(String(containerCalls.find((call) => call.url.endsWith("/task"))!.init!.body)) as { args: string[] }).args;
+    const args = (JSON.parse(String(containerCalls.find((call) => call.url.endsWith("/task") && call.init?.method === "POST")!.init!.body)) as { args: string[] }).args;
     expect(args[0]).toBe("merge-partition");
     expect(args[args.indexOf("--partition") + 1]).toBe("7");
     expect(args[args.indexOf("--ref-base") + 1]).toBe("9000");
@@ -316,7 +318,7 @@ describe("swarm worker pump", () => {
         body: JSON.stringify({ workerId: "indexer-worker-04" }),
       }),
     );
-    const args = (JSON.parse(String(containerCalls.find((call) => call.url.endsWith("/task"))!.init!.body)) as { args: string[] }).args;
+    const args = (JSON.parse(String(containerCalls.find((call) => call.url.endsWith("/task") && call.init?.method === "POST")!.init!.body)) as { args: string[] }).args;
     expect(args).toEqual(["assemble-shard", "--version", VERSION, "--kind", "exact", "--shard", "3"]);
 
     container.getTcpPort = () => ({

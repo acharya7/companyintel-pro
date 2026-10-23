@@ -23,7 +23,7 @@ import type {
   UserSettings,
 } from "@/shared/models";
 import type { ExportRequestBody, SavedSearchRequest, SettingsRequest } from "@/shared/api-contract";
-import type { RealDataCoverageResponse } from "@/shared/realdata/types";
+import type { RealDataCoverageResponse, RealDataCoverageStatus } from "@/shared/realdata/types";
 
 export interface CompanySearchParams {
   query: string;
@@ -237,6 +237,8 @@ export interface DatasetModeInfo {
   version: string | null;
   /** True when real data is active but only part of the source corpus is indexed. */
   partial?: boolean;
+  /** Evidence-backed coverage state; absent means it could not be determined. */
+  coverageStatus?: RealDataCoverageStatus;
   /** Coverage metadata from `/api/realdata/coverage`, when the deployment has it. */
   coverage?: RealDataCoverageResponse | null;
 }
@@ -279,16 +281,18 @@ export function datasetModeInfo(status: StatusLike, coverage?: RealDataCoverageR
     const usableCoverage = coverage && coverage.dataOrigin === "r2" && (!coverage.version || coverage.version === activeVersion);
     if (usableCoverage) {
       const percent = coverage.coverage?.totals.coveragePercent ?? 0;
+      const coverageStatus = coverage.coverageStatus ?? (coverage.partial ? "partial" : "complete");
+      const percentText = coverageStatus === "unknown" ? "source coverage is unconfirmed" : `${percent < 1 ? percent.toFixed(4) : percent.toFixed(2)}% of the original source file bytes are indexed`;
       return {
         mode,
-        label: coverage.partial ? "REAL DATA — PARTIAL COVERAGE" : "REAL DATA — COMPLETE COVERAGE",
+        label: coverage.label,
         description:
           `${coverage.companies.toLocaleString("en-US")} companies and ${coverage.contacts.toLocaleString("en-US")} contacts ` +
-          `from ${coverage.version ?? activeVersion}; ${percent < 1 ? percent.toFixed(4) : percent.toFixed(2)}% of the ` +
-          "original source file bytes are indexed.",
+          `from ${coverage.version ?? activeVersion}; ${percentText}.`,
         synthetic: false,
         version: coverage.version ?? activeVersion,
-        partial: coverage.partial,
+        partial: coverageStatus !== "complete",
+        coverageStatus,
         coverage,
       };
     }
@@ -298,6 +302,7 @@ export function datasetModeInfo(status: StatusLike, coverage?: RealDataCoverageR
       description: `Results come from the published index version ${activeVersion} in company-intel-data. Coverage metadata is unavailable for this request.`,
       synthetic: false,
       version: activeVersion,
+      coverageStatus: "unknown",
       coverage: coverage ?? null,
     };
   }

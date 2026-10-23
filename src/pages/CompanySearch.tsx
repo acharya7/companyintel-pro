@@ -211,7 +211,7 @@ export default function CompanySearch() {
 
   const activeFilterCount = Object.values(state.filters).filter(Boolean).length;
   const realData = useRealDataCoverage();
-  const partialCoverage = realData.data?.partial !== false;
+  const coverageStatus = realData.data?.coverageStatus ?? "unknown";
   const hits = state.mode === "contacts" ? [] : query.data?.hits ?? [];
   const contactHits = state.mode === "companies" ? [] : contactQuery.data?.hits ?? [];
   const suggestionHits = state.mode === "contacts" ? [] : suggestions.data?.hits ?? [];
@@ -485,11 +485,13 @@ export default function CompanySearch() {
           ) : resultsEmpty ? (
             <EmptyState
               icon={<Search className="size-5" />}
-              title={partialCoverage ? "No match in the indexed coverage" : "No results"}
+              title={coverageStatus === "complete" ? "No results" : coverageStatus === "partial" ? "No match in the indexed coverage" : "No results in the active index"}
               description={
-                partialCoverage
-                  ? "Nothing in the activated index matches this query. Only part of the 64 GB corpus is indexed, so the record may still exist — run a bounded source scan below to look outside that coverage. No absence is claimed."
-                  : "We did not find anything related to this company or contact in our database."
+                coverageStatus === "complete"
+                  ? "We did not find anything related to this company or contact in our database."
+                  : coverageStatus === "partial"
+                    ? "Nothing in the activated index matches this query. Only part of the source corpus is indexed, so the record may still exist — a bounded source scan can look outside that coverage. No absence is claimed."
+                    : "The complete indexed corpus was searched. Source coverage for this generation could not be verified, so this is not proof that the record does not exist outside it."
               }
             />
           ) : (

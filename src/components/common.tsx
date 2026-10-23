@@ -135,20 +135,72 @@ export function LoadingBlock({ label = "Loading", rows = 4 }: { label?: string; 
   );
 }
 
+/**
+ * Structured failure panel.
+ *
+ * A 503 must not render as a generic "Request failed": the operator needs to know
+ * whether the dataset is unavailable, the search was rejected for its cost, the
+ * session expired, or the network is down — and, for a server failure, the
+ * request reference that correlates with the Worker log. The API error carries
+ * status/code/requestId; this turns them into one sentence plus a retry.
+ */
 export function ErrorBlock({ error, onRetry }: { error: Error; onRetry?: () => void }) {
+  const status = (error as { status?: number }).status;
+  const code = (error as { code?: string }).code;
+  const requestId = (error as { requestId?: string }).requestId;
+  const isNetwork = error instanceof TypeError || /fetch|network|load failed/i.test(error.message);
+
+  const title = isNetwork
+    ? "The API could not be reached"
+    : status === 401 || status === 403
+      ? "Your session is no longer authorised"
+      : status === 503
+        ? "Search is temporarily unavailable"
+        : status === 429
+          ? "Too many requests"
+          : status === 404
+            ? "Record not found"
+            : status && status >= 500
+              ? "The server could not complete the request"
+              : "The request could not be completed";
+
+  const guidance = isNetwork
+    ? "Check the connection and retry. No results from an earlier query are shown in place of this answer."
+    : status === 401 || status === 403
+      ? "Reload the page to sign in through Cloudflare Access again. Nothing was changed."
+      : status === 503
+        ? "The dataset or the search runtime is not available right now. Wait a moment and retry; if it persists the active dataset may need attention under Dataset."
+        : status === 429
+          ? "Wait for the current minute to finish, then retry."
+          : null;
+
   return (
-    <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-4">
+    <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-4" role="alert">
       <p className="flex items-center gap-2 text-sm font-medium text-destructive">
         <AlertTriangle className="size-4" />
-        Request failed
+        {title}
       </p>
       <p className="mt-1.5 text-xs leading-5 text-muted-foreground">{error.message}</p>
-      {onRetry ? (
-        <Button variant="outline" size="sm" className="mt-3 gap-2" onClick={onRetry}>
-          <RefreshCw className="size-3.5" />
-          Retry
-        </Button>
-      ) : null}
+      {guidance ? <p className="mt-1.5 text-xs leading-5 text-muted-foreground">{guidance}</p> : null}
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        {onRetry ? (
+          <Button variant="outline" size="sm" className="gap-2" onClick={onRetry}>
+            <RefreshCw className="size-3.5" />
+            Retry
+          </Button>
+        ) : null}
+        {status ? (
+          <span className="text-[11px] text-muted-foreground">
+            HTTP {status}
+            {code ? ` · ${code}` : ""}
+          </span>
+        ) : null}
+        {requestId ? (
+          <span className="rounded border border-border/70 bg-background px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground">
+            ref {requestId}
+          </span>
+        ) : null}
+      </div>
     </div>
   );
 }
