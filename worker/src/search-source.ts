@@ -247,14 +247,33 @@ export class R2CandidateSource implements CandidateSource {
    * pages resolve with a single bounded shard read and never scan.
    */
   async refForId(id: string): Promise<number | null> {
+    const refs = await this.refsForId(id);
+    return refs[0] ?? null;
+  }
+
+  /**
+   * Every ref that carries this id.
+   *
+   * Normally one. The completed production generation does contain a small
+   * number of identities claimed by two records (two rows that resolved to the
+   * same domain identity under different names), and both records store the same
+   * canonical id. Returning the whole posting lets the route layer pick the
+   * record that actually owns the identity instead of silently serving whichever
+   * ref happened to be written first.
+   */
+  async refsForId(id: string): Promise<number[]> {
     const shard = shardOf(id, this.directory.shards.ids ?? SHARDING.idShards);
     const payload = await this.store.getShard(this.datasetVersion, "ids", shard);
     const value = postingsFor(payload, id);
-    return value?.refs?.[0] ?? null;
+    return value?.refs ? [...value.refs] : [];
   }
 
   refForCompanyId(id: string): Promise<number | null> {
     return this.refForId(id);
+  }
+
+  refsForCompanyId(id: string): Promise<number[]> {
+    return this.refsForId(id);
   }
 
   refForContactId(id: string): Promise<number | null> {

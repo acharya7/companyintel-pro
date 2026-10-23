@@ -198,6 +198,37 @@ function datasetFor(c: { get: (key: "store") => R2Store }): Promise<DatasetConte
   return requireDataset(c.get("store"));
 }
 
+/**
+ * The company ref that owns a canonical company id.
+ *
+ * Almost always a single id→ref posting. The completed production generation
+ * does contain a handful of ids carried by two records (two rows that resolved
+ * to one domain identity under different names), and the ids index lists both.
+ * Picking the first ref blindly served the wrong company's profile and contacts,
+ * so duplicates are resolved by choosing the record that actually owns the
+ * identity: the one with the most indexed contacts, with the lower ref as a
+ * deterministic tie-break. Cost is one extra partition read, and only for an id
+ * that is genuinely duplicated.
+ */
+async function resolveCompanyRef(dataset: DatasetContext, id: string): Promise<number | null> {
+  const refs = await dataset.source.refsForCompanyId(id);
+  if (!refs.length) return null;
+  if (refs.length === 1) return refs[0];
+  const companies = await dataset.store.getCompaniesByRefs(dataset.version, refs, refs.length);
+  let best: number | null = null;
+  let bestContacts = -1;
+  for (const ref of refs) {
+    const company = companies.get(ref);
+    if (!company || company.id !== id) continue;
+    const contacts = company.contactCount ?? 0;
+    if (contacts > bestContacts || (contacts === bestContacts && best !== null && ref < best)) {
+      best = ref;
+      bestContacts = contacts;
+    }
+  }
+  return best ?? refs[0];
+}
+
 class HttpError extends Error {
   constructor(
     readonly status: number,
@@ -530,7 +561,7 @@ app.get("/api/companies/search", async (c) => {
 
 app.get("/api/companies/:id", async (c) => {
   const dataset = await datasetFor(c);
-  const ref = await dataset.source.refForCompanyId(c.req.param("id"));
+  const ref = await resolveCompanyRef(dataset, c.req.param("id"));
   if (ref === null) throw new HttpError(404, "not_found", `Company ${c.req.param("id")} is not in dataset ${dataset.version}.`);
   const company = await dataset.store.getCompanyByRef(dataset.version, ref);
   if (!company) throw new HttpError(404, "not_found", `Company record ${c.req.param("id")} could not be read.`);
@@ -559,7 +590,7 @@ app.get("/api/companies/:id/contacts", async (c) => {
   const order = query.order === "desc" ? "desc" : "asc";
   const filters = toContactFilters(contactFiltersSchema.optional().parse(extractFilters(query)));
 
-  const ref = await dataset.source.refForCompanyId(c.req.param("id"));
+  const ref = await resolveCompanyRef(dataset, c.req.param("id"));
   if (ref === null) throw new HttpError(404, "not_found", `Company ${c.req.param("id")} is not in dataset ${dataset.version}.`);
   const all = await dataset.store.getContactsByCompanyRef(dataset.version, ref);
   // Facets come from the complete collection, never the filtered page: the
@@ -594,7 +625,7 @@ app.get("/api/companies/:id/unassigned", async (c) => {
   // index attached to their claim but flagged.
   const wanted = parseAssociationFilter(query.category) ?? (["unresolved"] as AssociationCategory[]);
 
-  const ref = await dataset.source.refForCompanyId(c.req.param("id"));
+  const ref = await resolveCompanyRef(dataset, c.req.param("id"));
   if (ref === null) throw new HttpError(404, "not_found", `Company ${c.req.param("id")} is not in dataset ${dataset.version}.`);
   const company = await dataset.store.getCompanyByRef(dataset.version, ref);
   if (!company) throw new HttpError(404, "not_found", `Company record ${c.req.param("id")} could not be read.`);
@@ -700,7 +731,7 @@ app.get("/api/contacts", async (c) => {
   const filters = toContactFilters(contactFiltersSchema.optional().parse(extractFilters(query)));
   const collected: Contact[] = [];
   for (const companyId of companyIds) {
-    const ref = await dataset.source.refForCompanyId(companyId);
+    const ref = await resolveCompanyRef(dataset, companyId);
     if (ref === null) continue;
     collected.push(...(await dataset.store.getContactsByCompanyRef(dataset.version, ref)));
   }
@@ -757,7 +788,7 @@ app.post("/api/leads", async (c) => {
 
   let lead: SavedLead;
   if (body.kind === "company") {
-    const ref = await dataset.source.refForCompanyId(body.targetId);
+    const ref = await resolveCompanyRef(dataset, body.targetId);
     if (ref === null) throw new HttpError(404, "not_found", "Company is not in the active dataset.");
     const company = await store.getCompanyByRef(dataset.version, ref);
     if (!company) throw new HttpError(404, "not_found", "Company record could not be read.");
@@ -949,7 +980,7 @@ app.post("/api/exports", async (c) => {
     const ids = body.companyIds ?? [];
     if (!ids.length) throw new HttpError(400, "invalid_request", "Select at least one company to export.");
     for (const id of ids.slice(0, MAX_EXPORT_ROWS)) {
-      const ref = await dataset.source.refForCompanyId(id);
+      const ref = await resolveCompanyRef(dataset, id);
       if (ref === null) continue;
       const company = await store.getCompanyByRef(dataset.version, ref);
       if (!company) continue;
@@ -959,7 +990,7 @@ app.post("/api/exports", async (c) => {
     const companyIds = body.companyId ? [body.companyId] : [];
     if (companyIds.length) {
       for (const companyId of companyIds) {
-        const ref = await dataset.source.refForCompanyId(companyId);
+        const ref = await resolveCompanyRef(dataset, companyId);
         if (ref === null) continue;
         const company = await store.getCompanyByRef(dataset.version, ref);
         const contacts = filterContacts(await store.getContactsByCompanyRef(dataset.version, ref), toContactFilters(body.filters));
