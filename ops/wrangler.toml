@@ -1,0 +1,18 @@
+# TEMPORARY headless control channel (see ops/worker.ts).
+name = "companyintel-ops"
+main = "worker.ts"
+compatibility_date = "2025-09-01"
+workers_dev = true
+
+[[durable_objects.bindings]]
+name = "COORD"
+class_name = "IndexingCoordinator"
+script_name = "companyintel"
+
+[[durable_objects.bindings]]
+name = "WORKER"
+class_name = "IndexerWorker"
+script_name = "companyintel"
+
+[vars]
+OPS_SECRET = "c41d8a76f2e35b90d7a6c4e182f5b3097e2a5c8d14f6b093a7e5c2d81f4b6a30"
